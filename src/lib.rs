@@ -86,6 +86,43 @@
 //! [`IntervalResolution::fixed_seconds`] returns `None` for `Day`, `Month` and
 //! `Year` rather than an approximation — see [`calendar::intervals_in_day`].
 //!
+//! # One value, one string
+//!
+//! Every type here that has a string form has **exactly one** of them. The rule
+//! is worth stating because the alternative fails silently: a value with two
+//! spellings produces two database keys, two map entries and two "distinct" rows
+//! that mean the same thing, and nothing anywhere reports an error.
+//!
+//! - Unit enums ([`Sparte`], [`QualityFlag`], [`MeasurementUnit`]): `as_str`,
+//!   [`Display`], [`FromStr`] and the `serde` tag are the same code.
+//! - [`ObisCode`]: `1-0:1.8.0`. The `*F` group is omitted when F is 255 ("not
+//!   applicable", IEC 62056-6-1) — the spelling MSCONS carries and people type.
+//! - [`IntervalResolution`]: the ISO 8601 duration, `PT15M` / `P1D`.
+//!
+//! Parsing is deliberately lenient where writing is not: [`ObisCode`] also
+//! accepts `1-0:1.8.0*255`, leading zeros and surrounding whitespace, and
+//! [`IntervalResolution`] accepts `PT900S` and lower case. Every accepted
+//! spelling maps onto the one canonical output, so
+//!
+//! ```rust
+//! # use metering::ObisCode;
+//! // ...whichever spelling arrived, one key comes out.
+//! assert_eq!(ObisCode::normalize("1-0:1.8.0*255")?, "1-0:1.8.0");
+//! assert_eq!(ObisCode::normalize("  1-0:01.8.0 ")?, "1-0:1.8.0");
+//! # Ok::<(), metering::ParseError>(())
+//! ```
+//!
+//! `s.parse()?.to_string() == s` holds for every canonical `s`, and
+//! `tests/string_canonicalisation.rs` holds stability, totality, idempotence and
+//! injectivity under proptest.
+//!
+//! Where a code legitimately carries a storage group — a historical billing
+//! period, `1-0:1.8.0*1` — it is never elided, because there the suffix is
+//! information rather than noise.
+//!
+//! [`Display`]: std::fmt::Display
+//! [`FromStr`]: std::str::FromStr
+//!
 //! # Serde representation stability
 //!
 //! With the `serde` feature enabled, the emitted representation — enum tags and
@@ -94,8 +131,16 @@
 //! is a breaking change and will be released as one. `tests/serde_representation.rs`
 //! pins every tag literally so the commitment is mechanical rather than a promise.
 //!
-//! Each unit enum's tag is identical to its `as_str` code, so `serde`,
-//! [`std::fmt::Display`] and [`std::str::FromStr`] never disagree.
+//! You do not need to define your own storage codes to insulate yourself from
+//! renames here; if you would rather anyway, that is a deliberate choice and not
+//! a hedge against an unstated policy.
+//!
+//! Each unit enum's tag is identical to its `as_str` code, and the two types
+//! with a canonical string ([`ObisCode`], [`IntervalResolution`]) serialise *as*
+//! that string, so `serde`, [`std::fmt::Display`] and [`std::str::FromStr`]
+//! never disagree. `ObisCode` in particular is stable for a further reason: it
+//! is an IEC 62056 identifier and `IntervalResolution` an ISO 8601 duration —
+//! both external standards, which no refactor in this crate can rename.
 //!
 //! # Enum exhaustiveness
 //!

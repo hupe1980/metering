@@ -21,11 +21,21 @@
 //! ```
 //!
 //! where:
-//! - `V_m3` — metered volume in m³ (at meter measurement conditions)
+//! - `V_m3` — the **Betriebsvolumen** in m³, i.e. volume at meter measurement
+//!   conditions. OBIS `7-0:3.0.0`
+//!   ([`ObisCode::GAS_VOLUME_M3`](crate::ObisCode::GAS_VOLUME_M3)).
 //! - `Hs_kWh_per_m3` — superior calorific value (Brennwert Ho / Hs) in kWh/m³
-//!   as determined by the gas distributor for the supply area
+//!   as determined by the gas distributor for the supply area. OBIS
+//!   `7-0:54.0.ee`, where E selects the averaging period.
 //! - `Zustandszahl` — volume conversion factor (dimensionless, typically 0.95–1.05)
-//!   accounting for pressure and temperature at the meter
+//!   accounting for pressure and temperature at the meter. OBIS `7-0:52.0.22`.
+//!
+//! **Pass a Betriebsvolumen, not a Normvolumen.** `7-0:13.2.0` (Normvolumen
+//! umgewertet) and `7-0:3.2.0` (Normvolumen gemessen) have already been
+//! state-converted by the Mengenumwerter. Feeding one of those in applies the
+//! Zustandszahl a second time and overstates the energy by the Zustandszahl's
+//! deviation from 1 — a few percent, silently, on a billed quantity. For an
+//! already-converted volume, pass `Decimal::ONE` as the Zustandszahl.
 //!
 //! ## Typical values for German natural gas (Erdgas H)
 //!

@@ -37,22 +37,24 @@ or in `Cargo.toml`:
 
 ```toml
 [dependencies]
-metering = "0.15"
+metering = "0.16"
 ```
 
 With `serde` support for all public types:
 
 ```toml
 [dependencies]
-metering = { version = "0.15", features = ["serde"] }
+metering = { version = "0.16", features = ["serde"] }
 ```
 
 **MSRV:** Rust `1.94` (edition 2024). The MSRV is pinned in
 [`rust-toolchain.toml`](rust-toolchain.toml) and verified by a dedicated CI lane.
 
-> ⚠️ **0.15 is a breaking release.** It fixes UTC-vs-Berlin bucketing, DST
-> interval counts, a mislabelled OBIS constant and the ambient clock reads. See
-> [CHANGELOG.md](CHANGELOG.md) for the full migration table.
+> ⚠️ **0.16 is a breaking release, and one change reaches data at rest.**
+> `ObisCode` now writes `1-0:1.8.0` where it wrote `1-0:1.8.0*255`, so persisted
+> code strings need a migration — both spellings still parse, so nothing fails to
+> read. [CHANGELOG.md](CHANGELOG.md) has the rest, the constant renames and the
+> SQL.
 
 ---
 
@@ -68,7 +70,7 @@ let intervals = vec![MeterInterval {
     to:   datetime!(2026-06-01 0:15 UTC),
     value_kwh: dec!(2.345),
     quality: QualityFlag::Measured,
-    obis_code: Some("1-0:1.8.0*255".parse().unwrap()),
+    obis_code: Some("1-0:1.8.0".parse().unwrap()),
 }];
 
 let period = aggregate(&intervals, &AggregationConfig::rlm_strom());
@@ -246,7 +248,7 @@ pub struct MeterInterval {
 `obis_code` is a parsed `ObisCode`, so the same channel identifier has the same
 type and value wherever it appears and `MeterInterval::obis_code ==
 MeasurementSeries::obis_code` is a comparison rather than a parse that might fail
-on data already accepted. Parse at the boundary — `"1-0:1.8.0*255".parse()?` —
+on data already accepted. Parse at the boundary — `"1-0:1.8.0".parse()?` —
 and a malformed code is rejected there, where the message is still available to
 report.
 
@@ -658,13 +660,66 @@ DLMS/COSEM Blue Book media list that OMS Spec Vol. 2 adopts:
 | 8 | Cold water | `is_water()` | `WASSER_KALT_VOLUME` |
 | 9 | Hot water | `is_water()` | `WASSER_WARM_VOLUME` |
 
-**A = 8 is water, not heat.** An HCA (A = 4) reports dimensionless
-*Verbrauchseinheiten* and carries no Eichfrist — HeizkostenV §5 Abs. 1 Satz 3
-admits it as an apportionment device precisely because it measures no unit.
+**Heat is A = 6 and cooling A = 5 — both away from the water media.** A = 8 and
+A = 9 are cold and hot water, and a Wärmezähler put on A = 8 lands in the wrong
+Sparte. This crate shipped that mistake: `WAERME_ENERGY` was `8-0:1.0.0` through
+0.14, so a heat register reported `is_water()` and inherited water's daily
+default resolution instead of hourly.
 
-A test asserts every named constant satisfies the predicate its name implies —
-`WAERME_ENERGY` was `8-0:1.0.0` through 0.14, so a heat register reported
-`is_water()` and inherited water's daily default resolution instead of hourly.
+**A = 4 is a Heizkostenverteiler, which measures nothing.** An HCA reports
+dimensionless *Verbrauchseinheiten* and carries no Eichfrist — HeizkostenV §5
+Abs. 1 Satz 3 admits it as an apportionment device precisely because it measures
+no physical unit, so an Eichfrist check must skip it rather than treat a missing
+date as an expiry.
+
+A test asserts every named constant satisfies the predicate its name implies, so
+that mistake cannot come back unnoticed.
+
+---
+
+## 🧭 OBIS value groups C, D and E
+
+C, D and E are read wrong more often than A, because the IEC group *names* do not
+say how the German market *assigns* them. The authority is the EDI@Energy
+[Codeliste der OBIS-Kennzahlen und Medien](https://www.bundesnetzagentur.de/DE/Beschlusskammern/BK06/BK6_83_Zug_Mess/835_mitteilungen_datenformate/Mitteilung_31/Anlagen/EDIFACT/Codeliste%20der%20OBIS-Kennzahlen%20und%20Medien%202.4b.pdf?__blob=publicationFile&v=1)
+(v2.4b), and four rules follow from it:
+
+**Direction is C alone.** §2.1 writes Bezug as `1-b:1.x.y` and Lieferung as
+`1-b:2.x.y`, with `x` and `y` explicitly free. So `is_import()` / `is_export()`
+test C, never D:
+
+```rust
+use metering::ObisCode;
+
+// Zählerstand, Vorschub, Lastgang, Maximum — all Bezug.
+for code in ["1-0:1.8.0", "1-0:1.9.0", "1-0:1.29.0", "1-0:1.6.0"] {
+    assert!(code.parse::<ObisCode>().unwrap().is_import());
+}
+```
+
+**D is the Messart — which measurement, over which period.** 6 = Maximum,
+8 = Zählerstand (Zeitintegral 1), 9 = Vorschub (Zeitintegral 2), 29 = Lastgang
+(Zeitintegral 5). Two of these carry different units: `1-0:1.29.0` is the
+15-minute energy series in **kWh**, while the peak-demand register billed under
+§ 18 Abs. 1 StromNEV is `1-0:1.6.0` in **kW**. Reading one as the other bills an
+energy quantity as a power:
+
+```rust
+use metering::ObisCode;
+
+assert!(ObisCode::STROM_BEZUG_LASTGANG.is_lastgang());  // 1-0:1.29.0, kWh
+assert!(ObisCode::STROM_BEZUG_MAXIMUM.is_maximum());    // 1-0:1.6.0,  kW
+```
+
+**E = 63 is a fault counter sitting inside the tariff numbering.** Tariffs run
+0…9 before 2023-10-01 and 0…62 since; 63 is the Fehlerregister. `tariff_register()`
+returns `None` for it, so its contents cannot be summed into an Arbeitsmenge as
+though they were a tariff's consumption.
+
+**Reactive energy is C = 3…8, and only for A = 1.** Blindleistung positiv (3),
+negativ (4) and the four quadrants Q I…Q IV (5–8). Checking `C ∈ {3, 4}` alone
+misses every quadrant register, and checking C without the medium reports gas
+volume (`7-0:3.0.0`) as reactive energy.
 
 ---
 
@@ -729,15 +784,22 @@ for callers that already hold `f64` samples (e.g. straight out of a database).
 
 ---
 
-## 🔤 String forms
+## 🔤 String forms — one value, one string
 
-`Sparte`, `MeasurementUnit`, `QualityFlag` and `QualityGrade` each have **one**
-stable code that `as_str()`, `Display`, `FromStr` and the `serde` tag all agree
-on, so a value written to a log, a CLI argument or a database column reads back
-as itself:
+Every type with a string form has **exactly one** of them, shared by `as_str()`,
+`Display`, `FromStr` and the `serde` tag. The rule is worth stating because the
+alternative fails silently: a value with two spellings produces two database
+keys, two map entries and two "distinct" rows that mean the same thing, and
+nothing anywhere reports an error.
+
+| Type | Canonical string |
+|---|---|
+| `Sparte`, `MeasurementUnit`, `QualityFlag`, `QualityGrade` | the `as_str()` code — `STROM`, `KWH`, `SUBSTITUTED` |
+| `ObisCode` | `1-0:1.8.0` — reduced form, `*F` omitted when F is 255 |
+| `IntervalResolution` | ISO 8601 duration — `PT15M`, `P1D`, `PT300S` |
 
 ```rust
-use metering::{QualityFlag, Sparte, IntervalResolution};
+use metering::{ObisCode, QualityFlag, IntervalResolution};
 
 assert_eq!(QualityFlag::Substituted.as_str(), "SUBSTITUTED");
 assert_eq!("substituted".parse::<QualityFlag>().unwrap(), QualityFlag::Substituted);
@@ -745,7 +807,41 @@ assert_eq!("substituted".parse::<QualityFlag>().unwrap(), QualityFlag::Substitut
 // IntervalResolution uses ISO 8601 durations, so Custom(n) round-trips too.
 assert_eq!(IntervalResolution::QuarterHour.to_string(), "PT15M");
 assert_eq!("PT900S".parse::<IntervalResolution>().unwrap(), IntervalResolution::QuarterHour);
+
+// ObisCode writes the spelling MSCONS carries and people type.
+assert_eq!(ObisCode::STROM_BEZUG_TOTAL.to_string(), "1-0:1.8.0");
 ```
+
+### Parsing is lenient; writing is not
+
+That is what lets one string be canonical without rejecting real-world input.
+`ObisCode` accepts `1-0:1.8.0*255`, leading zeros and surrounding whitespace;
+`IntervalResolution` accepts `PT900S` and lower case. Every accepted spelling
+maps onto the single canonical output, so `s.parse()?.to_string() == s` holds
+for every canonical `s`:
+
+```rust
+use metering::ObisCode;
+
+// Four spellings that arrive from four systems — one key comes out.
+for raw in ["1-0:1.8.0", "1-0:1.8.0*255", "  1-0:1.8.0 ", "01-00:01.08.00"] {
+    assert_eq!(ObisCode::normalize(raw).unwrap(), "1-0:1.8.0");
+}
+```
+
+Use `ObisCode::normalize()` when you hold a raw string (a column, a CSV cell, an
+MSCONS segment) and `code.to_string()` when you hold a value. For a system that
+insists on the explicit six-group form, `code.to_full_string()` — or
+`format!("{code:#}")` — writes `1-0:1.8.0*255`, and parses back to the same
+value.
+
+A storage group that carries information is **never** elided: `1-0:1.8.0*1` is a
+historical billing-period register, a different channel from `1-0:1.8.0`, and it
+keeps its suffix. Eliding it would merge two registers that must stay apart.
+
+[`tests/string_canonicalisation.rs`](tests/string_canonicalisation.rs) holds
+stability, totality, idempotence and injectivity under `proptest`, for both the
+string and the `serde` form.
 
 A test walks `Sparte::ALL`, `QualityFlag::ALL`, `MeasurementUnit::ALL` and
 `LoadProfile::ALL` asserting `from_str(x.as_str()) == x` and that all codes are
@@ -806,16 +902,24 @@ be released as one.
 literally, so the commitment is mechanical rather than a promise:
 
 ```rust
-assert_eq!(to_string(&QualityFlag::Measured)?,  "\"MEASURED\"");
-assert_eq!(to_string(&Sparte::Waerme)?,         "\"WAERME\"");
-assert_eq!(to_string(&ObisCode::WAERME_ENERGY)?, "\"6-0:1.0.0*255\"");
+assert_eq!(to_string(&QualityFlag::Measured)?,        "\"MEASURED\"");
+assert_eq!(to_string(&Sparte::Waerme)?,               "\"WAERME\"");
+assert_eq!(to_string(&ObisCode::WAERME_ENERGY)?,      "\"6-0:1.0.0\"");
+assert_eq!(to_string(&IntervalResolution::Day)?,      "\"P1D\"");
 ```
 
+**So you do not need to define your own storage codes to insulate yourself from
+renames here.** If you would rather anyway, that is a legitimate choice — but
+make it deliberately, not as a hedge against an unstated policy.
+
+The two types with a canonical string serialise *as* that string, which makes
+them stable for a second, independent reason: `ObisCode` is an IEC 62056
+identifier and `IntervalResolution` an ISO 8601 duration. Both are external
+standards, so no refactor in this crate can rename them — the same argument that
+holds for the `to_iso8601()` / `FromStr` pair holds for the `serde` form.
+
 Adding a **new** variant is not breaking for writers and may ship in a minor
-release; it is breaking for older readers — the usual open-enum trade-off. If you
-would rather not couple your storage to this crate at all, define your own codes
-with an exhaustive `match`, so a new upstream variant breaks your build rather
-than your data.
+release; it is breaking for older readers — the usual open-enum trade-off.
 
 ---
 
@@ -841,13 +945,14 @@ bounds, resampling, §42b EnWG GGV virtual meters (Beispiel 1 constant +
 Beispiel 3 proportional, Pos() cap, zero-division guard), §42a Residuallast,
 BSI TR-03109 SMGW + CLS lifecycle, Zählzeitdefinition resolution, MsbG §29/§45
 rollout classification, BDEW 2025 profile Dynamisierung, measurement series
-provenance, register + ObisCode — plus property tests and three integration
+provenance, register + ObisCode — plus property tests and four integration
 suites:
 
 | Suite | Covers |
 |---|---|
 | [`berlin_calendar.rs`](tests/berlin_calendar.rs) | Every DST transition 2025–2027, day tiling across a full year, 92/100-interval completeness |
 | [`serde_representation.rs`](tests/serde_representation.rs) | Every enum tag and struct field name, pinned literally |
+| [`string_canonicalisation.rs`](tests/string_canonicalisation.rs) | One value, one string — stability, totality, idempotence, injectivity under `proptest` |
 | [`regulatory_showcase.rs`](tests/regulatory_showcase.rs) | End-to-end regulatory scenarios with the exact 2026 DST dates |
 | [`readme_samples.rs`](tests/readme_samples.rs) | Every snippet in this file, so the README cannot drift from the code |
 

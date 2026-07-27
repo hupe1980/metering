@@ -37,20 +37,18 @@
 use std::fmt;
 use std::str::FromStr;
 
-#[cfg(feature = "serde")]
-use serde::{Deserialize, Serialize};
-
 use crate::error::ParseError;
 
 /// Typed interval resolution for meter data time series.
 ///
 /// The canonical string form is an ISO 8601 duration (`PT15M`, `P1D`, …), which
-/// [`Display`](fmt::Display) writes and [`FromStr`] reads. [`label`] gives the
-/// German name used on invoices and in operator UIs.
+/// [`Display`](fmt::Display) writes, [`FromStr`] reads, and — with the `serde`
+/// feature — `Serialize`/`Deserialize` use as well, so there is exactly one
+/// spelling per value. [`label`] gives the German name used on invoices and in
+/// operator UIs.
 ///
 /// [`label`]: IntervalResolution::label
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub enum IntervalResolution {
     /// 15-minute intervals (900 s) — standard for RLM, iMSys, SMGW.
     QuarterHour,
@@ -227,6 +225,49 @@ impl FromStr for IntervalResolution {
             }
         };
         Self::from_seconds(seconds).ok_or_else(err)
+    }
+}
+
+// ── Serde: the ISO 8601 string, not the Rust variant name ────────────────────
+
+#[cfg(feature = "serde")]
+mod serde_impl {
+    use super::IntervalResolution;
+    use serde::de::{self, Visitor};
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use std::fmt;
+
+    impl Serialize for IntervalResolution {
+        /// Writes the ISO 8601 duration — the same string
+        /// [`Display`](fmt::Display) writes.
+        ///
+        /// The derived representation used the Rust variant names
+        /// (`"QuarterHour"`, `{"Custom":300}`), giving each value a second
+        /// spelling that a rename could silently invalidate. ISO 8601 is an
+        /// external standard, so no refactor here can change it.
+        fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            serializer.collect_str(self)
+        }
+    }
+
+    struct IntervalResolutionVisitor;
+
+    impl Visitor<'_> for IntervalResolutionVisitor {
+        type Value = IntervalResolution;
+
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("an ISO 8601 duration string such as \"PT15M\" or \"P1D\"")
+        }
+
+        fn visit_str<E: de::Error>(self, v: &str) -> Result<IntervalResolution, E> {
+            v.parse().map_err(de::Error::custom)
+        }
+    }
+
+    impl<'de> Deserialize<'de> for IntervalResolution {
+        fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            deserializer.deserialize_str(IntervalResolutionVisitor)
+        }
     }
 }
 

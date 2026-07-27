@@ -1,7 +1,7 @@
 [package]
 name         = "metering"
 description  = "German energy metering domain library — Europe/Berlin calendar arithmetic (DST-correct interval counts), interval types, Gas conversion (m3→kWh_Hs), billing period aggregation (Spitzenleistung, HT/NT), SLP/RLM/iMSys classification, Mehr-/Mindermengensaldo, and Hampel-filter quality scoring. Zero I/O, no async, no clock, exact decimal quantities."
-version      = "0.15.0"
+version      = "0.16.0"
 authors      = ["hupe1980"]
 edition      = "2024"
 license      = "MIT OR Apache-2.0"

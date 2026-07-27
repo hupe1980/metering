@@ -15,9 +15,9 @@
 //! ## Example: dual-tariff meter (HT/NT)
 //!
 //! A typical HT/NT electricity meter has three registers:
-//! - Register 0 (`1-0:1.8.0*255`) — total energy (sum)
-//! - Register 1 (`1-0:1.8.1*255`) — HT energy
-//! - Register 2 (`1-0:1.8.2*255`) — NT energy
+//! - Register 0 (`1-0:1.8.0`) — total energy (sum)
+//! - Register 1 (`1-0:1.8.1`) — HT energy
+//! - Register 2 (`1-0:1.8.2`) — NT energy
 //!
 //! Each register maps to a separate `MeterInterval` time series in MSCONS.
 
@@ -125,7 +125,7 @@ pub struct MeterRegister {
     /// - 2 = register 2 (Niedertarif, NT)
     pub register_number: u8,
 
-    /// OBIS code identifying this measurement channel (e.g. `1-0:1.8.1*255` for HT).
+    /// OBIS code identifying this measurement channel (e.g. `1-0:1.8.1` for HT).
     pub obis_code: ObisCode,
 
     /// Energy flow direction for this register.

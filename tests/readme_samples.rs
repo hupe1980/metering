@@ -5,7 +5,7 @@
 
 use metering::{
     AggregationConfig, IntervalResolution, MeasurementSeries, MeasurementSource, MeterInterval,
-    QualityFlag, Sparte, aggregate, calendar,
+    ObisCode, QualityFlag, Sparte, aggregate, calendar,
 };
 use rust_decimal::dec;
 use time::macros::{date, datetime};
@@ -17,7 +17,7 @@ fn quick_start() {
         to: datetime!(2026-06-01 0:15 UTC),
         value_kwh: dec!(2.345),
         quality: QualityFlag::Measured,
-        obis_code: Some("1-0:1.8.0*255".parse().unwrap()),
+        obis_code: Some("1-0:1.8.0".parse().unwrap()),
     }];
 
     let period = aggregate(&intervals, &AggregationConfig::rlm_strom());
@@ -87,6 +87,58 @@ fn string_forms_section() {
         Sparte::Gas.billing_unit(),
         metering::MeasurementUnit::KiloWattHour
     );
+    assert_eq!(ObisCode::STROM_BEZUG_TOTAL.to_string(), "1-0:1.8.0");
+}
+
+/// README → "OBIS value groups C, D and E".
+#[test]
+fn obis_value_group_section() {
+    // Zählerstand, Vorschub, Lastgang, Maximum — all Bezug.
+    for code in ["1-0:1.8.0", "1-0:1.9.0", "1-0:1.29.0", "1-0:1.6.0"] {
+        assert!(code.parse::<ObisCode>().unwrap().is_import());
+    }
+
+    assert!(ObisCode::STROM_BEZUG_LASTGANG.is_lastgang());
+    assert!(ObisCode::STROM_BEZUG_MAXIMUM.is_maximum());
+
+    // E = 63 is the Fehlerregister, not tariff 63.
+    let fehler: ObisCode = "1-0:1.8.63".parse().unwrap();
+    assert!(fehler.is_fehlerregister());
+    assert_eq!(fehler.tariff_register(), None);
+
+    // Reactive is C = 3..=8, and only for electricity.
+    for c in 3..=8u8 {
+        assert!(
+            format!("1-0:{c}.8.0")
+                .parse::<ObisCode>()
+                .unwrap()
+                .is_reactive()
+        );
+    }
+    assert!(!ObisCode::GAS_VOLUME_M3.is_reactive());
+}
+
+/// README → "Parsing is lenient; writing is not".
+#[test]
+fn obis_canonicalisation_section() {
+    for raw in [
+        "1-0:1.8.0",
+        "1-0:1.8.0*255",
+        "  1-0:1.8.0 ",
+        "01-00:01.08.00",
+    ] {
+        assert_eq!(ObisCode::normalize(raw).unwrap(), "1-0:1.8.0");
+    }
+
+    let code = ObisCode::STROM_BEZUG_TOTAL;
+    assert_eq!(code.to_full_string(), "1-0:1.8.0*255");
+    assert_eq!(format!("{code:#}"), "1-0:1.8.0*255");
+    assert_eq!(code.to_full_string().parse::<ObisCode>().unwrap(), code);
+
+    // A real billing-period register keeps its suffix and stays a distinct code.
+    let historical: ObisCode = "1-0:1.8.0*1".parse().unwrap();
+    assert_eq!(historical.to_string(), "1-0:1.8.0*1");
+    assert_ne!(historical, code);
 }
 
 #[test]
@@ -122,7 +174,7 @@ fn quality_section() {
 
 #[test]
 fn parse_error_section() {
-    use metering::{ObisCode, ParseError};
+    use metering::ParseError;
 
     fn decode(
         sparte: &str,
@@ -132,7 +184,7 @@ fn parse_error_section() {
         Ok((sparte.parse()?, quality.parse()?, obis.parse()?))
     }
 
-    assert!(decode("STROM", "MEASURED", "1-0:1.8.0*255").is_ok());
+    assert!(decode("STROM", "MEASURED", "1-0:1.8.0").is_ok());
     let err = decode("STROM", "MEASURED", "nope").unwrap_err();
     assert_eq!(err.type_name(), "ObisCode");
 }

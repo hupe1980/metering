@@ -14,6 +14,13 @@
 //! Adding a **new** variant is not a breaking change for writers and is allowed
 //! within a minor release; it is breaking for *readers* on older versions, which
 //! is the usual open-enum trade-off.
+//!
+//! One rule governs the shapes below: **a type with a canonical `Display` string
+//! travels as that string**, never as a second, parallel encoding. `ObisCode`
+//! serialises as `"1-0:1.8.0"` and `IntervalResolution` as `"PT15M"` — the same
+//! bytes their `Display` writes and their `FromStr` reads. A value with two
+//! spellings is a value whose stored keys can disagree with each other;
+//! `tests/string_canonicalisation.rs` holds that property under proptest.
 
 #![cfg(feature = "serde")]
 
@@ -121,28 +128,48 @@ fn measurement_source_shape_is_stable() {
     );
 }
 
-/// An OBIS code travels as its canonical `A-B:C.D.E*F` string, not as six
-/// separate numbers.
+/// An OBIS code travels as its canonical string, not as six separate numbers —
+/// and the canonical string omits `*F` when F is 255 ("not applicable").
+///
+/// Changed in 0.16.0: the wire form was `"1-0:1.8.0*255"`, which no consumer
+/// could produce by typing the code or by copying it out of an MSCONS message.
+/// See `tests/string_canonicalisation.rs` for the invariants that fixes.
 #[test]
 fn obis_code_is_a_string_on_the_wire() {
-    assert_eq!(json(&ObisCode::STROM_BEZUG_TOTAL), "\"1-0:1.8.0*255\"");
-    let parsed: ObisCode = serde_json::from_str("\"1-0:1.8.0*255\"").unwrap();
-    assert_eq!(parsed, ObisCode::STROM_BEZUG_TOTAL);
+    assert_eq!(json(&ObisCode::STROM_BEZUG_TOTAL), "\"1-0:1.8.0\"");
+
+    // Both spellings still read, so archives written under either form decode.
+    for encoded in ["\"1-0:1.8.0\"", "\"1-0:1.8.0*255\""] {
+        let parsed: ObisCode = serde_json::from_str(encoded).unwrap();
+        assert_eq!(parsed, ObisCode::STROM_BEZUG_TOTAL, "{encoded}");
+    }
 
     // Medium 6 is heat — the constant and the wire form agree.
-    assert_eq!(json(&ObisCode::WAERME_ENERGY), "\"6-0:1.0.0*255\"");
+    assert_eq!(json(&ObisCode::WAERME_ENERGY), "\"6-0:1.0.0\"");
+
+    // A storage group that carries information is never elided.
+    assert_eq!(
+        json(&"1-0:1.8.0*1".parse::<ObisCode>().unwrap()),
+        "\"1-0:1.8.0*1\""
+    );
 }
 
-/// `IntervalResolution` carries a payload in one variant, so it is externally
-/// tagged rather than a plain string. `Display`/`FromStr` remain the ISO 8601
-/// form; the two are independent and both stable.
+/// `IntervalResolution` travels as its ISO 8601 duration — the same string
+/// `Display` writes and `FromStr` reads.
+///
+/// Changed in 0.16.0: the derived form used the Rust variant names
+/// (`"QuarterHour"`, `{"Custom":300}`), so the type had two spellings per value
+/// and the serde one was a rename away from silently invalidating stored data.
+/// ISO 8601 is an external standard that no refactor here can rename.
 #[test]
 fn interval_resolution_shape_is_stable() {
-    assert_eq!(json(&IntervalResolution::QuarterHour), "\"QuarterHour\"");
-    assert_eq!(json(&IntervalResolution::Day), "\"Day\"");
-    assert_eq!(json(&IntervalResolution::Custom(300)), r#"{"Custom":300}"#);
+    assert_eq!(json(&IntervalResolution::QuarterHour), "\"PT15M\"");
+    assert_eq!(json(&IntervalResolution::Day), "\"P1D\"");
+    assert_eq!(json(&IntervalResolution::Month), "\"P1M\"");
+    assert_eq!(json(&IntervalResolution::Year), "\"P1Y\"");
+    assert_eq!(json(&IntervalResolution::Custom(300)), "\"PT300S\"");
 
-    // ...while the string form is ISO 8601 and round-trips through FromStr.
+    // ...which is exactly the string form, rather than a parallel convention.
     assert_eq!(IntervalResolution::QuarterHour.to_string(), "PT15M");
     assert_eq!(
         "PT15M".parse::<IntervalResolution>().unwrap(),
@@ -177,7 +204,7 @@ fn meter_interval_field_names_are_stable() {
     for field in ["from", "to", "value_kwh", "quality", "obis_code"] {
         assert!(encoded.contains(&format!("\"{field}\"")), "{field} missing");
     }
-    assert!(encoded.contains("\"1-0:1.8.0*255\""));
+    assert!(encoded.contains("\"1-0:1.8.0\""));
 
     let decoded: MeterInterval = serde_json::from_str(&encoded).unwrap();
     assert_eq!(decoded, iv, "round trip");

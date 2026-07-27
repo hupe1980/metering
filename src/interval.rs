@@ -441,7 +441,7 @@ impl FromStr for QualityFlag {
 /// identifier must have the same type and the same value wherever it appears,
 /// so that `MeterInterval` and [`crate::MeasurementSeries`] can be compared and
 /// stored without a parse that might fail on data already accepted. Parse at
-/// the boundary — `"1-0:1.8.0*255".parse()` — and an unparseable code is
+/// the boundary — `"1-0:1.8.0".parse()` — and an unparseable code is
 /// rejected there, where the message is still available to report.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
@@ -512,7 +512,7 @@ impl MeterInterval {
     ///     to:   datetime!(2026-01-01 0:15 UTC),
     ///     value_kwh: dec!(2.5),
     ///     quality: QualityFlag::Measured,
-    ///     obis_code: Some("1-0:1.8.0*255".parse().unwrap()),
+    ///     obis_code: Some("1-0:1.8.0".parse().unwrap()),
     /// };
     /// assert_eq!(iv.obis_code, Some(ObisCode::STROM_BEZUG_TOTAL));
     /// assert_eq!(iv.is_import_energy(), Some(true));

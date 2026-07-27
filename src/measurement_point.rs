@@ -138,7 +138,7 @@ pub enum EnergyFlow {
 ///
 /// Virtual meters (GGV community solar, Residuallast) also have `MeasurementPoint`
 /// entries with `is_virtual = true`. Their `obis_code` is a conventional code
-/// like `1-0:1.8.0*255` (total import) since virtual meters are logical.
+/// like `1-0:1.8.0` (total import) since virtual meters are logical.
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct MeasurementPoint {
@@ -201,7 +201,8 @@ impl MeasurementPoint {
         matches!(self.energy_flow, EnergyFlow::Generation) || self.obis_code.is_einspeisung()
     }
 
-    /// `true` when this point measures reactive energy.
+    /// `true` when this point measures Blindarbeit / Blindleistung —
+    /// electricity C = 3…8, including the Q I–Q IV quadrant registers.
     #[must_use]
     pub fn is_reactive(&self) -> bool {
         self.obis_code.is_reactive()

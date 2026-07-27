@@ -10,8 +10,8 @@
 //! {
 //!     Ok((sparte.parse()?, quality.parse()?, obis.parse()?))
 //! }
-//! # assert!(decode("STROM", "MEASURED", "1-0:1.8.0*255").is_ok());
-//! # assert!(decode("KOHLE", "MEASURED", "1-0:1.8.0*255").is_err());
+//! # assert!(decode("STROM", "MEASURED", "1-0:1.8.0").is_ok());
+//! # assert!(decode("KOHLE", "MEASURED", "1-0:1.8.0").is_err());
 //! ```
 //!
 //! without three `map_err` calls or a bespoke enum. The rejected input and the
@@ -151,7 +151,7 @@ mod tests {
             let _: IntervalResolution = r.parse()?;
             Ok(())
         }
-        assert!(decode("GAS", "MEASURED", "7-0:3.0.0*255", "PT1H").is_ok());
+        assert!(decode("GAS", "MEASURED", "7-0:3.0.0", "PT1H").is_ok());
         let err = decode("GAS", "MEASURED", "bad", "PT1H").unwrap_err();
         assert_eq!(err.type_name(), "ObisCode");
     }

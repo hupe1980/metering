@@ -15,14 +15,25 @@
 //!
 //! ## OBIS codes for power quality
 //!
+//! Per-phase channels are **3x** (L1), **5x** (L2) and **7x** (L3) in IEC 62056;
+//! the **1x** codes are the all-phase / average value. So L1 voltage is
+//! `1-0:32.7.0`, not `1-0:12.7.0` — the latter is the average across the
+//! phases, which on an unbalanced three-phase load is a different number.
+//!
 //! | OBIS code | Quantity | Unit |
 //! |---|---|---|
-//! | `1-0:12.7.0*255` | Voltage L1 (avg) | V |
-//! | `1-0:52.7.0*255` | Voltage L2 (avg) | V |
-//! | `1-0:72.7.0*255` | Voltage L3 (avg) | V |
-//! | `1-0:11.7.0*255` | Current L1 (avg) | A |
-//! | `1-0:14.7.0*255` | Frequency | Hz |
-//! | `1-0:13.7.0*255` | Power factor (cos φ) | — |
+//! | `1-0:32.7.0` | Voltage L1 | V |
+//! | `1-0:52.7.0` | Voltage L2 | V |
+//! | `1-0:72.7.0` | Voltage L3 | V |
+//! | `1-0:12.7.0` | Voltage, all phases (average) | V |
+//! | `1-0:31.7.0` | Current L1 | A |
+//! | `1-0:51.7.0` | Current L2 | A |
+//! | `1-0:71.7.0` | Current L3 | A |
+//! | `1-0:11.7.0` | Current, all phases (average) | A |
+//! | `1-0:14.7.0` | Frequency | Hz |
+//! | `1-0:13.7.0` | Power factor (cos φ), total | — |
+//!
+//! D = 7 is the instantaneous value in all of the above.
 
 use rust_decimal::Decimal;
 use time::OffsetDateTime;

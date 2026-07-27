@@ -4,6 +4,179 @@ All notable changes to `metering` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the crate follows
 semver, with the `serde` representation explicitly in scope (see the crate docs).
 
+## [0.16.0] — 2026-07-27
+
+One theme: **a value must have exactly one string.** Two spellings of one value
+is not a cosmetic problem — it produces two database keys, two map entries and
+two "distinct" rows that mean the same thing, with no error raised anywhere.
+Reported from production, where a correction failed to supersede the reading it
+corrected and the billed total was overstated by the correction amount.
+
+A second theme emerged while verifying the first against the authoritative
+source — the EDI@Energy *Codeliste der OBIS-Kennzahlen und Medien* v2.4b.
+Several `ObisCode` predicates were written from the IEC value-group *names*
+rather than from how the German market *assigns* them, and the test suite
+never exercised the difference.
+
+### Fixed — OBIS value-group semantics
+
+- **Direction was read from the wrong value group, so the Lastgang was neither
+  import nor export.** `is_import()` required `C = 1 && D = 8`, but EDI@Energy
+  §2.1 defines direction by C alone — "+ Bezug des Kunden aus dem Netz (z. B.
+  `1-b:1.x.y`)", with `x`/`y` explicitly free. `1-0:1.29.0` — the Lastgang,
+  the code MSCONS PID 13018 carries and the one a `MeterInterval` normally
+  holds — therefore reported `is_import() == false`, and so did
+  `MeterInterval::is_import_energy()`, `MeasurementPoint::is_bezug()` and
+  `MeterRegister::is_import()`. Direction is now `A = 1 && C ∈ {1, 2}`, across
+  every Messart.
+
+- **`D = 9` was modelled as a reverse-direction flag.** In the German market
+  D is a *Messart*: 6 = Maximum, 8 = Zählerstand (Zeitintegral 1), 9 = Vorschub
+  (Zeitintegral 2), 29 = Lastgang (Zeitintegral 5). The constants
+  `STROM_REACTIVE_INDUCTIVE_EXPORT` / `..._CAPACITIVE_EXPORT` (`1-0:3.9.0`,
+  `1-0:4.9.0`) were labelled "export direction" but denote *Blindarbeit
+  positiv/negativ, Vorschub* — a different quantity, not a direction.
+
+- **`is_demand()` claimed `D = 29` is maximum demand.** D = 29 is the Lastgang,
+  an energy quantity in kWh per interval; the maximum is D = 6, a power in kW.
+  Conflating them bills a 15-minute energy quantity as a Leistungspreis basis.
+  Replaced by `is_lastgang()`, `is_maximum()`, `is_zaehlerstand()` and
+  `is_vorschub()`, which name what each Messart is.
+
+- **`is_reactive()` missed the four quadrant registers and claimed gas volume.**
+  It tested `C ∈ {3, 4}` with no medium guard. Blindleistung is C = 3…8 —
+  positiv, negativ and Q I…Q IV — so a quadrant register was read as active
+  energy, putting kvarh into a kWh column. Without the medium guard,
+  `GAS_VOLUME_M3` (`7-0:3.0.0`, C = 3) reported `is_reactive() == true`.
+  Now `A = 1 && C ∈ 3..=8`.
+
+- **`tariff_register()` reported the Fehlerregister as tariff 63.** EDI@Energy
+  §2.2 lists "63 Fehlerregister" alongside the tariffs; it counts faults and is
+  not a billable quantity. It now returns `None`, with `is_fehlerregister()` to
+  distinguish it from the total register, and `default_resolution()` returns
+  `None` for it rather than a 15-minute series.
+
+- **Two power-quality OBIS codes were documented as L1 when they are the
+  all-phase average.** Per-phase channels are 3x (L1), 5x (L2), 7x (L3); the 1x
+  codes are the average across phases. `power_quality.rs` listed `1-0:12.7.0`
+  as "Voltage L1" (it is the average — a different number on an unbalanced
+  three-phase load) and `1-0:11.7.0` as "Current L1". The correct codes are
+  `1-0:32.7.0` and `1-0:31.7.0`; the table now lists per-phase and average rows
+  separately, and the missing L2/L3 current rows were added.
+
+### Changed — OBIS constants renamed to what they denote
+
+| Removed | Replacement | Why |
+|---|---|---|
+| `STROM_DEMAND_INTERVAL` | `STROM_BEZUG_LASTGANG` | `1-0:1.29.0` is a Lastgang in kWh, not a demand in kW |
+| — | `STROM_BEZUG_MAXIMUM` | `1-0:1.6.0`, the actual Spitzenleistung register |
+| — | `STROM_BEZUG_VORSCHUB` | `1-0:1.9.0`, Zeitintegral 2 |
+| — | `STROM_EINSPEISUNG_LASTGANG` | `1-0:2.29.0` |
+| `STROM_REACTIVE_INDUCTIVE` | `STROM_BLINDARBEIT_POSITIV` | C = 3 is "Blindleistung positiv"; inductive/capacitive is a quadrant property |
+| `STROM_REACTIVE_CAPACITIVE` | `STROM_BLINDARBEIT_NEGATIV` | C = 4 is "Blindleistung negativ" |
+| `STROM_REACTIVE_INDUCTIVE_EXPORT` | `STROM_BLINDARBEIT_Q1`…`Q4` | the old pair were Vorschub registers mislabelled as export |
+| `STROM_REACTIVE_CAPACITIVE_EXPORT` | (as above) | |
+
+`ObisCode::TARIFF_FEHLERREGISTER` (63) was added alongside `STORAGE_UNUSED`.
+
+### Fixed
+
+- **`ObisCode` was not string-stable: `FromStr` → `Display` was not the
+  identity.** Parsing defaulted the storage group F to 255 and `Display` always
+  printed it, so `"1-0:1.8.0"` — the spelling MSCONS carries and people type —
+  came back out as `"1-0:1.8.0*255"`. A reading written through one path and a
+  correction written through another produced different keys for one channel,
+  so the correction superseded nothing and both rows survived resolution.
+
+  `Display` now writes the **reduced form**, omitting `*F` when F is 255 ("not
+  applicable", IEC 62056-6-1 Annex A). A storage group that carries information
+  is never elided: `1-0:1.8.0*1` keeps its suffix and stays a distinct code.
+
+- **`ObisCode` could not be deserialised by any non-borrowing deserialiser.**
+  `serde(try_from = "&str")` required the deserialiser to hand out a borrowed
+  `&str`, so `serde_json::from_reader`, bincode, postcard and MessagePack all
+  failed with `invalid type: string "1-0:1.8.0*255", expected a borrowed string`
+  regardless of what the payload said — streaming a file of intervals was simply
+  impossible. Replaced with a visitor-based `Deserialize`, and a `Serialize` that
+  writes through `collect_str` without an intermediate `String`.
+
+- **The OBIS parser accepted signed value groups.** `u8::from_str` accepts a
+  leading `+`, so `+1-0:1.8.0*+255` parsed and then rendered under the canonical
+  spelling — a second spelling entering through the front door. Value groups are
+  now ASCII digits or nothing.
+
+### Changed
+
+- **BREAKING — `ObisCode`'s string and `serde` form is now `"1-0:1.8.0"`**, not
+  `"1-0:1.8.0*255"`. Both spellings still *parse*, so archives written under
+  either form still read; only what the crate *writes* changed. See "Migrating
+  stored OBIS codes" below.
+
+- **BREAKING — `IntervalResolution`'s `serde` form is now its ISO 8601 duration**
+  — `"PT15M"`, `"P1D"`, `"PT300S"` — instead of the derived Rust variant names
+  `"QuarterHour"`, `"Day"`, `{"Custom":300}`. This is the same defect one type
+  over: the value had a canonical string *and* a parallel serde encoding, and
+  the serde one was a variant rename away from silently invalidating stored
+  data. ISO 8601 is an external standard, so the new form cannot be renamed by
+  any refactor here. `Display` / `FromStr` are unchanged.
+
+- `ObisCode` now derives `PartialOrd` + `Ord`, ordering lexicographically by
+  value group (A, then B, … then F) — it is routinely used as a sort and merge
+  key.
+
+- The OBIS parser now tolerates surrounding whitespace and leading zeros, so
+  `"  01-00:01.08.00 "` from an EDIFACT segment normalises onto `"1-0:1.8.0"`.
+
+### Added
+
+- **`ObisCode::normalize(&str) -> Result<String, ParseError>`** — canonicalise a
+  raw string without building a value first, for consumers holding a database
+  column, a CSV cell or an MSCONS segment. Idempotent.
+- **`ObisCode::to_full_string()`** and the `{:#}` alternate format — the explicit
+  six-group form `1-0:1.8.0*255`, for systems that demand it. Parses back to the
+  same value.
+- `ObisCode::STORAGE_UNUSED` (255) and `ObisCode::has_unused_storage()`.
+- `ObisCode::MAX_LEN` (23) — the longest string a code can render as, for sizing
+  a fixed-width column. The canonical form is at most 19.
+- `ObisCode`'s `Display` now honours width, fill and alignment (`{:>13}`). It
+  wrote straight to the formatter before, so padding was silently dropped and
+  codes would not line up in a table. Rendering stays allocation-free.
+- Gas constants `GAS_NORMVOLUMEN_UMGEWERTET` (`7-0:13.2.0`), `GAS_ZUSTANDSZAHL`
+  (`7-0:52.0.22`) and `GAS_BRENNWERT_MONATSMITTEL` (`7-0:54.0.22`), plus a
+  warning on `GAS_VOLUME_M3` and in `conversion`: `gas_m3_to_kwh_hs` expects a
+  **Betriebsvolumen**. Passing an already-converted Normvolumen applies the
+  Zustandszahl twice and overstates the energy by a few percent, silently.
+- `tests/string_canonicalisation.rs` — stability, totality, idempotence and
+  injectivity under `proptest`, for the string form and the `serde` form, over
+  both `ObisCode` and `IntervalResolution`.
+- An `obis::mako_semantics_tests` module pinning every value-group rule above
+  against the EDI@Energy Codeliste, and README/rustdoc sections stating the
+  three rules that are read wrong most often: direction is C alone, D is a
+  Messart, E = 63 is the Fehlerregister.
+
+### Migrating stored OBIS codes
+
+Only rows written by this crate need rewriting, and only if you store the string
+rather than the six groups. The change is a suffix strip:
+
+```sql
+UPDATE readings
+   SET obis_code = left(obis_code, length(obis_code) - 4)
+ WHERE obis_code LIKE '%*255';
+```
+
+Run it over every table that keys on the code, then rebuild any index or
+materialised view derived from it. If you enforce the canonical shape with a
+check constraint, update it to reject a `*255` suffix rather than require one.
+Rows that already hold the short spelling are already canonical, and rows with a
+real storage group (`*0`, `*1`, …) must be left alone — the `WHERE` clause above
+does that.
+
+For `IntervalResolution`, map the old tags with
+`'QuarterHour' → 'PT15M'`, `'HalfHour' → 'PT30M'`, `'Hour' → 'PT1H'`,
+`'Day' → 'P1D'`, `'Month' → 'P1M'`, `'Year' → 'P1Y'`, and `{"Custom":n}` →
+`'PT{n}S'`.
+
 ## [0.15.0] — 2026-07-27
 
 A deliberate hard cut. Several fixes could not be made compatibly without

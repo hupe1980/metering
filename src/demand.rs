@@ -45,7 +45,13 @@ pub struct DemandInterval {
     pub to: OffsetDateTime,
     /// Average power demand during this interval (kW).
     pub demand_kw: Decimal,
-    /// OBIS code of the demand measurement (typically `1-0:1.29.0*255`).
+    /// OBIS code of the **Lastgang** this demand was derived from — typically
+    /// `1-0:1.29.0`, which carries kWh per interval, not kW.
+    ///
+    /// The meter's own maximum register is `1-0:1.6.0`
+    /// ([`ObisCode::STROM_BEZUG_MAXIMUM`](crate::ObisCode::STROM_BEZUG_MAXIMUM)),
+    /// a different channel; this field names the source series, so a reader can
+    /// tell a derived peak from a metered one.
     pub obis_code: Option<crate::obis::ObisCode>,
 }
 

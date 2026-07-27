@@ -1,0 +1,33 @@
+[package]
+name         = "metering"
+description  = "German energy metering domain library — Europe/Berlin calendar arithmetic (DST-correct interval counts), interval types, Gas conversion (m3→kWh_Hs), billing period aggregation (Spitzenleistung, HT/NT), SLP/RLM/iMSys classification, Mehr-/Mindermengensaldo, and Hampel-filter quality scoring. Zero I/O, no async, no clock, exact decimal quantities."
+version      = "0.15.0"
+authors      = ["hupe1980"]
+edition      = "2024"
+license      = "MIT OR Apache-2.0"
+repository   = "https://github.com/hupe1980/metering"
+rust-version = "1.94"
+readme       = "README.md"
+keywords     = ["energy", "metering", "bdew", "mako", "msbg"]
+categories   = ["science", "data-structures"]
+
+[dependencies]
+rust_decimal = { version = "1", features = ["macros"] }
+serde        = { version = "1", features = ["derive"], optional = true }
+thiserror    = "2"
+time         = { version = "0.3", features = ["std", "macros", "serde-well-known", "parsing", "formatting"] }
+time-tz      = { version = "2", features = ["db"] }
+uuid         = { version = "1", features = ["v4", "v5", "serde"] }
+
+[features]
+default = []
+serde   = ["dep:serde", "rust_decimal/serde"]
+
+[dev-dependencies]
+proptest   = "1"
+serde_json = "1"
+time       = { version = "0.3", features = ["macros"] }
+
+# Standalone crate — its own workspace root so `cargo` does not walk up to a
+# parent workspace when built in place.
+[workspace]

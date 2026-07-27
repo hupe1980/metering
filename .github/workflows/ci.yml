@@ -1,0 +1,137 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # `rust-toolchain.toml` pins the MSRV. RUSTUP_TOOLCHAIN takes precedence over
+  # that file, so each job below selects its own toolchain explicitly.
+  RUSTUP_TOOLCHAIN: stable
+
+jobs:
+  fmt:
+    name: 🎨 rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    name: 📎 clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: clippy (default features)
+        run: cargo clippy --all-targets -- -D warnings
+      - name: clippy (all features)
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+  purity:
+    name: 🧊 purity
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # The crate guarantees equal inputs give equal outputs: no clock read, no
+      # I/O, no unsafe outside comments. Cheap to check, easy to regress.
+      - name: no ambient state in src/
+        run: |
+          hits="$(grep -rn --include='*.rs' -E \
+            'now_utc|SystemTime::now|Instant::now|std::(fs|env|net|process)|\bunsafe\b' \
+            src/ | grep -vE ':[[:space:]]*(///|//!|//)' || true)"
+          if [ -n "$hits" ]; then
+            echo "::error::ambient state or unsafe reached the source"
+            echo "$hits"
+            exit 1
+          fi
+          echo "pure: no clock, no I/O, no unsafe"
+
+  test:
+    name: 🧪 test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: test (default features)
+        run: cargo test --all-targets
+      - name: test (all features)
+        run: cargo test --all-features --all-targets
+      - name: doctests (all features)
+        run: cargo test --all-features --doc
+
+  features:
+    name: 🎛️ feature matrix
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: build (no default features)
+        run: cargo build --no-default-features
+      - name: build (serde)
+        run: cargo build --no-default-features --features serde
+
+  msrv:
+    name: 🦀 MSRV 1.94
+    runs-on: ubuntu-latest
+    env:
+      RUSTUP_TOOLCHAIN: "1.94"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.94"
+      - uses: Swatinem/rust-cache@v2
+      # Keep in sync with `rust-version` in Cargo.toml and `rust-toolchain.toml`.
+      - run: cargo check --all-features --all-targets
+
+  docs:
+    name: 📚 rustdoc
+    runs-on: ubuntu-latest
+    env:
+      RUSTDOCFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo doc --no-deps --all-features
+
+  package:
+    name: 📦 package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Catches missing files / bad metadata before a release tag is cut.
+      - run: cargo publish --dry-run --all-features
+
+  audit:
+    name: 🛡️ audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}

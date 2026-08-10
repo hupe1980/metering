@@ -135,6 +135,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: rustsec/audit-check@v2
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@cargo-audit
+      # Run cargo-audit directly rather than via rustsec/audit-check: that action
+      # reports through the Checks API, which needs `checks: write` and is
+      # read-only for pull requests from forks, so it fails the job on the
+      # permission rather than on any finding. The exit code is the signal.
+      - run: cargo audit --deny warnings

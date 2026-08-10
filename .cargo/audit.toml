@@ -1,0 +1,16 @@
+# cargo-audit configuration — https://github.com/rustsec/rustsec/tree/main/cargo-audit
+#
+# `cargo audit` reads Cargo.lock, and a lockfile records the union of every
+# optional dependency in the graph — including ones no feature combination of
+# this crate ever compiles. An advisory against such a crate is real for someone,
+# but not reachable from here.
+
+[advisories]
+ignore = [
+    # rkyv 0.7.46, out-of-bounds read on archives containing Rc/Arc. Reached only
+    # through `rust_decimal/rkyv`, an optional feature nothing here enables —
+    # `cargo tree -e normal --all-features -i rkyv` prints nothing. rust_decimal
+    # 1.42.1 is the latest release and still pins rkyv 0.7. Drop this once it
+    # moves to rkyv >= 0.8.17.
+    "RUSTSEC-2026-0235",
+]

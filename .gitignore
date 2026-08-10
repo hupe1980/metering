@@ -20,5 +20,7 @@ target
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
 
-# Zola build output
+# Zola build output. `/public/` too: `--output-dir` resolves against the working
+# directory rather than `--root`, so a stray invocation lands it at the repo root.
 site/public/
+/public/

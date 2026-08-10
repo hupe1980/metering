@@ -113,7 +113,7 @@ site:
 # 🌐 Build the site and validate every internal link
 site-build:
     zola --root site check
-    zola --root site build --output-dir public --force
+    zola --root site build --force
 
 # 🧹 Remove build artifacts
 clean:

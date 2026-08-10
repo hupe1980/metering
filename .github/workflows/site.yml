@@ -35,8 +35,11 @@ jobs:
       # build failure, not something a reader discovers.
       - name: check links
         run: zola --root site check
+      # No `--output-dir`: it resolves against the working directory, not
+      # `--root`, so passing one writes to ./public while the upload below looks
+      # in site/public. The default is <root>/public, which is what we want.
       - name: build
-        run: zola --root site build --output-dir public --force
+        run: zola --root site build --force
       - uses: actions/upload-pages-artifact@v3
         with:
           path: site/public

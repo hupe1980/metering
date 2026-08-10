@@ -1,0 +1,75 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="hero">
+  <h1>German energy metering, <em>correct by construction</em></h1>
+  <p class="lede">
+    A pure Rust domain library for the quantity calculations German metering
+    requires — Europe/Berlin calendar arithmetic that knows a day is sometimes
+    23 hours, Zählerstandsgang to Lastgang, gas m³→kWh_Hs, Ersatzwertbildung
+    with an audit trail, and §14a Modul 3 tariff registers.
+  </p>
+  <p class="badges">
+    <span class="chip">Zero I/O</span>
+    <span class="chip">No async</span>
+    <span class="chip">No clock</span>
+    <span class="chip">Exact decimals</span>
+  </p>
+  <div class="cta">
+    <a class="btn primary" href="{{ get_url(path='@/docs/getting-started.md') }}">Get started</a>
+    <a class="btn" href="{{ config.extra.api_docs }}">API reference</a>
+  </div>
+<pre class="install"><code>cargo add metering</code></pre>
+</section>
+
+<section class="why">
+  <h2>Three things it gets right that are easy to get wrong</h2>
+  <div class="cards">
+    <article>
+      <h3>A German day is not 24 hours</h3>
+      <p>
+        23 hours each spring, 25 each autumn. A completeness check built on a
+        hard-coded 96 quarter-hours raises a false alarm every March and
+        <strong>hides a real four-interval gap every October</strong>, because 96
+        of an expected 100 looks complete.
+      </p>
+      <p><a href="{{ get_url(path='@/docs/time-and-calendar.md') }}">Time and the calendar →</a></p>
+    </article>
+    <article>
+      <h3>The meter counts, it does not measure intervals</h3>
+      <p>
+        Since June 2025 the gateway delivers a <em>Zählerstandsgang</em> and the
+        Messstellenbetreiber differences it into the Lastgang. Register wraps,
+        implausible jumps and meter exchanges all live at that boundary.
+      </p>
+      <p><a href="{{ get_url(path='@/docs/readings.md') }}">Readings and intervals →</a></p>
+    </article>
+    <article>
+      <h3>Every citation is checked</h3>
+      <p>
+        Provisions are quoted from the published text and dated. Where a claim
+        could not be verified — the 2025 SLP dynamisation is printed as an image
+        — the library says so instead of asserting it.
+      </p>
+      <p><a href="{{ get_url(path='@/docs/regulatory-basis.md') }}">Regulatory basis →</a></p>
+    </article>
+  </div>
+</section>
+
+<section class="sample">
+  <h2>What using it looks like</h2>
+{{ section.content | safe }}
+</section>
+
+<section class="scope">
+  <h2>What it deliberately does not do</h2>
+  <table>
+    <thead><tr><th>Not here</th><th>Why</th><th>Where instead</th></tr></thead>
+    <tbody>
+      <tr><td>Money — prices, tariffs, invoices</td><td>the output is kWh, m³ and kW</td><td>your billing layer</td></tr>
+      <tr><td>EDIFACT / XML market messages</td><td>parsing a MSCONS is not arithmetic</td><td><a href="https://github.com/hupe1980/mako">mako</a></td></tr>
+      <tr><td>Fristen — counting Werktage to a deadline</td><td>a process-engine concern</td><td>your process engine</td></tr>
+      <tr><td>SMGW certificates and device inventory</td><td>PKI and asset tracking, not quantities</td><td>your device management</td></tr>
+    </tbody>
+  </table>
+</section>
+{% endblock %}

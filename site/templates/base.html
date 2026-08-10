@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="{{ lang | default(value="en") }}">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+
+{%- set page_title = title | default(value=config.title) -%}
+{%- set page_desc = description | default(value=config.description) -%}
+{%- set page_url = permalink | default(value=config.base_url) -%}
+
+<title>{% if title and title != config.title %}{{ title }} · {{ config.title }}{% else %}{{ config.title }} — German energy metering for Rust{% endif %}</title>
+<meta name="description" content="{{ page_desc }}">
+<link rel="canonical" href="{{ page_url }}">
+
+<meta property="og:type" content="{% if page %}article{% else %}website{% endif %}">
+<meta property="og:site_name" content="{{ config.title }}">
+<meta property="og:title" content="{{ page_title }}">
+<meta property="og:description" content="{{ page_desc }}">
+<meta property="og:url" content="{{ page_url }}">
+<meta property="og:locale" content="en">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:title" content="{{ page_title }}">
+<meta name="twitter:description" content="{{ page_desc }}">
+
+<link rel="alternate" type="application/atom+xml" title="{{ config.title }}" href="{{ get_url(path='atom.xml', trailing_slash=false) }}">
+<link rel="icon" href="{{ get_url(path='favicon.svg', trailing_slash=false) }}" type="image/svg+xml">
+<link rel="stylesheet" href="{{ get_url(path='style.css', trailing_slash=false) }}">
+
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "SoftwareSourceCode",
+  "name": "{{ config.title }}",
+  "description": "{{ config.description }}",
+  "codeRepository": "{{ config.extra.repo }}",
+  "programmingLanguage": "Rust",
+  "license": "https://spdx.org/licenses/MIT.html",
+  "author": { "@type": "Person", "name": "{{ config.extra.author }}" },
+  "url": "{{ config.base_url }}"
+}
+</script>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="site">
+  <a class="brand" href="{{ get_url(path='@/_index.md') }}">
+    <span class="bolt" aria-hidden="true">⚡</span><b>metering</b>
+  </a>
+  <nav aria-label="Main">
+    <a href="{{ get_url(path='@/docs/_index.md') }}">Docs</a>
+    <a href="{{ config.extra.api_docs }}">API</a>
+    <a href="{{ config.extra.crate }}">crates.io</a>
+    <a href="{{ config.extra.repo }}">GitHub</a>
+  </nav>
+</header>
+
+<main id="main">{% block content %}{% endblock %}</main>
+
+<footer class="site">
+  <p>
+    <a href="{{ config.extra.repo }}">Source</a> ·
+    <a href="{{ config.extra.repo }}/blob/main/CHANGELOG.md">Changelog</a> ·
+    MIT or Apache-2.0
+  </p>
+  <p class="fine">
+    Statutory citations are quoted from the published text and dated. Nothing
+    here is legal advice.
+  </p>
+</footer>
+</body>
+</html>

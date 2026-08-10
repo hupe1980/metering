@@ -1,6 +1,8 @@
 //! §42c EnWG Energy-Sharing metering eligibility — pure decision logic.
 //!
-//! Energy Sharing has been in force since **1 June 2026**. Its binding practical
+//! Energy Sharing has been in force since **1 June 2026**, initially within the
+//! Bilanzierungsgebiet of a single Verteilernetzbetreiber; from 1 June 2028 it
+//! extends to adjacent Bilanzierungsgebiete in the same Regelzone. Its binding practical
 //! constraint is not the allocation engine — it is which delivery points can
 //! produce quarter-hour values at all. §42c Abs. 1 admits a point only when both
 //! consumption *and* generation are measured by:
@@ -83,29 +85,178 @@ impl EligibilityBasis {
     }
 }
 
+// ── Findings ──────────────────────────────────────────────────────────────────
+
+/// Why an assessment reached the verdict it did.
+///
+/// A closed vocabulary rather than the `Vec<String>` of German prose this used
+/// to return. A domain library that emits display text has decided the
+/// caller's language, their wording and their formatting, and left them
+/// nothing to match on: routing a readiness report by *reason* meant
+/// `contains("fernauslesbar")`. Render these where the language is known.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "SCREAMING_SNAKE_CASE"))]
+#[non_exhaustive]
+pub enum Finding {
+    /// The meter is flagged as not remotely readable, so no series of
+    /// viertelstündig ermittelte Zählerstände can be transmitted.
+    NotRemotelyReadable,
+    /// A moderne Messeinrichtung has no gateway and no interval series
+    /// (§ 2 Satz 1 Nr. 15 MsbG).
+    ModerneMesseinrichtungWithoutGateway,
+    /// The Bilanzierungsmethode yields no quarter-hour values.
+    BalancingMethodHasNoQuarterHourValues,
+    /// The meter type is neither an iMSys nor covered by RLM.
+    MeterTypeQualifiesForNeitherLimb,
+    /// No Zählertyp in the master data.
+    ZaehlertypMissing,
+    /// No Bilanzierungsmethode on the Marktlokation.
+    BilanzierungsmethodeMissing,
+    /// No readings at all in the observation window.
+    NoReadings,
+    /// Readings arrived, but not at quarter-hour resolution.
+    NotQuarterHourResolution,
+    /// The interval length could not be determined from the series.
+    ResolutionUndeterminable,
+    /// Coverage is below the configured threshold.
+    CoverageBelowThreshold,
+}
+
+impl Finding {
+    /// Every finding, in declaration order.
+    pub const ALL: [Self; 10] = [
+        Self::NotRemotelyReadable,
+        Self::ModerneMesseinrichtungWithoutGateway,
+        Self::BalancingMethodHasNoQuarterHourValues,
+        Self::MeterTypeQualifiesForNeitherLimb,
+        Self::ZaehlertypMissing,
+        Self::BilanzierungsmethodeMissing,
+        Self::NoReadings,
+        Self::NotQuarterHourResolution,
+        Self::ResolutionUndeterminable,
+        Self::CoverageBelowThreshold,
+    ];
+
+    /// A German rendering, for an operator-facing report.
+    ///
+    /// Provided as a convenience, not as the interface: match on the variant.
+    #[must_use]
+    pub const fn description_de(self) -> &'static str {
+        match self {
+            Self::NotRemotelyReadable => {
+                "Zähler ist als nicht fernauslesbar gekennzeichnet — keine \
+                 Zählerstandsgangmessung möglich"
+            }
+            Self::ModerneMesseinrichtungWithoutGateway => {
+                "moderne Messeinrichtung ohne Smart-Meter-Gateway \
+                 (§ 2 Satz 1 Nr. 15 MsbG) — iMSys-Rollout oder RLM erforderlich"
+            }
+            Self::BalancingMethodHasNoQuarterHourValues => {
+                "Bilanzierungsmethode liefert keine Viertelstundenwerte"
+            }
+            Self::MeterTypeQualifiesForNeitherLimb => "Zählertyp ist weder iMSys noch RLM",
+            Self::ZaehlertypMissing => "kein Zählertyp im Stammdatensatz hinterlegt",
+            Self::BilanzierungsmethodeMissing => "keine Bilanzierungsmethode an der Marktlokation",
+            Self::NoReadings => "keine Messwerte im Betrachtungszeitraum",
+            Self::NotQuarterHourResolution => "Messwerte liegen nicht viertelstündlich vor",
+            Self::ResolutionUndeterminable => "Intervalllänge konnte nicht bestimmt werden",
+            Self::CoverageBelowThreshold => "Abdeckung unter der Schwelle",
+        }
+    }
+}
+
 // ── Capability (master data) ──────────────────────────────────────────────────
+
+/// The metering equipment installed at a delivery point.
+///
+/// Modelled on the BO4E `Zaehlertyp` value set, narrowed to the distinctions
+/// § 42c turns on. Anything that is a meter but not one of the first two is
+/// [`Conventional`](Self::Conventional) — a Drehstromzähler, a Wechselstrom-
+/// zähler and a Ferraris meter differ in ways § 42c does not care about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "SCREAMING_SNAKE_CASE"))]
+pub enum Zaehlertyp {
+    /// Intelligentes Messsystem — a modern meter behind a Smart-Meter-Gateway
+    /// (§ 2 Satz 1 Nr. 7 MsbG).
+    IntelligentesMesssystem,
+    /// Moderne Messeinrichtung — reflects consumption and usage time, but has
+    /// no gateway and produces no interval series (§ 2 Satz 1 Nr. 15 MsbG).
+    /// **Not** sufficient for § 42c on its own.
+    ModerneMesseinrichtung,
+    /// Any conventional meter: Drehstrom-, Wechselstrom-, Ferrariszähler.
+    Conventional,
+}
+
+impl Zaehlertyp {
+    /// Every variant, in declaration order.
+    pub const ALL: [Self; 3] = [
+        Self::IntelligentesMesssystem,
+        Self::ModerneMesseinrichtung,
+        Self::Conventional,
+    ];
+}
+
+/// How the Marktlokation is balanced (`Marktlokation.bilanzierungsmethode`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "SCREAMING_SNAKE_CASE"))]
+pub enum Bilanzierungsmethode {
+    /// Registrierende Leistungsmessung — the second § 42c limb, sufficient on
+    /// its own and needing no gateway.
+    Rlm,
+    /// Standardlastprofil — no quarter-hour values.
+    Slp,
+    /// Zählerstandsgangmessung at an intelligentes Messsystem.
+    Ims,
+    /// Temperaturabhängiges Lastprofil (Gas). § 42c is Strom-only, so this can
+    /// never qualify.
+    Tlp,
+    /// Pauschale Abrechnung — no measurement at all.
+    Pauschal,
+}
+
+impl Bilanzierungsmethode {
+    /// Every variant, in declaration order.
+    pub const ALL: [Self; 5] = [Self::Rlm, Self::Slp, Self::Ims, Self::Tlp, Self::Pauschal];
+
+    /// `true` when the method produces no quarter-hour series and so rules the
+    /// point out on its own.
+    #[must_use]
+    pub const fn precludes_quarter_hour_values(self) -> bool {
+        matches!(self, Self::Slp | Self::Tlp | Self::Pauschal)
+    }
+}
 
 /// Device master data for one delivery point.
 ///
-/// All fields are `Option` because master data is routinely incomplete; the
+/// Every field is `Option` because master data is routinely incomplete, and the
 /// assessment reports *why* it could not decide rather than guessing.
-#[derive(Debug, Clone, Default)]
+///
+/// The two enum fields were free-text `Option<String>` compared with `==`
+/// against literals such as `"INTELLIGENTES_MESSSYSTEM"`. That silently
+/// disqualified every record whose source spelled the value differently —
+/// lowercase, hyphenated, or simply another vocabulary — and the resulting
+/// verdict was `Disqualified`, not `Unknown`, so nothing indicated a mapping
+/// bug. Parsing into these enums at the boundary makes an unmappable value an
+/// error where the raw string is still available to report.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MeteringCapabilityInput {
-    /// BO4E `Zaehlertyp` wire value, e.g. `INTELLIGENTES_MESSSYSTEM`,
-    /// `MODERNE_MESSEINRICHTUNG`, `DREHSTROMZAEHLER`.
-    pub zaehlertyp: Option<String>,
+    /// The installed metering equipment.
+    pub zaehlertyp: Option<Zaehlertyp>,
     /// BO4E `Zaehler.istFernauslesbar`. A meter that cannot be read remotely
     /// cannot supply a quarter-hour series regardless of its type.
     pub ist_fernauslesbar: Option<bool>,
-    /// `Marktlokation.bilanzierungsmethode` — `RLM` | `SLP` | `IMS` | `TLP_*` | `PAUSCHAL`.
-    pub bilanzierungsmethode: Option<String>,
+    /// How the Marktlokation is balanced.
+    pub bilanzierungsmethode: Option<Bilanzierungsmethode>,
     /// Whether an operational Smart-Meter-Gateway session exists for this point.
     pub smgw_operational: Option<bool>,
 }
 
 /// Outcome of the master-data capability assessment.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(rename_all = "SCREAMING_SNAKE_CASE"))]
 pub enum Capability {
     /// Master data supports a §42c-qualifying measurement.
@@ -139,75 +290,60 @@ impl Capability {
 /// MsbG an mME records consumption and usage time but has no gateway and no
 /// interval series.
 #[must_use]
-pub fn assess_capability(input: &MeteringCapabilityInput) -> (Capability, Vec<String>) {
-    let mut reasons = Vec::new();
-
-    let methode = input.bilanzierungsmethode.as_deref().map(str::trim);
-    let typ = input.zaehlertyp.as_deref().map(str::trim);
+pub fn assess_capability(input: &MeteringCapabilityInput) -> (Capability, Vec<Finding>) {
+    let mut findings = Vec::new();
+    let methode = input.bilanzierungsmethode;
+    let typ = input.zaehlertyp;
 
     // Limb 2 — viertelstündliche registrierende Leistungsmessung.
-    if methode == Some("RLM") {
+    if methode == Some(Bilanzierungsmethode::Rlm) {
         return (
             Capability::Qualified(EligibilityBasis::RegistrierendeLeistungsmessung),
-            reasons,
+            findings,
         );
     }
 
     // Limb 1 — Zählerstandsgangmessung via iMSys.
-    let looks_imsys = methode == Some("IMS")
-        || typ == Some("INTELLIGENTES_MESSSYSTEM")
+    let looks_imsys = methode == Some(Bilanzierungsmethode::Ims)
+        || typ == Some(Zaehlertyp::IntelligentesMesssystem)
         || input.smgw_operational == Some(true);
 
     if looks_imsys {
-        // Remote readability is a precondition, not a nicety: without it there is
-        // no series of viertelstündig ermittelte Zählerstände to transmit.
+        // Remote readability is a precondition, not a nicety: without it there
+        // is no series of viertelstündig ermittelte Zählerstände to transmit.
         if input.ist_fernauslesbar == Some(false) {
-            reasons.push(
-                "Zähler ist als nicht fernauslesbar gekennzeichnet — \
-                 keine Zählerstandsgangmessung möglich"
-                    .to_owned(),
-            );
-            return (Capability::Disqualified, reasons);
+            findings.push(Finding::NotRemotelyReadable);
+            return (Capability::Disqualified, findings);
         }
         return (
             Capability::Qualified(EligibilityBasis::Zaehlerstandsgangmessung),
-            reasons,
+            findings,
         );
     }
 
-    match typ {
-        Some("MODERNE_MESSEINRICHTUNG") => {
-            reasons.push(
-                "moderne Messeinrichtung ohne Smart-Meter-Gateway (§2 Satz 1 Nr. 15 MsbG) — \
-                 iMSys-Rollout oder RLM erforderlich"
-                    .to_owned(),
-            );
-            (Capability::Disqualified, reasons)
-        }
-        Some(_) if matches!(methode, Some("SLP") | Some("PAUSCHAL")) => {
-            reasons.push(format!(
-                "Bilanzierungsmethode {} liefert keine Viertelstundenwerte",
-                methode.unwrap_or("?")
-            ));
-            (Capability::Disqualified, reasons)
-        }
-        _ => {
-            if typ.is_none() {
-                reasons.push("kein Zählertyp im Stammdatensatz hinterlegt".to_owned());
-            }
-            if methode.is_none() {
-                reasons.push("keine Bilanzierungsmethode an der Marktlokation".to_owned());
-            }
-            if reasons.is_empty() {
-                reasons.push(format!(
-                    "Zählertyp {} ist weder iMSys noch RLM",
-                    typ.unwrap_or("?")
-                ));
-                return (Capability::Disqualified, reasons);
-            }
-            (Capability::Unknown, reasons)
-        }
+    if typ == Some(Zaehlertyp::ModerneMesseinrichtung) {
+        findings.push(Finding::ModerneMesseinrichtungWithoutGateway);
+        return (Capability::Disqualified, findings);
     }
+
+    if methode.is_some_and(Bilanzierungsmethode::precludes_quarter_hour_values) {
+        findings.push(Finding::BalancingMethodHasNoQuarterHourValues);
+        return (Capability::Disqualified, findings);
+    }
+
+    // Nothing positive and nothing disqualifying: say which field is missing
+    // rather than guessing from the other.
+    if typ.is_none() {
+        findings.push(Finding::ZaehlertypMissing);
+    }
+    if methode.is_none() {
+        findings.push(Finding::BilanzierungsmethodeMissing);
+    }
+    if findings.is_empty() {
+        findings.push(Finding::MeterTypeQualifiesForNeitherLimb);
+        return (Capability::Disqualified, findings);
+    }
+    (Capability::Unknown, findings)
 }
 
 // ── Delivery (observed data) ──────────────────────────────────────────────────
@@ -230,7 +366,7 @@ pub struct DeliveryEvidenceInput {
 
 /// Whether the point is in fact delivering a quarter-hour series.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(rename_all = "SCREAMING_SNAKE_CASE"))]
 pub enum Delivery {
     /// Quarter-hour values observed at or above the coverage threshold.
@@ -254,43 +390,38 @@ pub const DEFAULT_COVERAGE_THRESHOLD_PCT: f64 = 95.0;
 pub fn assess_delivery(
     input: &DeliveryEvidenceInput,
     coverage_threshold_pct: f64,
-) -> (Delivery, Vec<String>) {
-    let mut reasons = Vec::new();
-
+) -> (Delivery, Vec<Finding>) {
     if input.reading_count == 0 {
-        reasons.push("keine Messwerte im Betrachtungszeitraum".to_owned());
-        return (Delivery::Absent, reasons);
+        return (Delivery::Absent, vec![Finding::NoReadings]);
     }
 
     if input.resolution != Some(IntervalResolution::QuarterHour) {
-        reasons.push(match input.resolution {
-            Some(r) => format!(
-                "Messwerte liegen im Intervall {} ({}) vor, nicht viertelstündlich",
-                r.label(),
-                r
-            ),
-            None => "Intervalllänge konnte nicht bestimmt werden".to_owned(),
-        });
-        return (Delivery::Insufficient, reasons);
+        let finding = if input.resolution.is_some() {
+            Finding::NotQuarterHourResolution
+        } else {
+            Finding::ResolutionUndeterminable
+        };
+        return (Delivery::Insufficient, vec![finding]);
     }
 
-    if let Some(cov) = input.coverage_pct
-        && cov < coverage_threshold_pct
+    if input
+        .coverage_pct
+        .is_some_and(|cov| cov < coverage_threshold_pct)
     {
-        reasons.push(format!(
-            "Abdeckung {cov:.1} % unter Schwelle {coverage_threshold_pct:.1} %"
-        ));
-        return (Delivery::Insufficient, reasons);
+        return (
+            Delivery::Insufficient,
+            vec![Finding::CoverageBelowThreshold],
+        );
     }
 
-    (Delivery::Delivering, reasons)
+    (Delivery::Delivering, Vec::new())
 }
 
 // ── Combined verdict ──────────────────────────────────────────────────────────
 
 /// Overall §42c readiness for one delivery point.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(rename_all = "SCREAMING_SNAKE_CASE"))]
 pub enum SharingReadiness {
     /// Capable and delivering — can join a sharing community today.
@@ -349,11 +480,15 @@ pub const fn combine(capability: Capability, delivery: Delivery) -> SharingReadi
 mod tests {
     use super::*;
 
-    fn cap(zt: Option<&str>, fern: Option<bool>, bm: Option<&str>) -> MeteringCapabilityInput {
+    fn cap(
+        zt: Option<Zaehlertyp>,
+        fern: Option<bool>,
+        bm: Option<Bilanzierungsmethode>,
+    ) -> MeteringCapabilityInput {
         MeteringCapabilityInput {
-            zaehlertyp: zt.map(str::to_owned),
+            zaehlertyp: zt,
             ist_fernauslesbar: fern,
-            bilanzierungsmethode: bm.map(str::to_owned),
+            bilanzierungsmethode: bm,
             smgw_operational: None,
         }
     }
@@ -362,7 +497,11 @@ mod tests {
     fn rlm_qualifies_without_a_gateway() {
         // §42c Abs. 1: "oder durch eine viertelstündliche registrierende
         // Leistungsmessung" — an independent limb.
-        let (c, _) = assess_capability(&cap(Some("DREHSTROMZAEHLER"), None, Some("RLM")));
+        let (c, _) = assess_capability(&cap(
+            Some(Zaehlertyp::Conventional),
+            None,
+            Some(Bilanzierungsmethode::Rlm),
+        ));
         assert_eq!(
             c,
             Capability::Qualified(EligibilityBasis::RegistrierendeLeistungsmessung)
@@ -371,7 +510,11 @@ mod tests {
 
     #[test]
     fn imsys_qualifies_on_the_zsg_limb() {
-        let (c, _) = assess_capability(&cap(Some("INTELLIGENTES_MESSSYSTEM"), Some(true), None));
+        let (c, _) = assess_capability(&cap(
+            Some(Zaehlertyp::IntelligentesMesssystem),
+            Some(true),
+            None,
+        ));
         assert_eq!(
             c,
             Capability::Qualified(EligibilityBasis::Zaehlerstandsgangmessung)
@@ -381,25 +524,30 @@ mod tests {
     #[test]
     fn imsys_that_cannot_be_read_remotely_is_disqualified() {
         let (c, reasons) = assess_capability(&cap(
-            Some("INTELLIGENTES_MESSSYSTEM"),
+            Some(Zaehlertyp::IntelligentesMesssystem),
             Some(false),
-            Some("IMS"),
+            Some(Bilanzierungsmethode::Ims),
         ));
         assert_eq!(c, Capability::Disqualified);
-        assert!(reasons[0].contains("fernauslesbar"), "{reasons:?}");
+        assert_eq!(reasons, vec![Finding::NotRemotelyReadable]);
     }
 
     #[test]
     fn moderne_messeinrichtung_is_not_sufficient() {
         // §2 Satz 1 Nr. 15 MsbG — no gateway, no interval series.
-        let (c, reasons) = assess_capability(&cap(Some("MODERNE_MESSEINRICHTUNG"), None, None));
+        let (c, reasons) =
+            assess_capability(&cap(Some(Zaehlertyp::ModerneMesseinrichtung), None, None));
         assert_eq!(c, Capability::Disqualified);
-        assert!(reasons[0].contains("Gateway"), "{reasons:?}");
+        assert_eq!(reasons, vec![Finding::ModerneMesseinrichtungWithoutGateway]);
     }
 
     #[test]
     fn slp_is_disqualified() {
-        let (c, _) = assess_capability(&cap(Some("DREHSTROMZAEHLER"), None, Some("SLP")));
+        let (c, _) = assess_capability(&cap(
+            Some(Zaehlertyp::Conventional),
+            None,
+            Some(Bilanzierungsmethode::Slp),
+        ));
         assert_eq!(c, Capability::Disqualified);
     }
 
@@ -407,7 +555,14 @@ mod tests {
     fn missing_master_data_is_unknown_not_a_guess() {
         let (c, reasons) = assess_capability(&cap(None, None, None));
         assert_eq!(c, Capability::Unknown);
-        assert_eq!(reasons.len(), 2, "both gaps reported: {reasons:?}");
+        assert_eq!(
+            reasons,
+            vec![
+                Finding::ZaehlertypMissing,
+                Finding::BilanzierungsmethodeMissing
+            ],
+            "both gaps reported"
+        );
     }
 
     #[test]
@@ -419,10 +574,16 @@ mod tests {
         };
         let (d, reasons) = assess_delivery(&ev, DEFAULT_COVERAGE_THRESHOLD_PCT);
         assert_eq!(d, Delivery::Insufficient);
-        // The reason names the resolution in both German and ISO 8601 rather
-        // than a raw second count, which read as "3600-Sekunden-Intervalle".
-        assert!(reasons[0].contains("Stunde"), "{reasons:?}");
-        assert!(reasons[0].contains("PT1H"), "{reasons:?}");
+        assert_eq!(reasons, vec![Finding::NotQuarterHourResolution]);
+
+        // "could not tell" is a different finding from "told, and it is wrong".
+        let unknown = DeliveryEvidenceInput {
+            resolution: None,
+            reading_count: 100,
+            ..Default::default()
+        };
+        let (_, reasons) = assess_delivery(&unknown, DEFAULT_COVERAGE_THRESHOLD_PCT);
+        assert_eq!(reasons, vec![Finding::ResolutionUndeterminable]);
     }
 
     #[test]
@@ -433,8 +594,20 @@ mod tests {
             reading_count: 100,
             ..Default::default()
         };
-        let (d, _) = assess_delivery(&ev, DEFAULT_COVERAGE_THRESHOLD_PCT);
+        let (d, reasons) = assess_delivery(&ev, DEFAULT_COVERAGE_THRESHOLD_PCT);
         assert_eq!(d, Delivery::Insufficient);
+        assert_eq!(reasons, vec![Finding::CoverageBelowThreshold]);
+    }
+
+    /// Findings are a closed vocabulary a caller can match on, and every one of
+    /// them can still be rendered for a human.
+    #[test]
+    fn findings_are_matchable_and_renderable() {
+        for f in Finding::ALL {
+            assert!(!f.description_de().is_empty(), "{f:?}");
+        }
+        let (_, reasons) = assess_capability(&cap(None, None, None));
+        assert!(reasons.contains(&Finding::ZaehlertypMissing));
     }
 
     #[test]

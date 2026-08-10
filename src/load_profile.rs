@@ -2,8 +2,14 @@
 //!
 //! ## Legal basis
 //!
-//! - **BDEW Repräsentative VDEW-Lastprofile** (1999, updated 2015): defines
-//!   the standard profiles used for German SLP metering.
+//! - **VDEW Repräsentative Lastprofile** (1999): the original profiles.
+//! - **BDEW "Hinweise zu den aktualisierten Standardlastprofilen Strom"**
+//!   (17.03.2025): the first revision since 1999, built by BTU EVU Beratung on
+//!   2018–2023 data. Their use is explicitly **voluntary** — *"Jedem
+//!   Netzbetreiber steht es weiterhin frei, bei der Bilanzierung auf die
+//!   aktualisierten Profile aus dem Jahr 2025, die alten Profile aus dem Jahr
+//!   1999, eigene Profile oder eine Mischung der verschiedenen Optionen
+//!   zurückzugreifen."*
 //! - **§12 StromNZV / GaBi Gas 2.1 (BK7-24-01-008)**: the duty to apply standardised load
 //!   profiles below 100 000 kWh/a (Strom) and 1.5 million kWh/a (Gas).
 //!   ⚠️ Both ordinances were **repealed with effect from the end of
@@ -11,7 +17,8 @@
 //!   Nr. 405); the substance now lives in BNetzA Festlegungen.
 //!   (Neither StromGVV nor GasGVV ever governed load profiles — §18 of each is
 //!   "Berechnungsfehler".)
-//! - **BK6-22-024 (GPKE)**: SLP MaLos use profiles for advance billing and MaBiS.
+//! - **GPKE / MaBiS**, in the consolidated Lesefassung of BNetzA **BK6-24-174**:
+//!   SLP Marktlokationen are balanced and billed against a profile.
 //!
 //! ## Profile families
 //!
@@ -96,12 +103,10 @@ pub enum LoadProfile {
     P0,
 
     // ── Aktualisierte BDEW-Profile 2025 ──────────────────────────────────────
-    // BDEW Anwendungshilfe "Hinweise zu den aktualisierten Standardlastprofilen
-    // Strom", 17.03.2025: first revision of the 1999 VDEW profiles. Twelve
-    // monthly seasons × three day types (WT/SA/FT, Bundesland holiday
-    // calendar), normed to 1 000 000 kWh/a. Their use in Bilanzierung is
-    // explicitly voluntary — each NB may keep the 1999 profiles, use its own,
-    // or mix.
+    // BDEW "Hinweise zu den aktualisierten Standardlastprofilen Strom",
+    // 17.03.2025. Twelve monthly seasons × three day types (WT/SA/FT) against
+    // the bundeslandspezifischer Feiertagskalender, normed to 1 000 000 kWh/a.
+    // See `DynamicSlpProfile` for the quoted specification.
     /// H25 — aktualisiertes Haushaltsprofil (successor to H0).
     ///
     /// Delivered "entdynamisiert": the Dynamisierungsfunktion MUST be applied
@@ -254,9 +259,13 @@ impl LoadProfile {
     /// `true` for profiles delivered "entdynamisiert", to which the
     /// Dynamisierungsfunktion must be applied (H25, P25, S25).
     ///
-    /// G25 and L25 explicitly carry no Dynamisierung; the 1999 profiles keep
-    /// their historical handling (H0 dynamized, G0–G6/L0–L2 static).
-    /// Source: BDEW Anwendungshilfe aktualisierte SLP Strom, 17.03.2025.
+    /// G25 and L25 carry none, verbatim: *"Das Profil enthält keine
+    /// Dynamisierung und die Dynamisierungsfunktion ist hier nicht
+    /// anzuwenden."* The 1999 profiles keep their historical handling — H0
+    /// dynamized, G0–G6 and L0–L2 static.
+    ///
+    /// Source: BDEW *Hinweise zu den aktualisierten Standardlastprofilen
+    /// Strom*, 17.03.2025, §§2.1–2.5.
     #[must_use]
     pub fn requires_dynamization(self) -> bool {
         matches!(self, Self::H0 | Self::H25 | Self::P25 | Self::S25)
@@ -307,32 +316,54 @@ impl std::str::FromStr for LoadProfile {
 
 // ── Dynamisierung ─────────────────────────────────────────────────────────────
 
-/// The SLP Dynamisierungsfunktion — a quartic in the day of the year.
-///
-/// The classic VDEW dynamization polynomial (published with the 1999 H0
-/// profile and retained for the entdynamisiert 2025 household profiles):
+/// A Dynamisierungsfunktion — a quartic in the day of the year.
 ///
 /// ```text
 /// f(t) = a·t⁴ + b·t³ + c·t² + d·t + e
-///      = -3.92e-10·t⁴ + 3.2e-7·t³ − 7.02e-5·t² + 2.1e-3·t + 1.24
 /// ```
 ///
-/// where `t` is the day of the year (1 = 1 January).
+/// where `t` is the day of the year, `1` = 1 January. The coefficients are a
+/// field rather than a constant because **which** quartic applies is a property
+/// of the profile, and only one of them can be cited here — see
+/// [`vdew_1999`](Self::vdew_1999).
 ///
-/// Rounding per the BDEW Anwendungshilfe (17.03.2025), quoted: "Eine Rundung
-/// der Dynamisierungsfaktoren auf vier Nachkommastellen wird empfohlen. Das
-/// Ergebnis wird auf drei Nachkommastellen gerundet." — factors → 4 decimal
-/// places, dynamized value → 3 decimal places.
+/// ## Rounding
+///
+/// BDEW *Hinweise zu den aktualisierten Standardlastprofilen Strom*
+/// (17.03.2025), §2.1, verbatim: *"Eine Rundung der Dynamisierungsfaktoren auf
+/// vier Nachkommastellen wird empfohlen. Das Ergebnis wird auf drei
+/// Nachkommastellen gerundet."* — factors to four decimal places, the dynamized
+/// value to three. [`factor`](Self::factor) and [`apply`](Self::apply) do
+/// exactly that.
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct Dynamization {
-    /// Quartic coefficients (a, b, c, d, e).
+    /// Quartic coefficients `(a, b, c, d, e)`, highest power first.
     pub coefficients: [f64; 5],
 }
 
 impl Dynamization {
-    /// The published VDEW/BDEW dynamization polynomial.
+    /// The 1999 VDEW dynamization polynomial, published with the H0 profile:
+    ///
+    /// ```text
+    /// f(t) = −3.92e−10·t⁴ + 3.2e−7·t³ − 7.02e−5·t² + 2.1e−3·t + 1.24
+    /// ```
+    ///
+    /// ## This is the 1999 function, and only that
+    ///
+    /// The 2025 Anwendungshilfe prints its Dynamisierungsfunktion **as an
+    /// image**, so its coefficients cannot be read out of the published
+    /// document, quoted, or verified against this one. They may well be the
+    /// same quartic; this crate does not assert it either way.
+    ///
+    /// So `Dynamization` is a parameter throughout. An operator loading the
+    /// licensed 2025 tables supplies the function that came with them —
+    /// [`DynamicSlpProfile::dynamization`] — rather than inheriting a guess.
+    /// A wrong dynamization is a silent few-percent error on every SLP
+    /// settlement in the balance group, which is precisely the kind of claim
+    /// that should not be hard-coded on an assumption.
     #[must_use]
-    pub fn vdew() -> Self {
+    pub fn vdew_1999() -> Self {
         Self {
             coefficients: [-3.92e-10, 3.2e-7, -7.02e-5, 2.1e-3, 1.24],
         }
@@ -351,8 +382,8 @@ impl Dynamization {
     /// Apply the factor to a profile value; the result is rounded to 3
     /// decimal places per the Anwendungshilfe.
     #[must_use]
-    pub fn apply(&self, profile_value_kwh: Decimal, day_of_year: u16) -> Decimal {
-        (profile_value_kwh * self.factor(day_of_year)).round_dp(3)
+    pub fn apply(&self, profile_value: Decimal, day_of_year: u16) -> Decimal {
+        (profile_value * self.factor(day_of_year)).round_dp(3)
     }
 }
 
@@ -371,27 +402,53 @@ pub enum SlpDayType {
     SonnFeiertag,
 }
 
-/// A 2025-generation profile table: 12 monthly seasons × 3 day types ×
-/// 96 quarter-hours, normed to 1 000 000 kWh annual consumption.
+/// A 2025-generation profile table.
 ///
-/// The value tables are licensed BDEW data and are **not** embedded here —
-/// the operator loads them (CSV/DB) into this container. The library
-/// contributes the shape, the lookup, and the Dynamisierung rules.
+/// BDEW *Hinweise zu den aktualisierten Standardlastprofilen Strom*
+/// (17.03.2025), §1, states the shape verbatim:
+///
+/// > Alle neuen Profile arbeiten nun mit **zwölf Monaten (Saisons)**. […] Alle
+/// > neuen Profile arbeiten mit **drei Typtagen**: Werktage (WT), Samstage (SA)
+/// > sowie Sonn- und Feiertage (FT). […] Es gilt der **bundeslandspezifische
+/// > Feiertagskalender** nach Definition des BDEW. […] Alle Profile sind auf
+/// > **1 Mio. kWh** Jahresverbrauchsmenge normiert.
+///
+/// So the table is 12 × 3 × 96 values, and the day type is resolved against the
+/// **delivery point's Bundesland** — which is what
+/// [`crate::slp_day_type`] does and why it takes a
+/// [`Bundesland`](crate::Bundesland).
+///
+/// The value tables themselves are licensed BDEW data and are **not** embedded
+/// here; the operator loads them into this container. The library contributes
+/// the shape, the lookup and the Dynamisierung rules.
 #[derive(Debug, Clone, Default)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct DynamicSlpProfile {
     /// Which profile the table belongs to (H25/G25/L25/P25/S25).
     pub profile: Option<LoadProfile>,
-    /// `values[(month, day_type)]` → 96 quarter-hour kWh values.
+    /// `values[(month, day_type)]` → 96 quarter-hour values.
     /// `month` is 1..=12.
     pub values: std::collections::BTreeMap<(u8, SlpDayType), Vec<Decimal>>,
+    /// The Dynamisierungsfunktion that came with the table.
+    ///
+    /// Supplied rather than assumed: the 2025 Anwendungshilfe publishes its
+    /// function as an image, so this crate cannot verify its coefficients — see
+    /// [`Dynamization::vdew_1999`]. `None` on a profile that
+    /// [`requires_dynamization`](LoadProfile::requires_dynamization) makes
+    /// [`value_at`](Self::value_at) return `None` rather than silently
+    /// returning an entdynamisiert value as if it were a real one.
+    pub dynamization: Option<Dynamization>,
 }
 
 impl DynamicSlpProfile {
     /// The profile value for `month` (1..=12), `day_type`, `quarter` (0..96),
-    /// with the Dynamisierungsfunktion applied when the profile requires it.
+    /// with the Dynamisierungsfunktion applied when the profile requires one.
     ///
-    /// Returns `None` when the table has no entry for the key.
+    /// Returns `None` when the table has no entry for the key, **or** when the
+    /// profile needs dynamizing and no [`dynamization`](Self::dynamization) was
+    /// supplied. The second case is deliberate: an entdynamisiert H25 value is
+    /// not a load-profile value, and returning it as one understates winter and
+    /// overstates summer by up to a quarter.
     #[must_use]
     pub fn value_at(
         &self,
@@ -405,12 +462,52 @@ impl DynamicSlpProfile {
             .get(&(month, day_type))
             .and_then(|day| day.get(quarter))
             .copied()?;
-        let dynamize = self.profile.is_none_or(LoadProfile::requires_dynamization);
-        Some(if dynamize {
-            Dynamization::vdew().apply(raw, day_of_year)
-        } else {
-            raw
-        })
+        // An unknown profile is treated as needing dynamization: the safe
+        // failure is refusing to answer, not answering with a raw value.
+        if self.profile.is_none_or(LoadProfile::requires_dynamization) {
+            return Some(self.dynamization?.apply(raw, day_of_year));
+        }
+        Some(raw)
+    }
+
+    /// [`value_at`](Self::value_at) for a calendar date, resolving the month,
+    /// the day type and the day of the year from it.
+    ///
+    /// This is the lookup an SLP settlement actually performs: it has a date, a
+    /// Bundesland and a quarter-hour index, not a pre-computed day type.
+    ///
+    /// ```rust
+    /// use metering::load_profile::{DynamicSlpProfile, Dynamization, SlpDayType};
+    /// use metering::{Bundesland, LoadProfile};
+    /// use rust_decimal::dec;
+    /// use time::macros::date;
+    ///
+    /// let mut h25 = DynamicSlpProfile {
+    ///     profile: Some(LoadProfile::H25),
+    ///     dynamization: Some(Dynamization::vdew_1999()),
+    ///     ..Default::default()
+    /// };
+    /// h25.values.insert((6, SlpDayType::SonnFeiertag), vec![dec!(100); 96]);
+    ///
+    /// // Fronleichnam 2026 is a Thursday — but a Sonn-/Feiertag in Bavaria.
+    /// let bavarian = h25.value_on(date!(2026 - 06 - 04), Bundesland::By, 0);
+    /// assert!(bavarian.is_some());
+    /// // In Berlin the same date is a Werktag, and that table is not loaded.
+    /// assert!(h25.value_on(date!(2026 - 06 - 04), Bundesland::Be, 0).is_none());
+    /// ```
+    #[must_use]
+    pub fn value_on(
+        &self,
+        date: time::Date,
+        land: crate::holiday::Bundesland,
+        quarter: usize,
+    ) -> Option<Decimal> {
+        self.value_at(
+            u8::from(date.month()),
+            crate::holiday::slp_day_type(date, land),
+            quarter,
+            date.ordinal(),
+        )
     }
 
     /// `true` when all 12 × 3 day tables are present with 96 values each.
@@ -523,9 +620,9 @@ mod tests {
     }
 
     #[test]
-    fn vdew_dynamization_matches_published_shape() {
+    fn vdew_1999_dynamization_matches_the_published_shape() {
         use rust_decimal::dec;
-        let d = Dynamization::vdew();
+        let d = Dynamization::vdew_1999();
         // Factors are 4-decimal rounded; winter above 1, summer below 1.
         let jan = d.factor(15);
         let jul = d.factor(196);
@@ -542,6 +639,7 @@ mod tests {
         use rust_decimal::dec;
         let mut h25 = DynamicSlpProfile {
             profile: Some(LoadProfile::H25),
+            dynamization: Some(Dynamization::vdew_1999()),
             ..Default::default()
         };
         h25.values
@@ -558,8 +656,72 @@ mod tests {
         assert_eq!(
             g25.value_at(1, SlpDayType::Werktag, 0, 15).unwrap(),
             dec!(100),
-            "G25 carries no Dynamisierung"
+            "G25 carries no Dynamisierung, and needs none supplied"
         );
         assert!(!g25.is_complete(), "one month/day-type is not a full table");
+    }
+
+    /// An entdynamisiert value is not a load-profile value. With no function
+    /// supplied the lookup refuses rather than handing back the raw table
+    /// entry, which would understate winter and overstate summer by up to a
+    /// quarter.
+    #[test]
+    fn a_profile_needing_dynamization_refuses_without_a_function() {
+        use rust_decimal::dec;
+        let mut h25 = DynamicSlpProfile {
+            profile: Some(LoadProfile::H25),
+            dynamization: None,
+            ..Default::default()
+        };
+        h25.values
+            .insert((1, SlpDayType::Werktag), vec![dec!(100); 96]);
+        assert_eq!(h25.value_at(1, SlpDayType::Werktag, 0, 15), None);
+
+        // The same table with a function answers.
+        h25.dynamization = Some(Dynamization::vdew_1999());
+        assert!(h25.value_at(1, SlpDayType::Werktag, 0, 15).is_some());
+
+        // An unknown profile is treated as needing one, for the same reason.
+        let unknown = DynamicSlpProfile {
+            profile: None,
+            values: h25.values.clone(),
+            dynamization: None,
+        };
+        assert_eq!(unknown.value_at(1, SlpDayType::Werktag, 0, 15), None);
+    }
+
+    /// The date-based lookup resolves month, day type and day-of-year together,
+    /// against the delivery point's Bundesland — the calendar the BDEW
+    /// Anwendungshilfe names.
+    #[test]
+    fn the_date_lookup_uses_the_bundesland_calendar() {
+        use crate::Bundesland;
+        use rust_decimal::dec;
+        use time::macros::date;
+
+        let mut h25 = DynamicSlpProfile {
+            profile: Some(LoadProfile::H25),
+            dynamization: Some(Dynamization::vdew_1999()),
+            ..Default::default()
+        };
+        // Only the June Sonn-/Feiertag table is loaded.
+        h25.values
+            .insert((6, SlpDayType::SonnFeiertag), vec![dec!(100); 96]);
+
+        // Fronleichnam 2026 is a Thursday, and a Feiertag only in some Länder.
+        let fronleichnam = date!(2026 - 06 - 04);
+        assert!(h25.value_on(fronleichnam, Bundesland::By, 0).is_some());
+        assert!(
+            h25.value_on(fronleichnam, Bundesland::Be, 0).is_none(),
+            "in Berlin it is a Werktag, and that table is not loaded"
+        );
+
+        // The dynamization factor follows the day of the year, so two dates in
+        // the same month and day type still differ.
+        h25.values
+            .insert((1, SlpDayType::SonnFeiertag), vec![dec!(100); 96]);
+        let new_year = h25.value_on(date!(2026 - 01 - 01), Bundesland::By, 0);
+        let midsummer = h25.value_on(date!(2026 - 06 - 07), Bundesland::By, 0);
+        assert!(new_year > midsummer, "winter runs above summer");
     }
 }

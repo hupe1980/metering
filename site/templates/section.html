@@ -1,0 +1,18 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="layout">
+  {% include "_sidebar.html" %}
+  <article class="prose">
+    <h1>{{ section.title }}</h1>
+    {{ section.content | safe }}
+    <nav class="toc-list" aria-label="Pages in this section">
+      <h2>Pages</h2>
+      <ul>
+      {% for p in section.pages %}
+        <li><a href="{{ p.permalink }}">{{ p.title }}</a>{% if p.description %} — {{ p.description }}{% endif %}</li>
+      {% endfor %}
+      </ul>
+    </nav>
+  </article>
+</div>
+{% endblock %}

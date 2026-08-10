@@ -22,19 +22,41 @@
 //!
 //! ## Legal basis
 //!
-//! - **§42b Abs. 5 EnWG (Solarpaket I)** — GGV community allocation formulas
-//! - **BDEW Anwendungshilfe "Berechnungsformeln Solarpaket 1"** v1.0, 25.01.2024
-//! - **§42a EEG** — residual metering for feed-in compensation
-//! - **GPKE BK6-22-024** — portfolio aggregation for BKV settlement
-//! - **BSI TR-03109** — SMGW sub-metering aggregation for §14a
+//! - **§ 42b EnWG — Gemeinschaftliche Gebäudeversorgung** (Solarpaket I). Abs. 5
+//!   caps the allocation, verbatim: *"die rechnerisch aufteilbare Strommenge
+//!   \[ist\] begrenzt … auf die Strommenge, die innerhalb eines
+//!   15-Minuten-Zeitintervalls in der Solaranlage erzeugt oder von allen
+//!   teilnehmenden Letztverbrauchern verbraucht wird, je nachdem welche dieser
+//!   Strommengen geringer ist."*
+//!
+//!   Note the cap is on the **pool**: the lesser of generation and *total*
+//!   participant consumption. The per-tenant cap this module applies —
+//!   `max(0, …)`, so no tenant is credited more PV than they themselves drew —
+//!   comes from the BDEW Anwendungshilfe's `Pos()` operator, not from that
+//!   sentence. Earlier releases attributed a per-tenant sentence to Abs. 5 that
+//!   the provision does not contain.
+//! - **BDEW Anwendungshilfe "Beispiele von Berechnungsformeln für das
+//!   Solarpaket 1"** v1.0, 25.01.2024 — the worked allocation formulas.
+//! - **MaBiS** (BNetzA BK6-07-002, Lesefassung BK6-24-174) — portfolio
+//!   aggregation for Bilanzkreis settlement.
 
 use std::collections::{HashMap, HashSet};
+use std::hash::BuildHasher;
 
 use rust_decimal::Decimal;
 use time::OffsetDateTime;
 
 use crate::aggregation_rule::AggregationRule;
 use crate::interval::{MeterInterval, QualityFlag};
+
+/// Source series keyed by MaLo / MeLo ID.
+///
+/// Generic over the hasher so a caller already holding an `FxHashMap` or an
+/// `ahash::HashMap` can pass it directly, instead of rebuilding the map — which
+/// for a year of quarter-hours across a GGV community is a large copy to make
+/// for a type parameter.
+pub type SourceMap<S = std::collections::hash_map::RandomState> =
+    HashMap<String, Vec<MeterInterval>, S>;
 
 // ── VirtualMeterError ─────────────────────────────────────────────────────────
 
@@ -74,9 +96,9 @@ pub enum VirtualMeterError {
 ///
 /// - [`VirtualMeterError::MissingSource`] when a required MaLo is absent.
 /// - [`VirtualMeterError::InvalidFractions`] for invalid GGV fractions.
-pub fn compute_virtual_meter(
+pub fn compute_virtual_meter<S: BuildHasher>(
     rule: &AggregationRule,
-    sources: &HashMap<String, Vec<MeterInterval>>,
+    sources: &SourceMap<S>,
 ) -> Result<Vec<MeterInterval>, VirtualMeterError> {
     match rule {
         AggregationRule::Sum { source_malo_ids } => compute_sum(source_malo_ids, sources),
@@ -103,21 +125,22 @@ pub fn compute_virtual_meter(
 
 // ── Sum ───────────────────────────────────────────────────────────────────────
 
-fn compute_sum(
+fn compute_sum<S: BuildHasher>(
     malo_ids: &[String],
-    sources: &HashMap<String, Vec<MeterInterval>>,
+    sources: &SourceMap<S>,
 ) -> Result<Vec<MeterInterval>, VirtualMeterError> {
     for id in malo_ids {
         if !sources.contains_key(id.as_str()) {
             return Err(VirtualMeterError::MissingSource(id.clone()));
         }
     }
+    let index = SourceIndex::build(sources);
     let aligned = aligned_timestamps(malo_ids.iter().map(String::as_str), sources);
     let mut result = Vec::with_capacity(aligned.len());
     for ts in aligned {
         let Some(ivs) = malo_ids
             .iter()
-            .map(|id| lookup(sources, id, ts))
+            .map(|id| index.get(id, ts))
             .collect::<Option<Vec<_>>>()
         else {
             continue;
@@ -126,15 +149,15 @@ fn compute_sum(
         let mut quality = QualityFlag::Measured;
         let mut end: Option<OffsetDateTime> = None;
         for iv in ivs {
-            sum += iv.value_kwh;
-            quality = worst_quality(quality, iv.quality);
+            sum += iv.value;
+            quality = quality.worse_of(iv.quality);
             end = Some(iv.to);
         }
         if let Some(to) = end {
             result.push(MeterInterval {
                 from: ts,
                 to,
-                value_kwh: sum,
+                value: sum,
                 quality,
                 obis_code: None,
             });
@@ -145,10 +168,10 @@ fn compute_sum(
 
 // ── Residual ──────────────────────────────────────────────────────────────────
 
-fn compute_residual(
+fn compute_residual<S: BuildHasher>(
     total_id: &str,
     subtract_ids: &[String],
-    sources: &HashMap<String, Vec<MeterInterval>>,
+    sources: &SourceMap<S>,
 ) -> Result<Vec<MeterInterval>, VirtualMeterError> {
     if !sources.contains_key(total_id) {
         return Err(VirtualMeterError::MissingSource(total_id.to_owned()));
@@ -158,16 +181,17 @@ fn compute_residual(
             return Err(VirtualMeterError::MissingSource(id.clone()));
         }
     }
+    let index = SourceIndex::build(sources);
     let all_ids = std::iter::once(total_id).chain(subtract_ids.iter().map(String::as_str));
     let aligned = aligned_timestamps(all_ids, sources);
     let mut result = Vec::with_capacity(aligned.len());
     for ts in aligned {
-        let Some(total_iv) = lookup(sources, total_id, ts) else {
+        let Some(total_iv) = index.get(total_id, ts) else {
             continue;
         };
         let Some(subtract_ivs) = subtract_ids
             .iter()
-            .map(|id| lookup(sources, id, ts))
+            .map(|id| index.get(id, ts))
             .collect::<Option<Vec<_>>>()
         else {
             continue;
@@ -175,13 +199,13 @@ fn compute_residual(
         let mut subtract_sum = Decimal::ZERO;
         let mut quality = total_iv.quality;
         for iv in subtract_ivs {
-            subtract_sum += iv.value_kwh;
-            quality = worst_quality(quality, iv.quality);
+            subtract_sum += iv.value;
+            quality = quality.worse_of(iv.quality);
         }
         result.push(MeterInterval {
             from: ts,
             to: total_iv.to,
-            value_kwh: total_iv.value_kwh - subtract_sum,
+            value: total_iv.value - subtract_sum,
             quality,
             obis_code: None,
         });
@@ -191,10 +215,10 @@ fn compute_residual(
 
 // ── PV net grid ───────────────────────────────────────────────────────────────
 
-fn compute_net_grid(
+fn compute_net_grid<S: BuildHasher>(
     grid_id: &str,
     gen_id: &str,
-    sources: &HashMap<String, Vec<MeterInterval>>,
+    sources: &SourceMap<S>,
 ) -> Result<Vec<MeterInterval>, VirtualMeterError> {
     if !sources.contains_key(grid_id) {
         return Err(VirtualMeterError::MissingSource(grid_id.to_owned()));
@@ -202,20 +226,19 @@ fn compute_net_grid(
     if !sources.contains_key(gen_id) {
         return Err(VirtualMeterError::MissingSource(gen_id.to_owned()));
     }
+    let index = SourceIndex::build(sources);
     let aligned = aligned_timestamps([grid_id, gen_id].iter().copied(), sources);
     let mut result = Vec::with_capacity(aligned.len());
     for ts in aligned {
-        let (Some(grid_iv), Some(gen_iv)) =
-            (lookup(sources, grid_id, ts), lookup(sources, gen_id, ts))
-        else {
+        let (Some(grid_iv), Some(gen_iv)) = (index.get(grid_id, ts), index.get(gen_id, ts)) else {
             continue;
         };
         // Net grid draw: positive = consuming from grid, negative = exporting
         result.push(MeterInterval {
             from: ts,
             to: grid_iv.to,
-            value_kwh: grid_iv.value_kwh - gen_iv.value_kwh,
-            quality: worst_quality(grid_iv.quality, gen_iv.quality),
+            value: grid_iv.value - gen_iv.value,
+            quality: grid_iv.quality.worse_of(gen_iv.quality),
             obis_code: None,
         });
     }
@@ -235,11 +258,11 @@ fn compute_net_grid(
 /// cannot "receive" more PV energy than they actually consumed in the interval,
 /// satisfying §42b Abs. 5 EnWG: "begrenzt auf die durch ihn in diesem
 /// Zeitintervall verbrauchte Strommenge."
-fn compute_ggv_constant(
+fn compute_ggv_constant<S: BuildHasher>(
     plant_id: &str,
     tenant_id: &str,
     fraction: Decimal,
-    sources: &HashMap<String, Vec<MeterInterval>>,
+    sources: &SourceMap<S>,
 ) -> Result<Vec<MeterInterval>, VirtualMeterError> {
     if !sources.contains_key(plant_id) {
         return Err(VirtualMeterError::MissingSource(plant_id.to_owned()));
@@ -251,26 +274,25 @@ fn compute_ggv_constant(
         return Err(VirtualMeterError::InvalidFractions { sum: fraction });
     }
 
+    let index = SourceIndex::build(sources);
     let aligned = aligned_timestamps([plant_id, tenant_id].iter().copied(), sources);
     let mut result = Vec::with_capacity(aligned.len());
     for ts in aligned {
-        let (Some(plant_iv), Some(tenant_iv)) = (
-            lookup(sources, plant_id, ts),
-            lookup(sources, tenant_id, ts),
-        ) else {
+        let (Some(plant_iv), Some(tenant_iv)) = (index.get(plant_id, ts), index.get(tenant_id, ts))
+        else {
             continue;
         };
 
         // allocated = fraction × plant_generation (UTILTS Z82 × ZG6)
-        let allocated = fraction * plant_iv.value_kwh;
+        let allocated = fraction * plant_iv.value;
         // net_grid_draw = Pos(consumption - allocated) = max(0, consumption - allocated)
-        let net_grid_draw = (tenant_iv.value_kwh - allocated).max(Decimal::ZERO);
+        let net_grid_draw = (tenant_iv.value - allocated).max(Decimal::ZERO);
 
         result.push(MeterInterval {
             from: ts,
             to: tenant_iv.to,
-            value_kwh: net_grid_draw,
-            quality: worst_quality(plant_iv.quality, tenant_iv.quality),
+            value: net_grid_draw,
+            quality: plant_iv.quality.worse_of(tenant_iv.quality),
             obis_code: None,
         });
     }
@@ -292,11 +314,11 @@ fn compute_ggv_constant(
 /// `net_grid_draw[t] = 0`. This matches the BDEW Anwendungshilfe note:
 /// "Ist die Energiemenge einer Marktlokation zugeordneten Messlokation = 0,
 /// so ist auch der Verbrauch der Marktlokation auf 0 zu setzen."
-fn compute_ggv_proportional(
+fn compute_ggv_proportional<S: BuildHasher>(
     plant_id: &str,
     tenant_id: &str,
     all_tenant_ids: &[String],
-    sources: &HashMap<String, Vec<MeterInterval>>,
+    sources: &SourceMap<S>,
 ) -> Result<Vec<MeterInterval>, VirtualMeterError> {
     if !sources.contains_key(plant_id) {
         return Err(VirtualMeterError::MissingSource(plant_id.to_owned()));
@@ -316,21 +338,20 @@ fn compute_ggv_proportional(
     let all_ids: Vec<&str> = std::iter::once(plant_id)
         .chain(all_tenant_ids.iter().map(String::as_str))
         .collect();
+    let index = SourceIndex::build(sources);
     let aligned = aligned_timestamps(all_ids.iter().copied(), sources);
     let mut result = Vec::with_capacity(aligned.len());
 
     for ts in aligned {
-        let (Some(plant_iv), Some(tenant_iv)) = (
-            lookup(sources, plant_id, ts),
-            lookup(sources, tenant_id, ts),
-        ) else {
+        let (Some(plant_iv), Some(tenant_iv)) = (index.get(plant_id, ts), index.get(tenant_id, ts))
+        else {
             continue;
         };
 
         // Denominator: Σ all tenant consumptions
         let Some(total_consumption) = all_tenant_ids
             .iter()
-            .map(|id| lookup(sources, id, ts).map(|iv| iv.value_kwh))
+            .map(|id| index.get(id, ts).map(|iv| iv.value))
             .sum::<Option<Decimal>>()
         else {
             continue;
@@ -338,9 +359,9 @@ fn compute_ggv_proportional(
 
         // Dynamic ratio: protect against zero-division
         let net_grid_draw = if total_consumption > Decimal::ZERO {
-            let ratio = tenant_iv.value_kwh / total_consumption;
-            let allocated = ratio * plant_iv.value_kwh;
-            (tenant_iv.value_kwh - allocated).max(Decimal::ZERO)
+            let ratio = tenant_iv.value / total_consumption;
+            let allocated = ratio * plant_iv.value;
+            (tenant_iv.value - allocated).max(Decimal::ZERO)
         } else {
             // All tenants consume 0 → grid draw is 0
             Decimal::ZERO
@@ -349,13 +370,13 @@ fn compute_ggv_proportional(
         // Worst quality across plant + all tenants (any estimated interval affects output)
         let quality = all_tenant_ids
             .iter()
-            .filter_map(|id| lookup(sources, id, ts))
-            .fold(plant_iv.quality, |q, iv| worst_quality(q, iv.quality));
+            .filter_map(|id| index.get(id, ts))
+            .fold(plant_iv.quality, |q, iv| q.worse_of(iv.quality));
 
         result.push(MeterInterval {
             from: ts,
             to: tenant_iv.to,
-            value_kwh: net_grid_draw,
+            value: net_grid_draw,
             quality,
             obis_code: None,
         });
@@ -366,24 +387,23 @@ fn compute_ggv_proportional(
 // ── helpers ───────────────────────────────────────────────────────────────────
 
 /// Compute the intersection of timestamps across all named source series.
-fn aligned_timestamps<'a>(
+fn aligned_timestamps<'a, S: BuildHasher>(
     malo_ids: impl Iterator<Item = &'a str>,
-    sources: &HashMap<String, Vec<MeterInterval>>,
+    sources: &SourceMap<S>,
 ) -> Vec<OffsetDateTime> {
     let ids: Vec<&str> = malo_ids.collect();
-    if ids.is_empty() {
+    let Some((first, rest)) = ids.split_first() else {
         return Vec::new();
-    }
-    let first_set: HashSet<i64> = sources
-        .get(ids[0])
-        .map(|ivs| ivs.iter().map(|iv| iv.from.unix_timestamp()).collect())
-        .unwrap_or_default();
-
-    let intersection = ids[1..].iter().fold(first_set, |acc, id| {
-        let other: HashSet<i64> = sources
-            .get(*id)
+    };
+    let series = |id: &str| -> HashSet<i64> {
+        sources
+            .get(id)
             .map(|ivs| ivs.iter().map(|iv| iv.from.unix_timestamp()).collect())
-            .unwrap_or_default();
+            .unwrap_or_default()
+    };
+
+    let intersection = rest.iter().fold(series(first), |acc, id| {
+        let other = series(id);
         acc.intersection(&other).copied().collect()
     });
 
@@ -395,39 +415,44 @@ fn aligned_timestamps<'a>(
         .collect()
 }
 
-/// Find the interval starting at `ts` in the named source series.
+/// Every source series indexed by interval start, so a per-timestamp lookup is
+/// a hash probe rather than a scan.
 ///
-/// `aligned_timestamps` guarantees the timestamp exists in every series, so a
-/// `None` can only mean the caller mutated `sources` in between — the compute
-/// fns skip such a timestamp rather than panic (a pure library must not abort
-/// the process on inconsistent input).
-fn lookup<'a>(
-    sources: &'a HashMap<String, Vec<MeterInterval>>,
-    malo_id: &str,
-    ts: OffsetDateTime,
-) -> Option<&'a MeterInterval> {
-    let unix = ts.unix_timestamp();
-    sources
-        .get(malo_id)
-        .and_then(|ivs| ivs.iter().find(|iv| iv.from.unix_timestamp() == unix))
+/// The scan it replaces made every rule quadratic in the series length: one
+/// linear `find` per source per aligned timestamp. On a year of quarter-hours
+/// that is 35 040² probes per source — the difference between a virtual meter
+/// that computes in milliseconds and one that appears to hang.
+struct SourceIndex<'a> {
+    by_id: HashMap<&'a str, HashMap<i64, &'a MeterInterval>>,
 }
 
-fn quality_rank(q: QualityFlag) -> u8 {
-    match q {
-        QualityFlag::Faulty | QualityFlag::Unknown => 5,
-        QualityFlag::Preliminary => 4,
-        QualityFlag::Estimated => 3,
-        QualityFlag::Corrected | QualityFlag::Substituted => 2,
-        QualityFlag::Calculated => 1,
-        QualityFlag::Measured => 0,
+impl<'a> SourceIndex<'a> {
+    fn build<S: BuildHasher>(sources: &'a SourceMap<S>) -> Self {
+        let by_id = sources
+            .iter()
+            .map(|(id, ivs)| {
+                let index = ivs
+                    .iter()
+                    .map(|iv| (iv.from.unix_timestamp(), iv))
+                    .collect();
+                (id.as_str(), index)
+            })
+            .collect();
+        Self { by_id }
     }
-}
 
-fn worst_quality(a: QualityFlag, b: QualityFlag) -> QualityFlag {
-    if quality_rank(a) >= quality_rank(b) {
-        a
-    } else {
-        b
+    /// The interval starting at `ts` in the named source series.
+    ///
+    /// `aligned_timestamps` guarantees the timestamp exists in every required
+    /// series, so `None` means the series carries two intervals with the same
+    /// start and the later one displaced the earlier, or the id is absent. The
+    /// compute functions skip such a timestamp rather than panic: a pure
+    /// library must not abort the process on inconsistent input.
+    fn get(&self, malo_id: &str, ts: OffsetDateTime) -> Option<&'a MeterInterval> {
+        self.by_id
+            .get(malo_id)
+            .and_then(|index| index.get(&ts.unix_timestamp()))
+            .copied()
     }
 }
 
@@ -443,7 +468,7 @@ mod tests {
         MeterInterval {
             from,
             to: from + Duration::minutes(15),
-            value_kwh: kwh,
+            value: kwh,
             quality,
             obis_code: None,
         }
@@ -476,7 +501,7 @@ mod tests {
         };
         let result = compute_virtual_meter(&rule, &map).unwrap();
         assert_eq!(result.len(), 2);
-        assert_eq!(result[0].value_kwh, dec!(5.0));
+        assert_eq!(result[0].value, dec!(5.0));
     }
 
     #[test]
@@ -507,8 +532,8 @@ mod tests {
         };
         let result = compute_virtual_meter(&rule, &map).unwrap();
         assert_eq!(result.len(), 2);
-        assert_eq!(result[0].value_kwh, dec!(7.0));
-        assert_eq!(result[1].value_kwh, dec!(6.0));
+        assert_eq!(result[0].value, dec!(7.0));
+        assert_eq!(result[1].value, dec!(6.0));
     }
 
     #[test]
@@ -524,7 +549,7 @@ mod tests {
             subtract_malo_ids: vec!["PV".to_owned()],
         };
         let result = compute_virtual_meter(&rule, &map).unwrap();
-        assert_eq!(result[0].value_kwh, dec!(-4.0));
+        assert_eq!(result[0].value, dec!(-4.0));
     }
 
     // ── PV net grid ───────────────────────────────────────────────────────────
@@ -542,7 +567,7 @@ mod tests {
             generation_malo_id: "GEN".to_owned(),
         };
         let result = compute_virtual_meter(&rule, &map).unwrap();
-        assert_eq!(result[0].value_kwh, dec!(2.0));
+        assert_eq!(result[0].value, dec!(2.0));
     }
 
     // ── GGV constant allocation (§42b Beispiel 1) ────────────────────────────
@@ -569,7 +594,7 @@ mod tests {
         };
         let result = compute_virtual_meter(&rule, &map).unwrap();
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0].value_kwh, dec!(4.0), "net grid draw = 5 - 1 = 4");
+        assert_eq!(result[0].value, dec!(4.0), "net grid draw = 5 - 1 = 4");
     }
 
     #[test]
@@ -594,11 +619,7 @@ mod tests {
             fraction: dec!(0.90),
         };
         let result = compute_virtual_meter(&rule, &map).unwrap();
-        assert_eq!(
-            result[0].value_kwh,
-            dec!(0.0),
-            "pos(2 - 9) = 0 — cap enforced"
-        );
+        assert_eq!(result[0].value, dec!(0.0), "pos(2 - 9) = 0 — cap enforced");
     }
 
     #[test]
@@ -649,12 +670,8 @@ mod tests {
             fraction: dec!(0.5),
         };
         let result = compute_virtual_meter(&rule, &map).unwrap();
-        assert_eq!(result[0].value_kwh, dec!(0.0), "3 - 5 < 0 → max(0)");
-        assert_eq!(
-            result[1].value_kwh,
-            dec!(3.0),
-            "no PV → full load from grid"
-        );
+        assert_eq!(result[0].value, dec!(0.0), "3 - 5 < 0 → max(0)");
+        assert_eq!(result[1].value, dec!(3.0), "no PV → full load from grid");
     }
 
     #[test]
@@ -715,8 +732,8 @@ mod tests {
 
         let r2 = compute_virtual_meter(&rule_t2, &map).unwrap();
         let r3 = compute_virtual_meter(&rule_t3, &map).unwrap();
-        assert_eq!(r2[0].value_kwh, dec!(0.0), "T2 fully covered by PV");
-        assert_eq!(r3[0].value_kwh, dec!(0.0), "T3 fully covered by PV");
+        assert_eq!(r2[0].value, dec!(0.0), "T2 fully covered by PV");
+        assert_eq!(r3[0].value, dec!(0.0), "T3 fully covered by PV");
     }
 
     #[test]
@@ -751,11 +768,11 @@ mod tests {
 
         let r2 = compute_virtual_meter(&rule_t2, &map).unwrap();
         let r3 = compute_virtual_meter(&rule_t3, &map).unwrap();
-        assert_eq!(r2[0].value_kwh, dec!(0.8));
-        assert_eq!(r3[0].value_kwh, dec!(3.2));
+        assert_eq!(r2[0].value, dec!(0.8));
+        assert_eq!(r3[0].value, dec!(3.2));
         // total PV delivered = (2-0.8) + (8-3.2) = 1.2 + 4.8 = 6 = plant generation
         assert_eq!(
-            (dec!(2.0) - r2[0].value_kwh) + (dec!(8.0) - r3[0].value_kwh),
+            (dec!(2.0) - r2[0].value) + (dec!(8.0) - r3[0].value),
             dec!(6.0)
         );
     }
@@ -784,7 +801,7 @@ mod tests {
         };
         let result = compute_virtual_meter(&rule, &map).unwrap();
         assert_eq!(
-            result[0].value_kwh,
+            result[0].value,
             dec!(0.0),
             "zero total → zero draw (no division by zero)"
         );
@@ -814,7 +831,7 @@ mod tests {
             all_tenant_melo_ids: vec!["T2".to_owned(), "T3".to_owned()],
         };
         let result = compute_virtual_meter(&rule, &map).unwrap();
-        assert_eq!(result[0].value_kwh, dec!(0.0), "§42b cap: no negative draw");
+        assert_eq!(result[0].value, dec!(0.0), "§42b cap: no negative draw");
     }
 
     #[test]
@@ -847,7 +864,7 @@ mod tests {
         };
         let result = compute_virtual_meter(&rule, &map).unwrap();
         assert_eq!(result.len(), 1, "only ts=15 is in both series");
-        assert_eq!(result[0].value_kwh, dec!(3.0));
+        assert_eq!(result[0].value, dec!(3.0));
     }
 
     // ── Quality propagation ────────────────────────────────────────────────────

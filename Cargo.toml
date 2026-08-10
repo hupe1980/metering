@@ -1,7 +1,7 @@
 [package]
 name         = "metering"
-description  = "German energy metering domain library — Europe/Berlin calendar arithmetic (DST-correct interval counts), interval types, Gas conversion (m3→kWh_Hs), billing period aggregation (Spitzenleistung, HT/NT), SLP/RLM/iMSys classification, Mehr-/Mindermengensaldo, and Hampel-filter quality scoring. Zero I/O, no async, no clock, exact decimal quantities."
-version      = "0.16.0"
+description  = "German energy metering domain library — DST-correct Europe/Berlin calendar arithmetic, gas m3→kWh_Hs conversion, billing-period aggregation, Ersatzwertbildung, a robust validation engine, Bundesland holiday calendar and SLP/RLM/iMSys classification. Zero I/O, no async, no clock, exact decimal quantities."
+version      = "0.17.0"
 authors      = ["hupe1980"]
 edition      = "2024"
 license      = "MIT OR Apache-2.0"
@@ -22,6 +22,14 @@ uuid         = { version = "1", features = ["v4", "v5", "serde"] }
 [features]
 default = []
 serde   = ["dep:serde", "rust_decimal/serde"]
+
+# docs.rs builds with default features unless told otherwise, which would hide
+# every `serde` impl — including the wire representation this crate documents as
+# semver-covered. Feature labels on the gated items come from `doc_auto_cfg`,
+# which is automatic since Rust 1.92 and so needs no rustdoc flag at our MSRV.
+[package.metadata.docs.rs]
+all-features = true
+targets      = ["x86_64-unknown-linux-gnu"]
 
 [dev-dependencies]
 proptest   = "1"

@@ -24,8 +24,12 @@
 //!
 //! ## Scope
 //!
-//! Everything here is Europe/Berlin, which is the market area this crate models
-//! (§ 20 StromNZV / GPKE settle in German local time). The rules come from the
+//! Everything here is Europe/Berlin, which is the market area this crate
+//! models. EDI@Energy *Allgemeine Festlegungen* v6.1b, Kap. 3 states the split
+//! this module exists to manage: *"Die Angabe von Zeiten in einer EDIFACT
+//! Nachricht erfolgt in koordinierter Weltzeit (UTC) … Alle in den Prozessen
+//! genannten Zeitpunkte … nutzen die gesetzliche deutsche Zeit."* Timestamps on
+//! the wire are UTC; periods and deadlines are MEZ/MESZ. The rules come from the
 //! IANA tz database via `time-tz`, so historical transitions are correct too —
 //! this is not a hard-coded "last Sunday in March" approximation.
 //! [`berlin`] exposes the timezone for callers needing something else.
@@ -227,6 +231,49 @@ pub fn day_kind(day: Date) -> DayKind {
         25 => DayKind::LongDay,
         _ => DayKind::Normal,
     }
+}
+
+/// The instant the UTC offset changes on a Berlin calendar day.
+///
+/// `None` on an ordinary day. On a transition day this is the moment the clock
+/// jumps: 01:00 UTC on both the spring and autumn Sundays under the current EU
+/// rule, though the tz database is what actually decides.
+///
+/// It is the anchor for the **repeated hour**. On the fall-back day, local
+/// 02:00–03:00 happens twice — once at UTC+2 before this instant and once at
+/// UTC+1 after it — so the two passes together occupy
+/// `[transition − 1 h, transition + 1 h)` in UTC.
+///
+/// ```rust
+/// use metering::calendar;
+/// use time::macros::{date, datetime};
+///
+/// // Autumn 2026: CEST ends at 01:00 UTC = 03:00 local, which becomes 02:00.
+/// assert_eq!(
+///     calendar::dst_transition_utc(date!(2026 - 10 - 25)),
+///     Some(datetime!(2026-10-25 1:00 UTC)),
+/// );
+/// assert_eq!(calendar::dst_transition_utc(date!(2026 - 07 - 20)), None);
+/// ```
+#[must_use]
+pub fn dst_transition_utc(day: Date) -> Option<OffsetDateTime> {
+    let start = day_start_utc(day);
+    let end = day_end_utc(day);
+    let first_offset = to_berlin(start).offset();
+    if to_berlin(end - Duration::seconds(1)).offset() == first_offset {
+        return None;
+    }
+    // Every transition in the tz database for this zone lands on a whole hour,
+    // so stepping hours finds it exactly rather than approximately.
+    let mut cursor = start;
+    while cursor < end {
+        let next = cursor + Duration::hours(1);
+        if to_berlin(next).offset() != to_berlin(cursor).offset() {
+            return Some(next);
+        }
+        cursor = next;
+    }
+    None
 }
 
 // ── expected interval counts ──────────────────────────────────────────────────
@@ -665,6 +712,30 @@ mod tests {
             date!(2028 - 01 - 16),
             "the naive shift drifts by the leap day"
         );
+    }
+
+    /// The transition instant anchors the repeated hour, so it is pinned on
+    /// both transitions and asserted absent on ordinary days.
+    #[test]
+    fn dst_transitions_are_located_to_the_instant() {
+        for (day, expected) in [
+            (date!(2026 - 03 - 29), Some(datetime!(2026-03-29 1:00 UTC))),
+            (date!(2026 - 10 - 25), Some(datetime!(2026-10-25 1:00 UTC))),
+            (date!(2025 - 10 - 26), Some(datetime!(2025-10-26 1:00 UTC))),
+            (date!(2026 - 07 - 20), None),
+            (date!(2026 - 01 - 15), None),
+        ] {
+            assert_eq!(dst_transition_utc(day), expected, "{day}");
+        }
+
+        // On the fall-back day the hour either side of the transition is the
+        // same local wall-clock hour, at two different offsets.
+        let t = dst_transition_utc(date!(2026 - 10 - 25)).unwrap();
+        let before = to_berlin(t - Duration::minutes(30));
+        let after = to_berlin(t + Duration::minutes(30));
+        assert_eq!(before.hour(), 2);
+        assert_eq!(after.hour(), 2);
+        assert_ne!(before.offset(), after.offset());
     }
 
     /// The tz database, not a hard-coded EU rule: Germany's 1980 transition was

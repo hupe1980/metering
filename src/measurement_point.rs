@@ -1,13 +1,25 @@
-//! Measurement point model — MaLo + MeLo + OBIS + market role binding.
+//! Measurement point — what is being metered, and on whose account.
 //!
-//! A [`MeasurementPoint`] is the logical binding of:
-//! - A physical location (MeLo)
-//! - A market billing location (MaLo)
-//! - A specific OBIS register
-//! - The accountable market role
+//! A [`MeasurementPoint`] binds one **OBIS register** on one meter to the
+//! market location it is billed against, for a stated validity period. It is
+//! the structural context that turns a bare [`crate::MeterInterval`] into a
+//! reading somebody can invoice.
 //!
-//! This is the structural metadata layer that connects raw [`crate::MeterInterval`]
-//! data to the regulatory and billing context required by German MaKo.
+//! ## One type, not two
+//!
+//! Earlier releases also carried a `MeterRegister` in a separate module. The
+//! two modelled the same thing — MaLo, meter serial, OBIS code, direction,
+//! validity — with two different direction enums (`EnergyFlow` and
+//! `EnergyDirection`) that could disagree about the same register. They had
+//! separate `is_import` / `is_bezug` predicates, and when those turned out to
+//! be able to report a point as both import *and* export, the bug had to be
+//! fixed twice because the concept existed twice.
+//!
+//! `MeterRegister`'s two genuinely distinct fields survive here: the
+//! [`wandler_factor`](MeasurementPoint::wandler_factor), and the register unit
+//! — which is now **derived** from the OBIS code
+//! ([`ObisCode::register_unit`](crate::ObisCode::register_unit)) rather than
+//! stored, since a stored unit can contradict the code that determines it.
 //!
 //! ## Relationship to MSCONS
 //!
@@ -31,12 +43,14 @@
 //! - **BDEW MaKo**: MaLo is the billing reference.
 //! - **BSI TR-03109**: Zählpunkt-ID ties MeLo to the SMGW.
 
+use rust_decimal::Decimal;
 use time::Date;
 
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
-use crate::obis::ObisCode;
+use crate::interval::Sparte;
+use crate::obis::{ObisCode, RegisterUnit};
 
 // ── MarktRolle ────────────────────────────────────────────────────────────────
 
@@ -99,10 +113,12 @@ impl MarktRolle {
 
 // ── EnergyFlow ────────────────────────────────────────────────────────────────
 
-/// Energy flow type at this measurement point.
+/// Which way energy flows at this measurement point.
 ///
-/// Determines billing logic: generation gets feed-in compensation (EEG),
-/// consumption triggers NNE (Netznutzungsentgelt) billing.
+/// The **one** direction enum in this crate. It is master data — a statement of
+/// what the point is for — and the OBIS code is the metered fact. Where the two
+/// disagree, [`MeasurementPoint::is_bezug`] and
+/// [`is_einspeisung`](MeasurementPoint::is_einspeisung) believe the code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[cfg_attr(feature = "serde", serde(rename_all = "SCREAMING_SNAKE_CASE"))]
@@ -111,12 +127,46 @@ pub enum EnergyFlow {
     Consumption,
     /// Generation — energy fed into the grid (Einspeisung).
     Generation,
-    /// Storage charging — battery, heat pump storage.
+    /// Storage charging. Consumption from the grid's point of view, kept
+    /// distinct because EEG and Redispatch treat a battery differently from a
+    /// load.
     StorageCharge,
-    /// Storage discharging.
+    /// Storage discharging. Generation from the grid's point of view.
     StorageDischarge,
-    /// Bidirectional — prosumer net metering (Vierquadrantenmessung).
+    /// Bidirectional — a four-quadrant meter at one connection point, where
+    /// neither direction is the point's purpose.
     Bidirectional,
+}
+
+impl EnergyFlow {
+    /// Every variant, in declaration order.
+    pub const ALL: [Self; 5] = [
+        Self::Consumption,
+        Self::Generation,
+        Self::StorageCharge,
+        Self::StorageDischarge,
+        Self::Bidirectional,
+    ];
+
+    /// `true` when energy flows out of the grid at this point — consumption,
+    /// or a storage unit charging.
+    #[must_use]
+    pub const fn draws_from_grid(self) -> bool {
+        matches!(self, Self::Consumption | Self::StorageCharge)
+    }
+
+    /// `true` when energy flows into the grid at this point — generation, or a
+    /// storage unit discharging.
+    #[must_use]
+    pub const fn feeds_grid(self) -> bool {
+        matches!(self, Self::Generation | Self::StorageDischarge)
+    }
+
+    /// `true` for a storage point in either direction.
+    #[must_use]
+    pub const fn is_storage(self) -> bool {
+        matches!(self, Self::StorageCharge | Self::StorageDischarge)
+    }
 }
 
 // ── MeasurementPoint ─────────────────────────────────────────────────────────
@@ -159,7 +209,7 @@ pub struct MeasurementPoint {
     pub obis_code: ObisCode,
 
     /// Energy commodity.
-    pub sparte: crate::interval::Sparte,
+    pub sparte: Sparte,
 
     /// Energy flow direction for this register.
     pub energy_flow: EnergyFlow,
@@ -172,6 +222,16 @@ pub struct MeasurementPoint {
 
     /// `true` when this is a virtual/derived measurement point (GGV, Residuallast).
     pub is_virtual: bool,
+
+    /// Multiplier from the raw counter display to the real quantity
+    /// (Wandlerfaktor).
+    ///
+    /// `1` for direct metering; 100–1000 for a Wandlermessung. **Every
+    /// [`MeterInterval`](crate::MeterInterval) in this crate is post-Wandler**:
+    /// the factor is applied when the counter is read, so this field is
+    /// traceability, and applying it a second time inflates consumption by the
+    /// factor.
+    pub wandler_factor: Decimal,
 
     /// Validity start (German local date, inclusive).
     pub valid_from: Date,
@@ -189,16 +249,42 @@ impl MeasurementPoint {
         on_date >= self.valid_from && self.valid_to.is_none_or(|end| on_date <= end)
     }
 
-    /// `true` when this point represents electricity (Strom) import.
+    /// `true` when this point measures Bezug — energy drawn from the grid.
+    ///
+    /// Decided by the **OBIS code**, which is the metered fact (direction is
+    /// value group C — see [`ObisCode::is_import`]), falling back to
+    /// [`energy_flow`](Self::energy_flow) only when the code carries no
+    /// direction, as a gas or heat code does not.
+    ///
+    /// The two used to be combined with `||`, which let a point whose
+    /// `energy_flow` said `Generation` and whose OBIS code said `1-0:1.8.0`
+    /// answer `true` to both this and [`is_einspeisung`](Self::is_einspeisung).
+    /// A pair of predicates that are simultaneously true is worse than either
+    /// being wrong, because nothing downstream can detect the contradiction.
     #[must_use]
     pub fn is_bezug(&self) -> bool {
-        matches!(self.energy_flow, EnergyFlow::Consumption) || self.obis_code.is_import()
+        if self.obis_code.is_import() {
+            return true;
+        }
+        if self.obis_code.is_export() {
+            return false;
+        }
+        matches!(self.energy_flow, EnergyFlow::Consumption)
     }
 
-    /// `true` when this point represents electricity feed-in (Einspeisung).
+    /// `true` when this point measures Einspeisung — energy fed into the grid.
+    ///
+    /// The mirror of [`is_bezug`](Self::is_bezug), and mutually exclusive with
+    /// it by construction.
     #[must_use]
     pub fn is_einspeisung(&self) -> bool {
-        matches!(self.energy_flow, EnergyFlow::Generation) || self.obis_code.is_einspeisung()
+        if self.obis_code.is_export() {
+            return true;
+        }
+        if self.obis_code.is_import() {
+            return false;
+        }
+        matches!(self.energy_flow, EnergyFlow::Generation)
     }
 
     /// `true` when this point measures Blindarbeit / Blindleistung —
@@ -211,7 +297,33 @@ impl MeasurementPoint {
     /// `true` when this point measures Gas.
     #[must_use]
     pub fn is_gas(&self) -> bool {
-        matches!(self.sparte, crate::interval::Sparte::Gas)
+        matches!(self.sparte, Sparte::Gas)
+    }
+
+    /// The unit this register counts in, derived from the OBIS code.
+    ///
+    /// `None` for a code whose unit this crate cannot name — see
+    /// [`ObisCode::register_unit`].
+    #[must_use]
+    pub fn unit(&self) -> Option<RegisterUnit> {
+        self.obis_code.register_unit()
+    }
+
+    /// Tariff register: `None` for the total, `Some(1)` for HT, `Some(2)` for
+    /// NT — see [`ObisCode::tariff_register`].
+    #[must_use]
+    pub fn tariff_register(&self) -> Option<u8> {
+        self.obis_code.tariff_register()
+    }
+
+    /// Apply the Wandlerfaktor to a raw counter reading.
+    ///
+    /// Only ever call this on a value straight off the meter display. Values
+    /// that reach [`MeterInterval`](crate::MeterInterval) have already had it
+    /// applied.
+    #[must_use]
+    pub fn apply_wandler(&self, raw_display_value: Decimal) -> Decimal {
+        raw_display_value * self.wandler_factor
     }
 }
 
@@ -220,7 +332,7 @@ impl MeasurementPoint {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{interval::Sparte, obis::ObisCode};
+    use rust_decimal::dec;
     use time::macros::date;
 
     fn bezug_point() -> MeasurementPoint {
@@ -234,6 +346,7 @@ mod tests {
             accountable_role: MarktRolle::Lf,
             accountable_mp_id: "9900987654321".to_owned(),
             is_virtual: false,
+            wandler_factor: Decimal::ONE,
             valid_from: date!(2026 - 01 - 01),
             valid_to: None,
         }
@@ -288,6 +401,79 @@ mod tests {
         let mut mp = bezug_point();
         mp.is_virtual = true;
         assert!(mp.is_virtual);
+    }
+
+    /// The unit is read off the OBIS code, so it cannot contradict it — the
+    /// failure a stored `unit` field made possible.
+    #[test]
+    fn the_unit_is_derived_from_the_obis_code() {
+        let mut mp = bezug_point();
+        assert_eq!(mp.unit(), Some(RegisterUnit::KiloWattHour));
+
+        mp.obis_code = ObisCode::STROM_BLINDARBEIT_Q1;
+        assert_eq!(mp.unit(), Some(RegisterUnit::KiloVarHour));
+
+        mp.obis_code = ObisCode::STROM_BEZUG_MAXIMUM;
+        assert_eq!(mp.unit(), Some(RegisterUnit::KiloWatt));
+        assert!(!mp.unit().unwrap().is_cumulative(), "a maximum is a power");
+
+        mp.obis_code = ObisCode::GAS_VOLUME_M3;
+        assert_eq!(mp.unit(), Some(RegisterUnit::CubicMetre));
+
+        mp.obis_code = ObisCode::WAERME_ENERGY;
+        assert_eq!(mp.unit(), Some(RegisterUnit::KiloWattHourThermal));
+    }
+
+    /// The Wandlerfaktor, and the direction predicates the merged type
+    /// inherited from `MeterRegister`.
+    #[test]
+    fn the_merged_type_carries_the_register_facts() {
+        let mut mp = bezug_point();
+        mp.wandler_factor = dec!(100);
+        assert_eq!(mp.apply_wandler(dec!(1234)), dec!(123400));
+
+        assert_eq!(mp.tariff_register(), None, "1-0:1.8.0 is the total");
+        mp.obis_code = ObisCode::STROM_BEZUG_HT;
+        assert_eq!(mp.tariff_register(), Some(1));
+        mp.obis_code = ObisCode::STROM_BEZUG_NT;
+        assert_eq!(mp.tariff_register(), Some(2));
+    }
+
+    /// The direction predicates are mutually exclusive — the invariant that
+    /// had to be fixed twice while the concept existed twice.
+    #[test]
+    fn direction_predicates_are_mutually_exclusive() {
+        let mut mp = bezug_point();
+        // Master data and the OBIS code disagree on purpose.
+        mp.energy_flow = EnergyFlow::Generation;
+        mp.obis_code = ObisCode::STROM_BEZUG_TOTAL;
+        assert!(mp.is_bezug(), "the metered code wins");
+        assert!(!mp.is_einspeisung());
+
+        // ...and where the code carries no direction, the master data decides.
+        mp.obis_code = ObisCode::GAS_VOLUME_M3;
+        assert!(!mp.is_bezug());
+        assert!(mp.is_einspeisung());
+
+        for flow in EnergyFlow::ALL {
+            mp.energy_flow = flow;
+            assert!(
+                !(mp.is_bezug() && mp.is_einspeisung()),
+                "{flow:?} must not be both"
+            );
+        }
+    }
+
+    #[test]
+    fn energy_flow_groups_storage_with_the_direction_it_acts_in() {
+        assert!(EnergyFlow::Consumption.draws_from_grid());
+        assert!(EnergyFlow::StorageCharge.draws_from_grid());
+        assert!(EnergyFlow::Generation.feeds_grid());
+        assert!(EnergyFlow::StorageDischarge.feeds_grid());
+        assert!(!EnergyFlow::Bidirectional.draws_from_grid());
+        assert!(!EnergyFlow::Bidirectional.feeds_grid());
+        assert!(EnergyFlow::StorageCharge.is_storage());
+        assert!(!EnergyFlow::Consumption.is_storage());
     }
 
     #[test]

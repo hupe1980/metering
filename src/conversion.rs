@@ -52,7 +52,7 @@
 
 use rust_decimal::Decimal;
 
-use crate::interval::MeterInterval;
+use crate::interval::MeasurementUnit;
 
 /// Parameters for Gas m³ → kWh_Hs conversion.
 #[derive(Debug, Clone)]
@@ -182,38 +182,94 @@ pub fn gas_m3_to_kwh_hs_rounded(
     }
 }
 
-/// Normalize a raw meter interval to kWh.
+/// Normalize a raw meter reading to kWh.
 ///
-/// For Strom intervals already in kWh: returns `interval.value_kwh` unchanged.
-/// For Gas intervals in m³: applies the Hs conversion.
+/// Handles the three shapes an ingest path actually receives:
 ///
-/// The `unit` field on the interval indicates the raw unit:
-/// - `"kWh"` → no conversion
-/// - `"m3"` or `"m³"` → multiply by `hs × z`
-/// - `"kW"` → instantaneous demand; multiply by duration_h to get kWh
-#[must_use]
-pub fn normalize_interval_to_kwh(
-    interval: &MeterInterval,
+/// | Source unit | Conversion |
+/// |---|---|
+/// | an energy unit ([`MeasurementUnit::parse_scaled`]) | rescale — kWh, Wh, MWh, GJ, MJ and the UN/ECE Rec 20 codes |
+/// | a volume unit (m³, litres, `MTQ`) | `V × Hs × z`, needing `gas` |
+/// | `"kW"` / `"kvar"` — a **power**, not an energy | `P × duration_h`, needing `duration_secs` |
+///
+/// # Errors
+///
+/// Returns [`ConversionError`] rather than guessing. The previous signature
+/// returned a bare `Decimal` and fell through to *"assume already kWh"* for any
+/// unit it did not recognise, so `"MWh"` — which the crate's own
+/// [`MeasurementUnit::parse_scaled`] reads correctly — passed through
+/// unconverted and understated the reading by a factor of a thousand, silently.
+///
+/// # Example
+///
+/// ```rust
+/// use metering::{normalize_to_kwh, GasConversionParams};
+/// use rust_decimal::{Decimal, dec};
+///
+/// // A gas volume needs the Brennwert and the Zustandszahl.
+/// let gas = GasConversionParams { hs_kwh_per_m3: dec!(10.55), zustandszahl: dec!(0.98) };
+/// let kwh = normalize_to_kwh(dec!(100), "m3", Some(&gas), None)?;
+/// assert_eq!(kwh, dec!(1033.900));
+///
+/// // An energy unit only needs rescaling: 3.6 GJ is exactly 1000 kWh.
+/// assert_eq!(normalize_to_kwh(dec!(3.6), "GJ", None, None)?, dec!(1000));
+///
+/// // A power needs the interval it was averaged over: 48 kW for 15 min = 12 kWh.
+/// assert_eq!(normalize_to_kwh(dec!(48), "kW", None, Some(900))?, dec!(12));
+///
+/// // ...and an unknown unit is an error, not a silent pass-through.
+/// assert!(normalize_to_kwh(dec!(1), "furlong", None, None).is_err());
+/// # Ok::<(), metering::conversion::ConversionError>(())
+/// ```
+pub fn normalize_to_kwh(
+    value: Decimal,
     unit: &str,
-    gas_params: Option<&GasConversionParams>,
-) -> Decimal {
-    match unit.to_lowercase().as_str() {
-        "m3" | "m³" => {
-            let p = gas_params
-                .map(|p| (p.hs_kwh_per_m3, p.zustandszahl))
-                .unwrap_or_else(|| {
-                    let d = GasConversionParams::default_erdgas_h();
-                    (d.hs_kwh_per_m3, d.zustandszahl)
-                });
-            gas_m3_to_kwh_hs(interval.value_kwh, p.0, p.1)
+    gas: Option<&GasConversionParams>,
+    duration_secs: Option<i64>,
+) -> Result<Decimal, ConversionError> {
+    let trimmed = unit.trim();
+    if matches!(trimmed.to_lowercase().as_str(), "kw" | "kvar") {
+        let secs = duration_secs.ok_or(ConversionError::MissingDuration)?;
+        if secs <= 0 {
+            return Err(ConversionError::MissingDuration);
         }
-        "kw" => {
-            // kW → kWh: multiply by duration in hours
-            let dur_h = Decimal::from(interval.duration_secs()) / Decimal::from(3600u32);
-            interval.value_kwh * dur_h
-        }
-        _ => interval.value_kwh, // assume already kWh
+        let hours = Decimal::from(secs) / Decimal::from(3600u32);
+        return Ok(value * hours);
     }
+
+    let scale = MeasurementUnit::parse_scaled(trimmed)
+        .ok_or_else(|| ConversionError::UnknownUnit(trimmed.to_owned()))?;
+    match scale.unit {
+        MeasurementUnit::KiloWattHour => Ok(scale.apply(value)),
+        MeasurementUnit::CubicMetre => {
+            let params = gas.ok_or(ConversionError::MissingGasParameters)?;
+            let m3 = scale.apply(value);
+            Ok(gas_m3_to_kwh_hs(
+                m3,
+                params.hs_kwh_per_m3,
+                params.zustandszahl,
+            ))
+        }
+    }
+}
+
+/// Why a reading could not be normalised to kWh.
+///
+/// `#[non_exhaustive]`: a caller that wildcards an unfamiliar variant still
+/// does the right thing — it reports a failure — so there is nothing to
+/// protect. See the crate-level **Enum exhaustiveness** section.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum ConversionError {
+    /// The unit string matched nothing this crate knows.
+    #[error("unknown unit {0:?} — see MeasurementUnit::parse_scaled for the accepted set")]
+    UnknownUnit(String),
+    /// A volume was supplied without a Brennwert and Zustandszahl to convert it.
+    #[error("a volume reading needs GasConversionParams (Brennwert and Zustandszahl)")]
+    MissingGasParameters,
+    /// A power was supplied without the interval length to integrate it over.
+    #[error("a power reading needs a positive interval duration to become an energy")]
+    MissingDuration,
 }
 
 #[cfg(test)]

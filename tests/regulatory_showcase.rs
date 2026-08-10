@@ -7,20 +7,26 @@
 //! Run: `cargo test -p metering --test regulatory_showcase`
 //!
 //! ## Legal sources
-//! - **MsbG**: Messzugangsverordnung (§§2–27)
+//! - **MsbG**: Messstellenbetriebsgesetz — the statute this crate is mostly
+//!   about. (It was described here as the "Messzugangsverordnung", which is a
+//!   different thing and was in any case never abbreviated MsbG.)
 //! - **MessEG/MessEV**: §33 MessEG + §25 Nr. 4/Nr. 7 MessEV — the exceptions
 //!   that make a *derived* kWh lawful (Brennwert × Zustandszahl). Not GasGVV:
 //!   that ordinance has no §24 and never mentions Brennwert.
 //! - **DVGW G 685**: Gasabrechnung §10 (Zustandszahl)
 //! - **DVGW G 260**: Gasbeschaffenheit (Brennwertbereiche H-Gas / L-Gas)
-//! - **GPKE BK6-22-024**: §3 MMM billing (arbeitsmenge + spitzenleistung)
-//! - **EnWG §41a**: Dynamic tariff billing (15-min iMSys resolution)
+//! - **StromNEV § 17 Abs. 2**: Jahresleistungspreissystem (Jahreshöchstleistung)
+//! - **EnWG § 41a Abs. 2**: large suppliers must offer a dynamic tariff to
+//!   customers who have an iMSys
+//! - **EnWG § 14a Modul 3**: three-level time-variable Netzentgelte, mandatory
+//!   for every Netzbetreiber since 1 April 2025
 //! - **EnWG §40 Abs. 2**: Annual SLP meter reading
 
+use metering::zaehlzeit::{HT, NT, ST};
 use metering::*;
 use rust_decimal::Decimal;
 use rust_decimal::dec;
-use time::macros::datetime;
+use time::macros::{date, datetime};
 
 // ═══════════════════════════════════════════════════════════════════════════
 // § 12 StromNZV — Spitzenleistung (peak demand)
@@ -35,28 +41,28 @@ fn peak_demand_is_highest_15min_quarter() {
         MeterInterval {
             from: base,
             to: base + time::Duration::minutes(15),
-            value_kwh: dec!(2.5),
+            value: dec!(2.5),
             quality: QualityFlag::Measured,
             obis_code: None,
         }, // 10 kW
         MeterInterval {
             from: base + time::Duration::minutes(15),
             to: base + time::Duration::minutes(30),
-            value_kwh: dec!(5.0),
+            value: dec!(5.0),
             quality: QualityFlag::Measured,
             obis_code: None,
         }, // 20 kW ← peak
         MeterInterval {
             from: base + time::Duration::minutes(30),
             to: base + time::Duration::minutes(45),
-            value_kwh: dec!(1.25),
+            value: dec!(1.25),
             quality: QualityFlag::Measured,
             obis_code: None,
         }, // 5 kW
     ];
-    let period = aggregate(&intervals, &AggregationConfig::rlm_strom());
+    let period = aggregate(&intervals, &AggregationConfig::rlm());
     assert_eq!(period.spitzenleistung_kw, Some(dec!(20)));
-    assert_eq!(period.arbeitsmenge_kwh, dec!(8.75)); // sum
+    assert_eq!(period.arbeitsmenge, dec!(8.75)); // sum
 }
 
 /// § 12 StromNZV: SLP has no Spitzenleistung.
@@ -66,16 +72,16 @@ fn slp_has_no_spitzenleistung() {
     let intervals = vec![MeterInterval {
         from: base,
         to: base + time::Duration::hours(24),
-        value_kwh: dec!(24.0),
+        value: dec!(24.0),
         quality: QualityFlag::Measured,
         obis_code: None,
     }];
-    let period = aggregate(&intervals, &AggregationConfig::slp_strom());
+    let period = aggregate(&intervals, &AggregationConfig::arbeitsmenge_only());
     assert_eq!(
         period.spitzenleistung_kw, None,
         "SLP billing has no peak demand"
     );
-    assert_eq!(period.arbeitsmenge_kwh, dec!(24.0));
+    assert_eq!(period.arbeitsmenge, dec!(24.0));
 }
 
 /// Only billable intervals (Measured, Substituted, Calculated) contribute.
@@ -89,19 +95,19 @@ fn non_billable_intervals_excluded_from_spitzenleistung() {
         MeterInterval {
             from: base,
             to: base + time::Duration::minutes(15),
-            value_kwh: dec!(5.0),
+            value: dec!(5.0),
             quality: QualityFlag::Measured,
             obis_code: None,
         }, // billable: 20 kW
         MeterInterval {
             from: base + time::Duration::minutes(15),
             to: base + time::Duration::minutes(30),
-            value_kwh: dec!(100.0),
+            value: dec!(100.0),
             quality: QualityFlag::Unknown,
             obis_code: None,
         }, // NOT billable: would be 400 kW
     ];
-    let period = aggregate(&intervals, &AggregationConfig::rlm_strom());
+    let period = aggregate(&intervals, &AggregationConfig::rlm());
     // Spitzenleistung is only from the billable interval
     assert_eq!(
         period.spitzenleistung_kw,
@@ -109,7 +115,7 @@ fn non_billable_intervals_excluded_from_spitzenleistung() {
         "Unknown quality must not contribute to Spitzenleistung"
     );
     assert_eq!(
-        period.arbeitsmenge_kwh,
+        period.arbeitsmenge,
         dec!(5.0),
         "Unknown quality excluded from arbeitsmenge"
     );
@@ -170,7 +176,7 @@ fn fifteen_min_intervals_classify_as_rlm() {
         .map(|i| MeterInterval {
             from: base + time::Duration::minutes(i * 15),
             to: base + time::Duration::minutes(i * 15 + 15),
-            value_kwh: dec!(2.0),
+            value: dec!(2.0),
             quality: QualityFlag::Measured,
             obis_code: None,
         })
@@ -186,15 +192,18 @@ fn smgw_source_forces_imsys() {
         .map(|i| MeterInterval {
             from: base + time::Duration::minutes(i * 15),
             to: base + time::Duration::minutes(i * 15 + 15),
-            value_kwh: dec!(2.0),
+            value: dec!(2.0),
             quality: QualityFlag::Measured,
             obis_code: None,
         })
         .collect();
-    assert_eq!(classify_messtyp(&intervals, Some("SMGW")), Messtyp::IMsys);
     assert_eq!(
-        classify_messtyp(&intervals, Some("CLS_GATEWAY")),
+        classify_messtyp(&intervals, Some(SeriesOrigin::SmartMeterGateway)),
         Messtyp::IMsys
+    );
+    assert_eq!(
+        classify_messtyp(&intervals, Some(SeriesOrigin::Other)),
+        Messtyp::Rlm
     );
 }
 
@@ -206,14 +215,14 @@ fn daily_intervals_classify_as_slp() {
         MeterInterval {
             from: base,
             to: base + time::Duration::days(1),
-            value_kwh: dec!(24.0),
+            value: dec!(24.0),
             quality: QualityFlag::Measured,
             obis_code: None,
         },
         MeterInterval {
             from: base + time::Duration::days(1),
             to: base + time::Duration::days(2),
-            value_kwh: dec!(22.5),
+            value: dec!(22.5),
             quality: QualityFlag::Measured,
             obis_code: None,
         },
@@ -303,14 +312,14 @@ fn clean_24h_series_grades_a() {
         .map(|i| MeterInterval {
             from: base + time::Duration::minutes(i * 15),
             to: base + time::Duration::minutes(i * 15 + 15),
-            value_kwh: Decimal::try_from(2.0 + i as f64 * 0.001).unwrap_or(dec!(2.0)),
+            value: Decimal::try_from(2.0 + i as f64 * 0.001).unwrap_or(dec!(2.0)),
             quality: QualityFlag::Measured,
             obis_code: None,
         })
         .collect();
-    let report = score_intervals(&samples, QualityConfig::default());
+    let report = score_intervals(&samples, &QualityConfig::default());
     assert_eq!(report.grade, QualityGrade::A);
-    assert!(!report.has_warnings);
+    assert!(!report.has_warnings());
     assert!(!report.grade.blocks_billing());
 }
 
@@ -322,15 +331,15 @@ fn spike_degrades_quality_grade() {
         .map(|i| MeterInterval {
             from: base + time::Duration::minutes(i * 15),
             to: base + time::Duration::minutes(i * 15 + 15),
-            value_kwh: dec!(2.0),
+            value: dec!(2.0),
             quality: QualityFlag::Measured,
             obis_code: None,
         })
         .collect();
-    samples[50].value_kwh = dec!(2000); // 1000× spike
-    let report = score_intervals(&samples, QualityConfig::default());
+    samples[50].value = dec!(2000); // 1000× spike
+    let report = score_intervals(&samples, &QualityConfig::default());
     assert_ne!(report.grade, QualityGrade::A, "spike must degrade grade");
-    assert!(report.has_warnings);
+    assert!(report.has_warnings());
 }
 
 /// M7: grade F blocks automated billing.
@@ -342,20 +351,23 @@ fn grade_f_blocks_billing() {
     assert!(!QualityGrade::C.blocks_billing());
 }
 
-/// M7: score_intervals_raw() — f64 API (from database queries).
+/// The Hampel primitive on its own: a smooth ramp holds no outliers.
+///
+/// This replaces two tests of `score_intervals_raw`, an `&[f64]` grader that
+/// duplicated the interval scorer and has been removed. A caller holding raw
+/// floats wants the filter, not a second grading vocabulary.
 #[test]
-fn score_raw_clean_series_grades_a() {
+fn hampel_passes_a_smooth_ramp() {
     let values: Vec<f64> = (0..20).map(|i| 2.0 + i as f64 * 0.01).collect();
-    assert_eq!(score_intervals_raw(&values, 3, 3.0), QualityGrade::A);
+    assert!(hampel_filter_with_floor(&values, 3, 3.0, 0.05).is_empty());
 }
 
-/// M7: score_intervals_raw() — spike detection.
+/// ...and flags a spike in an otherwise flat series.
 #[test]
-fn score_raw_spike_degrades_grade() {
-    let mut values: Vec<f64> = (0..20).map(|_| 2.0).collect();
+fn hampel_flags_a_spike() {
+    let mut values: Vec<f64> = vec![2.0; 20];
     values[10] = 500.0; // 250× spike
-    let grade = score_intervals_raw(&values, 3, 3.0);
-    assert_ne!(grade, QualityGrade::A, "spike must degrade raw score");
+    assert!(hampel_filter_with_floor(&values, 3, 3.0, 0.05).contains(&10));
 }
 
 /// M7: gap detection — missing interval between reads.
@@ -366,23 +378,23 @@ fn gap_in_series_detected() {
         .map(|i| MeterInterval {
             from: base + time::Duration::minutes(i * 15),
             to: base + time::Duration::minutes(i * 15 + 15),
-            value_kwh: dec!(2.0),
+            value: dec!(2.0),
             quality: QualityFlag::Measured,
             obis_code: None,
         })
         .collect();
     samples.remove(48); // create a gap
-    let report = score_intervals(&samples, QualityConfig::default());
+    let report = score_intervals(&samples, &QualityConfig::default());
     assert_eq!(report.gaps_detected, 1);
-    assert!(report.has_warnings);
+    assert!(report.has_warnings());
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// GPKE §3 — MMM billing: arbeitsmenge + spitzenleistung
+// Billing period — Arbeitsmenge + Spitzenleistung
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// GPKE BK6-22-024 §3: MMM billing requires arbeitsmenge_kwh and spitzenleistung_kw.
-/// This test verifies the full monthly RLM billing period calculation.
+/// A full monthly RLM billing period: Arbeitsmenge and Jahreshöchstleistung
+/// basis (§ 17 Abs. 2 StromNEV) from one month of quarter-hours.
 #[test]
 fn rlm_monthly_billing_period() {
     let base = datetime!(2026-06-01 0:00 UTC);
@@ -391,19 +403,20 @@ fn rlm_monthly_billing_period() {
         .map(|i| MeterInterval {
             from: base + time::Duration::minutes(i * 15),
             to: base + time::Duration::minutes(i * 15 + 15),
-            value_kwh: dec!(2.5),
+            value: dec!(2.5),
             quality: QualityFlag::Measured,
             obis_code: None,
         })
         .collect();
 
-    let period = aggregate(&intervals, &AggregationConfig::rlm_strom());
+    let period = aggregate(&intervals, &AggregationConfig::rlm());
 
     // Arbeitsmenge: 2880 × 2.5 = 7200 kWh
-    assert_eq!(period.arbeitsmenge_kwh, dec!(7200.0));
+    assert_eq!(period.arbeitsmenge, dec!(7200.0));
     // Spitzenleistung: 2.5 × 4 = 10 kW (uniform, all equal)
     assert_eq!(period.spitzenleistung_kw, Some(dec!(10)));
-    assert_eq!(period.interval_count, 2880);
+    assert_eq!(period.billable_count, 2880);
+    assert_eq!(period.excluded_count, 0);
     assert!(
         (period.coverage_pct - 100.0).abs() < 1.0,
         "full month should have ~100% coverage"
@@ -424,22 +437,34 @@ fn ht_nt_weekday_split() {
         MeterInterval {
             from: ht_time,
             to: ht_time + time::Duration::minutes(15),
-            value_kwh: dec!(4.0),
+            value: dec!(4.0),
             quality: QualityFlag::Measured,
             obis_code: None,
         },
         MeterInterval {
             from: nt_time,
             to: nt_time + time::Duration::minutes(15),
-            value_kwh: dec!(1.0),
+            value: dec!(1.0),
             quality: QualityFlag::Measured,
             obis_code: None,
         },
     ];
-    let period = aggregate(&intervals, &AggregationConfig::rlm_zweitarif());
-    let ht_nt = period.ht_nt.unwrap();
-    assert_eq!(ht_nt.ht_kwh, dec!(4.0), "daytime weekday = HT");
-    assert_eq!(ht_nt.nt_kwh, dec!(1.0), "nighttime weekday = NT");
+    let zzd = Zaehlzeitdefinition::ht_nt("NB-1", date!(2026 - 01 - 01), 6 * 60, 22 * 60);
+    let split = zzd.split_energy(&intervals);
+    assert_eq!(
+        split[&Some(HT.to_owned())],
+        dec!(4.0),
+        "daytime weekday = HT"
+    );
+    assert_eq!(
+        split[&Some(NT.to_owned())],
+        dec!(1.0),
+        "nighttime weekday = NT"
+    );
+
+    // The split reconstructs the Arbeitsmenge exactly.
+    let period = aggregate(&intervals, &AggregationConfig::rlm());
+    assert_eq!(split.values().sum::<Decimal>(), period.arbeitsmenge);
 }
 
 /// Weekend → all NT.
@@ -450,14 +475,55 @@ fn ht_nt_weekend_all_nt() {
     let intervals = vec![MeterInterval {
         from: sat,
         to: sat + time::Duration::minutes(15),
-        value_kwh: dec!(3.0),
+        value: dec!(3.0),
         quality: QualityFlag::Measured,
         obis_code: None,
     }];
-    let period = aggregate(&intervals, &AggregationConfig::rlm_zweitarif());
-    let ht_nt = period.ht_nt.unwrap();
-    assert_eq!(ht_nt.ht_kwh, Decimal::ZERO, "Saturday morning = NT");
-    assert_eq!(ht_nt.nt_kwh, dec!(3.0));
+    let zzd = Zaehlzeitdefinition::ht_nt("NB-1", date!(2026 - 01 - 01), 6 * 60, 22 * 60);
+    let split = zzd.split_energy(&intervals);
+    assert!(
+        !split.contains_key(&Some(HT.to_owned())),
+        "Saturday morning = NT"
+    );
+    assert_eq!(split[&Some(NT.to_owned())], dec!(3.0));
+}
+
+/// §14a EnWG Modul 3 — three tariff levels, mandatory for every Netzbetreiber
+/// since 1 April 2025. The two-register model this crate used to have could not
+/// express it.
+#[test]
+fn modul_3_splits_a_day_into_three_registers() {
+    let zzd = Zaehlzeitdefinition::modul_3(
+        "NB-14A-3",
+        date!(2026 - 01 - 01),
+        (17 * 60, 20 * 60), // Hochtarif 17:00–20:00
+        (22 * 60, 6 * 60),  // Niedertarif 22:00–06:00, crossing midnight
+    );
+    assert_eq!(zzd.registers(), vec![HT, NT, ST]);
+
+    let start = calendar::day_start_utc(date!(2026 - 01 - 05));
+    let intervals: Vec<MeterInterval> = (0..96)
+        .map(|i| {
+            let from = start + time::Duration::minutes(i * 15);
+            MeterInterval {
+                from,
+                to: from + time::Duration::minutes(15),
+                value: dec!(1),
+                quality: QualityFlag::Measured,
+                obis_code: None,
+            }
+        })
+        .collect();
+
+    let split = zzd.split_energy(&intervals);
+    // HT 17:00–20:00 is 3 h; NT 22:00–24:00 plus 00:00–06:00 is 8 h; ST the
+    // remaining 13 h.
+    assert_eq!(split[&Some(HT.to_owned())], dec!(12));
+    assert_eq!(split[&Some(NT.to_owned())], dec!(32));
+    assert_eq!(split[&Some(ST.to_owned())], dec!(52));
+
+    let period = aggregate(&intervals, &AggregationConfig::rlm());
+    assert_eq!(split.values().sum::<Decimal>(), period.arbeitsmenge);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -481,18 +547,18 @@ fn gas_billing_workflow_m3_to_kwh_to_period() {
             MeterInterval {
                 from: base + time::Duration::hours(i),
                 to: base + time::Duration::hours(i + 1),
-                value_kwh: kwh,
+                value: kwh,
                 quality: QualityFlag::Measured,
                 obis_code: Some("7-10:3.1.0".parse().expect("valid Gas OBIS")),
             }
         })
         .collect();
 
-    let period = aggregate(&intervals, &AggregationConfig::gas());
+    let period = aggregate(&intervals, &AggregationConfig::arbeitsmenge_only());
 
     // 24h × 10 m³ × 10.55 kWh/m³ × 0.9764 = 2471.76... kWh_Hs
     let expected_kwh = dec!(24) * gas_m3_to_kwh_hs(dec!(10), dec!(10.55), dec!(0.9764));
-    assert_eq!(period.arbeitsmenge_kwh, expected_kwh);
+    assert_eq!(period.arbeitsmenge, expected_kwh);
     assert_eq!(
         period.spitzenleistung_kw, None,
         "Gas billing has no Spitzenleistung"
@@ -509,7 +575,7 @@ fn demand_kw_15min() {
     let iv = MeterInterval {
         from: datetime!(2026-01-01 0:00 UTC),
         to: datetime!(2026-01-01 0:15 UTC),
-        value_kwh: dec!(2.5),
+        value: dec!(2.5),
         quality: QualityFlag::Measured,
         obis_code: None,
     };
@@ -523,7 +589,7 @@ fn demand_kw_zero_duration_is_none() {
     let iv = MeterInterval {
         from: ts,
         to: ts,
-        value_kwh: dec!(5.0),
+        value: dec!(5.0),
         quality: QualityFlag::Measured,
         obis_code: None,
     };
@@ -593,16 +659,16 @@ fn decimal_arithmetic_exact_no_float_errors() {
             MeterInterval {
                 from: base + time::Duration::minutes(i * 15),
                 to: base + time::Duration::minutes(i * 15 + 15),
-                value_kwh: kwh_per_interval,
+                value: kwh_per_interval,
                 quality: QualityFlag::Measured,
                 obis_code: None,
             }
         })
         .collect();
-    let period = aggregate(&intervals, &AggregationConfig::slp_strom());
+    let period = aggregate(&intervals, &AggregationConfig::arbeitsmenge_only());
     let expected: Decimal = kwh_per_interval * Decimal::from(96u32);
     assert_eq!(
-        period.arbeitsmenge_kwh, expected,
+        period.arbeitsmenge, expected,
         "Decimal summation must be exact"
     );
 }
@@ -636,14 +702,14 @@ fn v07_dst_ambiguity_detected_for_local_time_storage() {
         MeterInterval {
             from: fake_utc_duplicate,
             to: fake_utc_duplicate + time::Duration::minutes(15),
-            value_kwh: dec!(2.5),
+            value: dec!(2.5),
             quality: QualityFlag::Measured,
             obis_code: None,
         },
         MeterInterval {
             from: fake_utc_duplicate, // duplicate — stored as local time!
             to: fake_utc_duplicate + time::Duration::minutes(15),
-            value_kwh: dec!(2.3),
+            value: dec!(2.3),
             quality: QualityFlag::Measured,
             obis_code: None,
         },
@@ -662,23 +728,33 @@ fn v07_dst_ambiguity_detected_for_local_time_storage() {
         result.issues
     );
 
-    // ...and assert V07 on what it actually means: a full local fall-back day
-    // that carries only 24 hours, so the repeated 02:00–03:00 hour was collapsed
-    // and an hour of energy silently vanished. Local 2026-10-25 runs
-    // 22:00Z (24 Oct) → 23:00Z (25 Oct) — 25 hours, 100 quarter-hours.
-    let collapsed: Vec<MeterInterval> = (0..96)
-        .map(|i| {
-            let from = datetime!(2026-10-24 22:00 UTC) + time::Duration::minutes(15 * i);
-            MeterInterval {
-                from,
-                to: from + time::Duration::minutes(15),
-                value_kwh: dec!(2.5),
-                quality: QualityFlag::Measured,
-                obis_code: None,
-            }
-        })
-        .collect();
-    let collapsed_result = validate_intervals(&collapsed, &ValidationConfig::rlm_strom_15min());
+    // ...and assert V07 on what it actually means: the repeated 02:00–03:00
+    // hour is gone. Local 2026-10-25 runs 22:00Z (24 Oct) → 23:00Z (25 Oct) —
+    // 25 hours, 100 quarter-hours — and the two passes of the repeated hour
+    // occupy 00:00Z–02:00Z. A series converted from local time keeps only one
+    // of them.
+    let full_day = |skip_second_pass: bool| -> Vec<MeterInterval> {
+        (0..100)
+            .map(|i| {
+                let from = datetime!(2026-10-24 22:00 UTC) + time::Duration::minutes(15 * i);
+                MeterInterval {
+                    from,
+                    to: from + time::Duration::minutes(15),
+                    value: dec!(2.5),
+                    quality: QualityFlag::Measured,
+                    obis_code: None,
+                }
+            })
+            .filter(|iv| {
+                let in_second_pass = iv.from >= datetime!(2026-10-25 1:00 UTC)
+                    && iv.from < datetime!(2026-10-25 2:00 UTC);
+                !(skip_second_pass && in_second_pass)
+            })
+            .collect()
+    };
+
+    let collapsed_result =
+        validate_intervals(&full_day(true), &ValidationConfig::rlm_strom_15min());
     assert!(
         collapsed_result
             .issues
@@ -686,6 +762,31 @@ fn v07_dst_ambiguity_detected_for_local_time_storage() {
             .any(|i| i.rule_id == ValidationRuleId::DstAmbiguity),
         "a collapsed fall-back hour must trigger V07. Issues: {:?}",
         collapsed_result.issues
+    );
+
+    // A gap somewhere *else* on the same day is a V01 gap and nothing more.
+    // The rule used to compare the whole day against 25 hours, so any two
+    // missing quarter-hours produced a confident — and wrong — report that the
+    // repeated hour had been collapsed.
+    let midday_gap: Vec<MeterInterval> = full_day(false)
+        .into_iter()
+        .filter(|iv| iv.from != datetime!(2026-10-25 11:00 UTC))
+        .collect();
+    let midday_result = validate_intervals(&midday_gap, &ValidationConfig::rlm_strom_15min());
+    assert!(
+        midday_result
+            .issues
+            .iter()
+            .any(|i| i.rule_id == ValidationRuleId::GapDetected),
+        "the midday gap is a V01"
+    );
+    assert!(
+        !midday_result
+            .issues
+            .iter()
+            .any(|i| i.rule_id == ValidationRuleId::DstAmbiguity),
+        "...and must not be reported as a collapsed DST hour: {:?}",
+        midday_result.issues
     );
 }
 
@@ -703,7 +804,7 @@ fn v07_no_false_positive_for_correct_utc_at_dst_fallback() {
         .map(|i| MeterInterval {
             from: base + time::Duration::minutes(i * 15),
             to: base + time::Duration::minutes(i * 15 + 15),
-            value_kwh: dec!(2.5),
+            value: dec!(2.5),
             quality: QualityFlag::Measured,
             obis_code: None,
         })
@@ -746,7 +847,7 @@ fn sect42b_beispiel1_constant_allocation_10_and_90_percent() {
     let make_iv = |kwh: Decimal| MeterInterval {
         from: base,
         to: base + time::Duration::minutes(15),
-        value_kwh: kwh,
+        value: kwh,
         quality: QualityFlag::Measured,
         obis_code: None,
     };
@@ -773,19 +874,19 @@ fn sect42b_beispiel1_constant_allocation_10_and_90_percent() {
     let malo3 = compute_virtual_meter(&rule_malo3, &sources).unwrap();
 
     assert_eq!(
-        malo2[0].value_kwh,
+        malo2[0].value,
         dec!(4.0),
         "Malo2 net grid draw = max(0, 5 - 0.1×10) = 4"
     );
     assert_eq!(
-        malo3[0].value_kwh,
+        malo3[0].value,
         dec!(11.0),
         "Malo3 net grid draw = max(0, 20 - 0.9×10) = 11"
     );
 
     // Verify: total PV delivered to tenants = full plant output (no grid feed-in)
-    let pv_to_malo2 = dec!(5.0) - malo2[0].value_kwh;
-    let pv_to_malo3 = dec!(20.0) - malo3[0].value_kwh;
+    let pv_to_malo2 = dec!(5.0) - malo2[0].value;
+    let pv_to_malo3 = dec!(20.0) - malo3[0].value;
     assert_eq!(
         pv_to_malo2 + pv_to_malo3,
         dec!(10.0),
@@ -811,7 +912,7 @@ fn sect42b_allocation_cap_by_tenant_consumption() {
     let make_iv = |kwh: Decimal| MeterInterval {
         from: base,
         to: base + time::Duration::minutes(15),
-        value_kwh: kwh,
+        value: kwh,
         quality: QualityFlag::Measured,
         obis_code: None,
     };
@@ -828,7 +929,7 @@ fn sect42b_allocation_cap_by_tenant_consumption() {
     let result = compute_virtual_meter(&rule, &sources).unwrap();
 
     assert_eq!(
-        result[0].value_kwh,
+        result[0].value,
         dec!(0.0),
         "§42b Abs. 5: net grid draw must never be negative (Pos operator)"
     );
@@ -850,7 +951,7 @@ fn sect42b_beispiel3_proportional_allocation_full_coverage() {
     let make_iv = |kwh: Decimal| MeterInterval {
         from: base,
         to: base + time::Duration::minutes(15),
-        value_kwh: kwh,
+        value: kwh,
         quality: QualityFlag::Measured,
         obis_code: None,
     };
@@ -874,16 +975,8 @@ fn sect42b_beispiel3_proportional_allocation_full_coverage() {
     let r2 = compute_virtual_meter(&rule_t2, &sources).unwrap();
     let r3 = compute_virtual_meter(&rule_t3, &sources).unwrap();
 
-    assert_eq!(
-        r2[0].value_kwh,
-        dec!(0.0),
-        "T2 ratio=0.2, allocation=2, net=0"
-    );
-    assert_eq!(
-        r3[0].value_kwh,
-        dec!(0.0),
-        "T3 ratio=0.8, allocation=8, net=0"
-    );
+    assert_eq!(r2[0].value, dec!(0.0), "T2 ratio=0.2, allocation=2, net=0");
+    assert_eq!(r3[0].value, dec!(0.0), "T3 ratio=0.8, allocation=8, net=0");
 }
 
 /// BDEW Anwendungshilfe — proportional allocation zero-division guard.
@@ -904,7 +997,7 @@ fn sect42b_proportional_zero_division_guard_all_tenants_off() {
     let make_iv = |kwh: Decimal| MeterInterval {
         from: base,
         to: base + time::Duration::minutes(15),
-        value_kwh: kwh,
+        value: kwh,
         quality: QualityFlag::Measured,
         obis_code: None,
     };
@@ -922,7 +1015,7 @@ fn sect42b_proportional_zero_division_guard_all_tenants_off() {
     let result = compute_virtual_meter(&rule, &sources).unwrap();
 
     assert_eq!(
-        result[0].value_kwh,
+        result[0].value,
         dec!(0.0),
         "zero total consumption → denominator guard → net grid draw = 0 (no panic)"
     );
@@ -950,7 +1043,7 @@ fn dst_spring_forward_2026_03_29_utc_series_no_gap() {
         intervals.push(MeterInterval {
             from: t,
             to: t + time::Duration::minutes(15),
-            value_kwh: rust_decimal::Decimal::ONE,
+            value: rust_decimal::Decimal::ONE,
             quality: QualityFlag::Measured,
             obis_code: None,
         });
@@ -989,7 +1082,7 @@ fn dst_fall_back_2026_10_25_utc_100_intervals_clean() {
         intervals.push(MeterInterval {
             from: t,
             to: t + time::Duration::minutes(15),
-            value_kwh: rust_decimal::Decimal::ONE,
+            value: rust_decimal::Decimal::ONE,
             quality: QualityFlag::Measured,
             obis_code: None,
         });
@@ -1026,7 +1119,7 @@ fn leap_year_2024_02_29_96_intervals_clean() {
         intervals.push(MeterInterval {
             from: t,
             to: t + time::Duration::minutes(15),
-            value_kwh: rust_decimal::Decimal::ONE,
+            value: rust_decimal::Decimal::ONE,
             quality: QualityFlag::Measured,
             obis_code: None,
         });
@@ -1055,9 +1148,7 @@ fn leap_year_2024_02_29_96_intervals_clean() {
 /// - fill the 07:15 gap with the average of the 07:15 prior values only
 #[test]
 fn sect17_prior_period_average_uses_matching_time_slot() {
-    use metering::{
-        FillGapsConfig, MeterInterval, QualityFlag, SubstituteMethod, fill_gaps_with_config,
-    };
+    use metering::{FillGapsConfig, IntervalResolution, MeterInterval, QualityFlag, fill_gaps};
     use rust_decimal::dec;
     use time::macros::datetime;
 
@@ -1068,7 +1159,7 @@ fn sect17_prior_period_average_uses_matching_time_slot() {
         MeterInterval {
             from: datetime!(2026-07-01 06:45 UTC),
             to: datetime!(2026-07-01 07:00 UTC),
-            value_kwh: dec!(1.0),
+            value: dec!(1.0),
             quality: QualityFlag::Measured,
             obis_code: None,
         },
@@ -1076,7 +1167,7 @@ fn sect17_prior_period_average_uses_matching_time_slot() {
         MeterInterval {
             from: datetime!(2026-07-01 08:00 UTC),
             to: datetime!(2026-07-01 08:15 UTC),
-            value_kwh: dec!(1.0),
+            value: dec!(1.0),
             quality: QualityFlag::Measured,
             obis_code: None,
         },
@@ -1087,28 +1178,28 @@ fn sect17_prior_period_average_uses_matching_time_slot() {
         MeterInterval {
             from: datetime!(2026-06-24 07:00 UTC),
             to: datetime!(2026-06-24 07:15 UTC),
-            value_kwh: dec!(3.0), // 07:00 slot — expected substitution value
+            value: dec!(3.0), // 07:00 slot — expected substitution value
             quality: QualityFlag::Measured,
             obis_code: None,
         },
         MeterInterval {
             from: datetime!(2026-06-24 07:15 UTC),
             to: datetime!(2026-06-24 07:30 UTC),
-            value_kwh: dec!(5.0), // 07:15 slot — expected substitution value
+            value: dec!(5.0), // 07:15 slot — expected substitution value
             quality: QualityFlag::Measured,
             obis_code: None,
         },
         MeterInterval {
             from: datetime!(2026-06-24 07:30 UTC),
             to: datetime!(2026-06-24 07:45 UTC),
-            value_kwh: dec!(7.0), // 07:30 slot
+            value: dec!(7.0), // 07:30 slot
             quality: QualityFlag::Measured,
             obis_code: None,
         },
         MeterInterval {
             from: datetime!(2026-06-24 07:45 UTC),
             to: datetime!(2026-06-24 08:00 UTC),
-            value_kwh: dec!(9.0), // 07:45 slot
+            value: dec!(9.0), // 07:45 slot
             quality: QualityFlag::Measured,
             obis_code: None,
         },
@@ -1116,24 +1207,24 @@ fn sect17_prior_period_average_uses_matching_time_slot() {
 
     // Use short_gap_threshold=0 to ensure PriorPeriodAverage applies to every
     // slot in the gap regardless of gap length (no linear-interpolation override).
-    let config = FillGapsConfig {
-        method: SubstituteMethod::PriorPeriodAverage,
-        prior_period_intervals: prior_week,
-        short_gap_threshold: 0,
-    };
-    let filled = fill_gaps_with_config(
+    let filled = fill_gaps(
         &series,
-        900,
-        datetime!(2026-07-01 06:00 UTC),
-        datetime!(2026-07-01 09:00 UTC),
-        &config,
+        &FillGapsConfig::new(
+            IntervalResolution::QuarterHour,
+            datetime!(2026-07-01 06:00 UTC),
+            datetime!(2026-07-01 09:00 UTC),
+        )
+        .prior_period(prior_week)
+        .short_gap_threshold(0),
     );
 
     // Find the substituted intervals.
     let sub_0700 = filled
+        .intervals
         .iter()
         .find(|iv| iv.from == datetime!(2026-07-01 07:00 UTC));
     let sub_0715 = filled
+        .intervals
         .iter()
         .find(|iv| iv.from == datetime!(2026-07-01 07:15 UTC));
 
@@ -1141,14 +1232,14 @@ fn sect17_prior_period_average_uses_matching_time_slot() {
     assert!(sub_0715.is_some(), "07:15 gap must be filled");
 
     assert_eq!(
-        sub_0700.unwrap().value_kwh,
+        sub_0700.unwrap().value,
         dec!(3.0),
-        "§ 60 Abs. 2 MsbG: 07:00 slot must use prior-week 07:00 value (3.0 kWh)"
+        "the 07:00 slot must take the prior week's 07:00 value (3.0 kWh)"
     );
     assert_eq!(
-        sub_0715.unwrap().value_kwh,
+        sub_0715.unwrap().value,
         dec!(5.0),
-        "§ 60 Abs. 2 MsbG: 07:15 slot must use prior-week 07:15 value (5.0 kWh)"
+        "the 07:15 slot must take the prior week's 07:15 value (5.0 kWh)"
     );
 
     // Both substituted intervals must carry Substituted quality flag.
@@ -1174,28 +1265,28 @@ fn faulty_intervals_excluded_from_billing_sum() {
         MeterInterval {
             from: time::macros::datetime!(2026-07-01 00:00 UTC),
             to: time::macros::datetime!(2026-07-01 00:15 UTC),
-            value_kwh: dec!(1.0),
+            value: dec!(1.0),
             quality: QualityFlag::Measured,
             obis_code: None,
         },
         MeterInterval {
             from: time::macros::datetime!(2026-07-01 00:15 UTC),
             to: time::macros::datetime!(2026-07-01 00:30 UTC),
-            value_kwh: dec!(99.9), // should be excluded
+            value: dec!(99.9), // should be excluded
             quality: QualityFlag::Faulty,
             obis_code: None,
         },
         MeterInterval {
             from: time::macros::datetime!(2026-07-01 00:30 UTC),
             to: time::macros::datetime!(2026-07-01 00:45 UTC),
-            value_kwh: dec!(1.0),
+            value: dec!(1.0),
             quality: QualityFlag::Measured,
             obis_code: None,
         },
         MeterInterval {
             from: time::macros::datetime!(2026-07-01 00:45 UTC),
             to: time::macros::datetime!(2026-07-01 01:00 UTC),
-            value_kwh: dec!(1.0),
+            value: dec!(1.0),
             quality: QualityFlag::Measured,
             obis_code: None,
         },
@@ -1205,7 +1296,7 @@ fn faulty_intervals_excluded_from_billing_sum() {
     let billing_total: Decimal = intervals
         .iter()
         .filter(|iv| iv.quality.is_billable() && iv.quality != QualityFlag::Faulty)
-        .map(|iv| iv.value_kwh)
+        .map(|iv| iv.value)
         .sum();
 
     assert_eq!(

@@ -1,432 +1,276 @@
-//! Energy forecast generation for § 60 Abs. 2 MsbG substitute values.
+//! Jahresprognose — projecting a full year from a partial one.
 //!
-//! When meter readings are unavailable, § 60 Abs. 2 MsbG requires substitute values.
-//! For longer gaps (> 3 intervals), prior-period averaging or profile-based
-//! forecasting is the BDEW-recommended approach.
+//! ## Scope
 //!
-//! This module provides:
-//! 1. **Annual forecast** — project total annual consumption from a partial year's data
-//! 2. **Short-term gap fill** — prior-period same-slot average for § 60 Abs. 2 MsbG
-//! 3. **Seasonal index** — detect consumption patterns (summer/winter)
+//! One calculation: scale an observed period's consumption to a whole calendar
+//! year, optionally corrected for where in the year the observation sits.
+//! It is used for Abschlag sizing, for the SLP Jahresprognose, and for
+//! estimating year-end Mehr-/Mindermengen.
 //!
-//! ## Legal basis
+//! **Gap filling lives in [`crate::substitute`].** This module used to carry a
+//! second Ersatzwertbildung engine with its own method enum, its own fallback
+//! order and — as it turned out — its own interpolation arithmetic, which
+//! disagreed with the first by one interval. There is now one engine.
 //!
-//! - **§ 60 Abs. 2 MsbG**: MSB must supply substitute values for unavailable measurements.
-//! - **§ 60 Abs. 2 MsbG**: Prior-period same-slot average is the preferred method.
-//! - **BDEW Richtlinie**: Prognosewert for SLP; Ersatzwert for RLM.
-//! - **VDE-AR-N 4400**: Technical rules for substitute value generation.
+//! ## What this does not do
 //!
-//! ## What this does NOT do
-//!
-//! This module does NOT perform machine-learning forecasting. ML requires an
-//! external runtime (PyTorch, ONNX), which violates this crate's no-I/O
-//! contract; it belongs in a service layer that can host one.
+//! No machine learning. An ML forecaster needs a runtime — PyTorch, ONNX — and
+//! this crate performs no I/O and links nothing that does. Extrapolating a
+//! daily mean is not a model, and calling it one would be worse than the
+//! honest arithmetic below.
 
 use rust_decimal::Decimal;
-use std::collections::HashMap;
-use time::{Duration, OffsetDateTime, Weekday};
+use rust_decimal::prelude::ToPrimitive as _;
+use time::OffsetDateTime;
 
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
-use crate::interval::{MeterInterval, QualityFlag};
-
-// ── ForecastMethod ────────────────────────────────────────────────────────────
-
-/// Method used for energy forecast or substitute value generation.
-///
-/// Stored in [`SubstituteValueEntry`] so auditors can explain every derived value.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-#[cfg_attr(feature = "serde", serde(rename_all = "SCREAMING_SNAKE_CASE"))]
-pub enum ForecastMethod {
-    /// § 60 Abs. 2 MsbG: same time slot from prior week(s).
-    PriorPeriodSameSlot,
-    /// Weighted rolling average over the same time slot from N prior periods.
-    WeightedRollingAverage,
-    /// Linear interpolation between surrounding measured values (short gaps only).
-    LinearInterpolation,
-    /// Last known value carried forward (fallback, conservative).
-    LastValueCarryForward,
-    /// Zero fill (confirmed plant shutdown / delivery pause).
-    ZeroFill,
-    /// Profile-based reconstruction (BDEW H0/G0 SLP load profile shape).
-    ProfileBased,
-    /// Annual projection: extrapolate partial-year consumption to full year.
-    AnnualProjection,
-}
-
-impl ForecastMethod {
-    /// Human-readable description (German regulatory language).
-    #[must_use]
-    pub fn description(self) -> &'static str {
-        match self {
-            Self::PriorPeriodSameSlot => {
-                "Vorperiodenmittelwert gleicher Zeitschlitz (§ 60 Abs. 2 MsbG)"
-            }
-            Self::WeightedRollingAverage => "Gewichteter gleitender Mittelwert",
-            Self::LinearInterpolation => "Lineare Interpolation zwischen Messwerten",
-            Self::LastValueCarryForward => "Letzter bekannter Wert fortgeschrieben",
-            Self::ZeroFill => "Nullwert (bestätigter Lieferstopp)",
-            Self::ProfileBased => "Profilbasiert (BDEW Standardlastprofil)",
-            Self::AnnualProjection => "Jahreshochrechnung aus Teiljahreswerten",
-        }
-    }
-}
-
-// ── SubstituteValueEntry ──────────────────────────────────────────────────────
-
-/// A single generated substitute value with full audit metadata.
-///
-/// Every substitute interval produced by this module includes the generation
-/// method, the reference data used, and any confidence notes. This satisfies
-/// the § 60 Abs. 2 MsbG traceability requirement.
-#[derive(Debug, Clone)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-pub struct SubstituteValueEntry {
-    /// The generated substitute interval.
-    pub interval: MeterInterval,
-    /// Method used to generate this value.
-    pub method: ForecastMethod,
-    /// Number of reference intervals used (e.g. prior-period sample count).
-    pub reference_count: u32,
-    /// Confidence note (e.g. "7 reference slots, stddev 0.15 kWh").
-    pub confidence_note: Option<String>,
-}
+use crate::interval::MeterInterval;
 
 // ── AnnualForecast ────────────────────────────────────────────────────────────
 
-/// Annual energy consumption forecast from a partial year's data.
-///
-/// Used to:
-/// 1. Estimate annual Abschlag (advance payment) amounts.
-/// 2. Generate the annual Jahresprognose for SLP customers.
-/// 3. Project Mehr-/Mindermengen at year-end.
+/// A projected annual consumption, with the inputs that produced it.
 ///
 /// ## Method
 ///
 /// ```text
-/// annual_kwh = observed_kwh / observed_days × days_in_target_year
+/// annual_kwh = observed / observed_days × days_in_target_year × seasonal_factor
 /// ```
 ///
-/// `observed_days` counts Europe/Berlin calendar days and the year factor is the
-/// target year's real length (366 in a leap year), so neither a DST transition
-/// inside the observation window nor a leap day skews the projection. Adjusted
-/// for seasonal index when prior-year data is available.
-#[derive(Debug, Clone)]
+/// `observed_days` counts **Europe/Berlin calendar days** and the year factor
+/// is the target year's real length, so neither a DST transition inside the
+/// observation window nor a leap day skews the result.
+#[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct AnnualForecast {
-    /// 11-digit MaLo-ID.
-    pub malo_id: String,
-    /// Projection base period.
+    /// Start of the observation window (earliest interval start).
     pub observation_from: OffsetDateTime,
-    /// Projection base period end.
+    /// End of the observation window (latest interval end).
     pub observation_to: OffsetDateTime,
-    /// Observed energy in the base period (kWh).
-    pub observed_kwh: Decimal,
-    /// Number of observed days.
+    /// Billable energy observed in the window (kWh).
+    pub observed: Decimal,
+    /// Berlin calendar days the window spans.
     pub observed_days: u32,
+    /// Days in the target year — 366 in a leap year.
+    pub target_year_days: u16,
     /// Projected annual consumption (kWh).
-    pub projected_annual_kwh: Decimal,
-    /// Whether seasonal correction was applied.
-    pub seasonal_correction_applied: bool,
-    /// Seasonal correction factor (1.0 = no correction).
+    pub projected_annual: Decimal,
+    /// Seasonal correction factor; `1` when none was applied.
     pub seasonal_factor: Decimal,
-    /// Method used for projection.
-    pub method: ForecastMethod,
-    /// 95% confidence interval lower bound (kWh), clamped at zero.
+    /// Whether prior-year data was available to correct for seasonality.
     ///
-    /// From the day-to-day variability of the observed period: with daily
-    /// sums treated as independent draws, the annual-total standard deviation
-    /// is `sd_daily × √days_in_year`, and the bounds are
-    /// `projection ± 1.96 × sd_annual`
-    /// (seasonally scaled like the projection itself). Informational — the
-    /// billed figure is always `projected_annual_kwh`.
-    pub confidence_lower_kwh: Option<Decimal>,
-    /// 95% confidence interval upper bound (kWh). See `confidence_lower_kwh`.
-    pub confidence_upper_kwh: Option<Decimal>,
+    /// An uncorrected projection from a January window overstates the year for
+    /// a heating-dominated load and understates it for a cooling-dominated one.
+    /// The flag exists so a caller can refuse to bill on one.
+    pub seasonal_correction_applied: bool,
+    /// Lower bound of the 95 % prediction interval (kWh), clamped at zero.
+    ///
+    /// See [`AnnualForecast::prediction_interval_note`] for what it does and
+    /// does not claim. `None` when fewer than two whole days were observed.
+    pub confidence_lower: Option<Decimal>,
+    /// Upper bound of the 95 % prediction interval (kWh).
+    pub confidence_upper: Option<Decimal>,
 }
 
-/// 95% CI half-width for the annual projection, from daily-sum variability.
+impl AnnualForecast {
+    /// What the prediction interval is and is not.
+    ///
+    /// It treats the observed **daily** sums as independent draws from one
+    /// distribution and asks how far the year's total could plausibly land from
+    /// the projection. Two sources of error contribute, and both must:
+    ///
+    /// ```text
+    /// Var(total) = Y² · σ²/n   (the daily mean is estimated from n days)
+    ///            + Y  · σ²     (the remaining days vary around it)
+    /// ```
+    ///
+    /// The first term dominates for a short window — with `Y = 365` and
+    /// `n = 14` it is twenty-six times the second — and it was previously
+    /// omitted entirely, which reported an interval roughly five times too
+    /// narrow.
+    ///
+    /// What it still does not model: daily sums from a load profile are
+    /// **not** independent and not identically distributed. Consumption is
+    /// autocorrelated and strongly seasonal, so a January window's spread
+    /// understates a whole year's. Treat the interval as a lower bound on the
+    /// uncertainty, not a confidence statement about the year.
+    #[must_use]
+    pub const fn prediction_interval_note() -> &'static str {
+        "95 % interval from daily-sum variability, assuming independent days; \
+         real load profiles are autocorrelated and seasonal, so the true spread is wider"
+    }
+
+    /// Mean daily consumption over the observation window (kWh/day).
+    #[must_use]
+    pub fn daily_average_kwh(&self) -> Decimal {
+        if self.observed_days == 0 {
+            return Decimal::ZERO;
+        }
+        self.observed / Decimal::from(self.observed_days)
+    }
+}
+
+/// The minimum observation window that yields a projection.
 ///
-/// Returns `None` with fewer than two observed days or when the statistics
-/// degenerate. Computed in `f64` — the bounds are diagnostics, not billed
-/// quantities, and the projection itself stays exact `Decimal`.
+/// Below a week the daily mean is dominated by the weekday mix of whichever
+/// days happened to be observed, and no correction here can repair that.
+pub const MIN_OBSERVATION_DAYS: i64 = 7;
+
+// ── project_annual_consumption ────────────────────────────────────────────────
+
+/// Project annual consumption from a partial year of interval data.
 ///
-/// `year_days` is the target year's real length, so the `√n` scaling matches
-/// the projection it brackets.
-fn confidence_half_width(
+/// Aggregates the billable energy, divides by the Berlin calendar days the
+/// window spans, and scales to the **real length of the target year** — the
+/// Berlin calendar year the observation ends in. A flat 365 would understate a
+/// leap-year Jahresprognose by one day, 0.27 %, which is real money on an
+/// industrial Abschlag.
+///
+/// When `prior_year_intervals` are supplied, a seasonal factor corrects for
+/// where in the year the window sits: the prior year's daily rate over the
+/// matching window, divided by the prior year's daily rate overall.
+///
+/// ## Returns
+///
+/// `None` when `intervals` is empty or spans fewer than
+/// [`MIN_OBSERVATION_DAYS`].
+///
+/// The result carries no market-location id. It used to take one as a `&str`
+/// and copy it into the output without reading it — a data-carrying parameter
+/// on a pure computation, and the only thing in this crate that made a
+/// projection non-comparable between two delivery points. The caller knows
+/// which MaLo it asked about.
+///
+/// ## Example
+///
+/// ```rust
+/// use metering::{project_annual_consumption, MeterInterval, QualityFlag, calendar};
+/// use rust_decimal::dec;
+/// use time::{Duration, macros::date};
+///
+/// // Fourteen days at 1 kWh per quarter-hour = 96 kWh/day.
+/// let base = calendar::day_start_utc(date!(2026 - 01 - 01));
+/// let intervals: Vec<MeterInterval> = (0..14 * 96).map(|i| MeterInterval {
+///     from: base + Duration::minutes(15 * i),
+///     to:   base + Duration::minutes(15 * i + 15),
+///     value: dec!(1),
+///     quality: QualityFlag::Measured,
+///     obis_code: None,
+/// }).collect();
+///
+/// let f = project_annual_consumption(&intervals, None).unwrap();
+/// assert_eq!(f.observed_days, 14);
+/// assert_eq!(f.projected_annual, dec!(96) * dec!(365));
+/// ```
+#[must_use]
+pub fn project_annual_consumption(
+    intervals: &[MeterInterval],
+    prior_year_intervals: Option<&[MeterInterval]>,
+) -> Option<AnnualForecast> {
+    let first_from = intervals.iter().map(|iv| iv.from).min()?;
+    let last_to = intervals.iter().map(|iv| iv.to).max()?;
+
+    // Berlin calendar days, not `(last_to - first_from).whole_days()`: an
+    // observation window spanning the spring transition is 24n − 1 hours long,
+    // and integer division reports one day fewer than it covers. That inflates
+    // the daily average — and the projection built on it — by 1/n.
+    let observed_days_i64 = crate::calendar::days_between(first_from, last_to);
+    if observed_days_i64 < MIN_OBSERVATION_DAYS {
+        return None;
+    }
+    let observed_days = u32::try_from(observed_days_i64).ok()?;
+
+    let observed: Decimal = intervals
+        .iter()
+        .filter(|iv| iv.quality.is_billable())
+        .map(|iv| iv.value)
+        .sum();
+
+    let target_year = crate::calendar::local_year(last_to);
+    let target_year_days = crate::calendar::days_in_year(target_year);
+    let daily_avg = observed / Decimal::from(observed_days);
+
+    let seasonal_factor = prior_year_intervals
+        .and_then(|prior| seasonal_factor(first_from, last_to, prior))
+        .unwrap_or(Decimal::ONE);
+    let seasonal_correction_applied = seasonal_factor != Decimal::ONE;
+
+    let projected = daily_avg * Decimal::from(target_year_days) * seasonal_factor;
+
+    let half_width = prediction_half_width(intervals, seasonal_factor, target_year_days);
+
+    Some(AnnualForecast {
+        observation_from: first_from,
+        observation_to: last_to,
+        observed,
+        observed_days,
+        target_year_days,
+        projected_annual: projected.round_dp(3),
+        seasonal_factor,
+        seasonal_correction_applied,
+        confidence_lower: half_width.map(|h| (projected - h).max(Decimal::ZERO).round_dp(3)),
+        confidence_upper: half_width.map(|h| (projected + h).round_dp(3)),
+    })
+}
+
+// ── statistics ────────────────────────────────────────────────────────────────
+
+/// Half-width of the 95 % prediction interval for the annual total.
+///
+/// `Var(total) = Y²σ²/n + Yσ²`, the estimation error of the daily mean plus the
+/// residual variation of the remaining days — see
+/// [`AnnualForecast::prediction_interval_note`].
+///
+/// Computed in `f64`: the bounds are diagnostics, not billed quantities, and
+/// the projection itself stays exact `Decimal`. `None` with fewer than two
+/// observed days or when the statistics degenerate.
+fn prediction_half_width(
     intervals: &[MeterInterval],
     seasonal_factor: Decimal,
     year_days: u16,
 ) -> Option<Decimal> {
     use std::collections::BTreeMap;
 
-    // Group by the Berlin calendar day, matching how the daily sums this
-    // variance describes are actually settled.
+    // Group by Berlin calendar day, matching how the daily sums this variance
+    // describes are actually settled.
     let mut daily: BTreeMap<time::Date, Decimal> = BTreeMap::new();
     for iv in intervals.iter().filter(|iv| iv.quality.is_billable()) {
-        *daily.entry(iv.berlin_day()).or_insert(Decimal::ZERO) += iv.value_kwh;
+        *daily.entry(iv.berlin_day()).or_insert(Decimal::ZERO) += iv.value;
     }
     if daily.len() < 2 {
         return None;
     }
 
-    let n = daily.len() as f64;
-    let values: Vec<f64> = daily
-        .values()
-        .filter_map(|d| d.to_string().parse::<f64>().ok())
-        .collect();
+    let values: Vec<f64> = daily.values().filter_map(Decimal::to_f64).collect();
     if values.len() != daily.len() {
         return None;
     }
+    let n = values.len() as f64;
     let mean = values.iter().sum::<f64>() / n;
-    let var = values.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / (n - 1.0);
-    let sd_daily = var.sqrt();
-    let factor: f64 = seasonal_factor.to_string().parse().ok()?;
-    let half = 1.96 * sd_daily * f64::from(year_days).sqrt() * factor;
+    let variance = values.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / (n - 1.0);
+
+    let y = f64::from(year_days);
+    // Y²σ²/n + Yσ² — the estimation term first, which dominates for short
+    // windows and was previously missing.
+    let total_variance = variance * (y * y / n + y);
+    let factor = seasonal_factor.to_f64()?;
+    let half = 1.96 * total_variance.sqrt() * factor.abs();
     if !half.is_finite() {
         return None;
     }
     Decimal::try_from(half).ok().map(|d| d.round_dp(3))
 }
 
-// ── project_annual_consumption ────────────────────────────────────────────────
-
-/// Project annual consumption from a partial year's interval data.
+/// The prior year's daily rate over the matching window, relative to its
+/// overall daily rate.
 ///
-/// Aggregates observed kWh, computes the daily average, and scales it to the
-/// **real length of the target year** — 366 days in a leap year, not a flat 365.
-/// The target year is the Berlin calendar year the observation ends in; a flat
-/// 365 would understate a leap-year Jahresprognose by one day, 0.27 %, which is
-/// a real amount of money on an industrial Abschlag.
+/// A factor above 1 means the observation window is a heavier-than-average part
+/// of the year, so the naive projection would overstate the year without it.
 ///
-/// When `prior_year_intervals` are provided, applies a seasonal correction
-/// factor based on the ratio of the prior year's same-period consumption
-/// to the prior year's annual total.
-///
-/// ## Returns
-///
-/// `None` when `intervals` is empty or covers fewer than 7 days.
-#[must_use]
-pub fn project_annual_consumption(
-    malo_id: &str,
-    intervals: &[MeterInterval],
-    prior_year_intervals: Option<&[MeterInterval]>,
-) -> Option<AnnualForecast> {
-    if intervals.is_empty() {
-        return None;
-    }
-
-    let first_from = intervals.iter().map(|iv| iv.from).min()?;
-    let last_to = intervals.iter().map(|iv| iv.to).max()?;
-    // Berlin calendar days, not `(last_to - first_from).whole_days()`: an
-    // observation window spanning the spring transition is 24n − 1 hours long,
-    // and integer division reports one day fewer than it covers. That inflates
-    // the daily average — and the projection built on it — by 1/n.
-    let observed_days_i64 = crate::calendar::days_between(first_from, last_to);
-    if observed_days_i64 < 7 {
-        return None; // insufficient data for meaningful projection
-    }
-    let observed_days = observed_days_i64 as u32;
-
-    let observed_kwh: Decimal = intervals
-        .iter()
-        .filter(|iv| iv.quality.is_billable())
-        .map(|iv| iv.value_kwh)
-        .sum();
-
-    // Base projection: daily average × the target year's real day count.
-    let target_year = crate::calendar::local_year(last_to);
-    let year_days = crate::calendar::days_in_year(target_year);
-    let daily_avg = observed_kwh / Decimal::from(observed_days);
-    let mut projected = daily_avg * Decimal::from(year_days);
-
-    // Seasonal correction using prior year data
-    let (seasonal_correction_applied, seasonal_factor) = if let Some(prior) = prior_year_intervals {
-        if let Some(factor) = compute_seasonal_factor(first_from, last_to, prior) {
-            projected *= factor;
-            (true, factor)
-        } else {
-            (false, Decimal::ONE)
-        }
-    } else {
-        (false, Decimal::ONE)
-    };
-
-    Some(AnnualForecast {
-        malo_id: malo_id.to_owned(),
-        observation_from: first_from,
-        observation_to: last_to,
-        observed_kwh,
-        observed_days,
-        projected_annual_kwh: projected.round_dp(3),
-        seasonal_correction_applied,
-        seasonal_factor,
-        method: if prior_year_intervals.is_some() {
-            ForecastMethod::WeightedRollingAverage
-        } else {
-            ForecastMethod::AnnualProjection
-        },
-        confidence_lower_kwh: confidence_half_width(intervals, seasonal_factor, year_days)
-            .map(|h| (projected - h).max(Decimal::ZERO).round_dp(3)),
-        confidence_upper_kwh: confidence_half_width(intervals, seasonal_factor, year_days)
-            .map(|h| (projected + h).round_dp(3)),
-    })
-}
-
-// ── prior_period_substitutes ──────────────────────────────────────────────────
-
-/// Generate substitute values for a gap using prior-period same-slot averaging.
-///
-/// Generate § 60 Abs. 2 MsbG substitute values for a gap, using `method`.
-///
-/// Every emitted [`SubstituteValueEntry`] records the method that actually
-/// produced it, which may differ from `method` when the requested strategy has
-/// no data to work from — a prior-period average with no matching reference slot
-/// falls back to carry-forward, then to zero. Reporting the requested method
-/// instead would put a claim in the § 60 Abs. 6 MsbG audit trail that the value does
-/// not support.
-///
-/// ## § 60 Abs. 2 MsbG compliance
-///
-/// [`crate::substitute::SubstituteMethod::PriorPeriodAverage`] implements the BDEW
-/// "Vorperiodenmittelwert" — the same slot of the preceding week, matched on
-/// (weekday, hour, minute) in German local time.
-///
-/// ## Parameters
-///
-/// - `gap_from` / `gap_to`: UTC timestamps of the gap to fill.
-/// - `interval_secs`: Expected interval length (900 for 15-min RLM).
-/// - `method`: Requested substitution strategy.
-/// - `prior_period_intervals`: Reference intervals (the preceding week).
-/// - `last_known_value`: Last billable value before the gap.
-/// - `next_known_value`: First billable value after the gap, required for
-///   linear interpolation to have a slope to follow.
-#[must_use]
-pub fn substitute_values(
-    gap_from: OffsetDateTime,
-    gap_to: OffsetDateTime,
-    interval_secs: u32,
-    method: crate::substitute::SubstituteMethod,
-    prior_period_intervals: &[MeterInterval],
-    last_known_value: Option<Decimal>,
-    next_known_value: Option<Decimal>,
-) -> Vec<SubstituteValueEntry> {
-    if gap_from >= gap_to || interval_secs == 0 {
-        return Vec::new();
-    }
-
-    // Build lookup: (weekday, hour, minute) → Vec<value>
-    let mut slot_map: HashMap<(Weekday, u8, u8), Vec<Decimal>> = HashMap::new();
-    for iv in prior_period_intervals {
-        if iv.quality.is_billable() {
-            use time_tz::{OffsetDateTimeExt, timezones};
-            let local = iv.from.to_timezone(timezones::db::europe::BERLIN);
-            let key = (local.weekday(), local.hour(), local.minute());
-            slot_map.entry(key).or_default().push(iv.value_kwh);
-        }
-    }
-
-    let mut result = Vec::new();
-    let interval_dur = Duration::seconds(i64::from(interval_secs));
-    let mut cursor = gap_from;
-
-    while cursor < gap_to {
-        let to = (cursor + interval_dur).min(gap_to);
-
-        // Look up prior-period slot
-        use time_tz::{OffsetDateTimeExt, timezones};
-        let local = cursor.to_timezone(timezones::db::europe::BERLIN);
-        let key = (local.weekday(), local.hour(), local.minute());
-
-        // Each arm falls back only when its own inputs are absent, and the arm
-        // that ran is what gets reported.
-        let (value, applied, ref_count) = match method {
-            crate::substitute::SubstituteMethod::ZeroFill => {
-                (Decimal::ZERO, ForecastMethod::ZeroFill, 0)
-            }
-
-            crate::substitute::SubstituteMethod::LastValueCarryForward => match last_known_value {
-                Some(last) => (last, ForecastMethod::LastValueCarryForward, 1),
-                None => (Decimal::ZERO, ForecastMethod::ZeroFill, 0),
-            },
-
-            crate::substitute::SubstituteMethod::LinearInterpolation => {
-                // Interpolate between the last known value before the gap and
-                // the first after it. With no closing value the series has no
-                // slope to follow, so this degrades to carry-forward.
-                match (last_known_value, next_known_value) {
-                    (Some(start), Some(end)) => {
-                        let span = (gap_to - gap_from).whole_seconds();
-                        let elapsed = (cursor - gap_from).whole_seconds();
-                        let value = if span > 0 {
-                            start + (end - start) * Decimal::from(elapsed) / Decimal::from(span)
-                        } else {
-                            start
-                        };
-                        (value, ForecastMethod::LinearInterpolation, 2)
-                    }
-                    (Some(start), None) => (start, ForecastMethod::LastValueCarryForward, 1),
-                    (None, Some(end)) => (end, ForecastMethod::LastValueCarryForward, 1),
-                    (None, None) => (Decimal::ZERO, ForecastMethod::ZeroFill, 0),
-                }
-            }
-
-            crate::substitute::SubstituteMethod::PriorPeriodAverage => {
-                if let Some(prior_values) = slot_map.get(&key) {
-                    let avg = prior_values.iter().sum::<Decimal>()
-                        / Decimal::from(prior_values.len() as u32);
-                    (
-                        avg,
-                        ForecastMethod::PriorPeriodSameSlot,
-                        prior_values.len() as u32,
-                    )
-                } else if let Some(last) = last_known_value {
-                    (last, ForecastMethod::LastValueCarryForward, 1)
-                } else {
-                    (Decimal::ZERO, ForecastMethod::ZeroFill, 0)
-                }
-            }
-        };
-        let method = applied;
-
-        result.push(SubstituteValueEntry {
-            interval: MeterInterval {
-                from: cursor,
-                to,
-                value_kwh: value.round_dp(6),
-                quality: QualityFlag::Substituted,
-                obis_code: None,
-            },
-            method,
-            reference_count: ref_count,
-            confidence_note: match applied {
-                ForecastMethod::PriorPeriodSameSlot => Some(format!(
-                    "{ref_count} Referenzintervall(e) im Vorperiodenmittelwert"
-                )),
-                ForecastMethod::LinearInterpolation => {
-                    Some("lineare Interpolation zwischen den Randwerten".to_owned())
-                }
-                ForecastMethod::LastValueCarryForward => {
-                    Some("letzter bekannter Messwert fortgeschrieben".to_owned())
-                }
-                ForecastMethod::ZeroFill => {
-                    Some("kein Referenzwert verfügbar — Nullwert gesetzt".to_owned())
-                }
-                _ => None,
-            },
-        });
-
-        cursor = to;
-    }
-
-    result
-}
-
-// ── helpers ───────────────────────────────────────────────────────────────────
-
-fn compute_seasonal_factor(
+/// `None` when the prior-year data cannot support the comparison — no overlap
+/// with the shifted window, or a zero total on either side.
+fn seasonal_factor(
     obs_from: OffsetDateTime,
     obs_to: OffsetDateTime,
     prior_year: &[MeterInterval],
@@ -435,43 +279,44 @@ fn compute_seasonal_factor(
         return None;
     }
 
-    // Shift the observation window back one calendar year to find the matching
-    // prior-year period. A fixed 365-day subtraction drifts by a day across a
-    // leap year and lands an hour off across a DST transition, so a "same two
-    // weeks of March" comparison would silently compare different windows.
+    // Shift the observation window back one calendar year. A fixed 365-day
+    // subtraction drifts by a day across a leap year and lands an hour off
+    // across a DST transition, so a "same two weeks of March" comparison would
+    // silently compare different windows.
     let prior_from = crate::calendar::shift_back_one_year(obs_from);
     let prior_to = crate::calendar::shift_back_one_year(obs_to);
 
-    let prior_period_kwh: Decimal = prior_year
-        .iter()
-        .filter(|iv| iv.from >= prior_from && iv.to <= prior_to && iv.quality.is_billable())
-        .map(|iv| iv.value_kwh)
-        .sum();
+    let billable = |iv: &&MeterInterval| iv.quality.is_billable();
 
-    let prior_annual_kwh: Decimal = prior_year
+    let prior_window_kwh: Decimal = prior_year
         .iter()
-        .filter(|iv| iv.quality.is_billable())
-        .map(|iv| iv.value_kwh)
+        .filter(billable)
+        .filter(|iv| iv.from >= prior_from && iv.to <= prior_to)
+        .map(|iv| iv.value)
         .sum();
+    let prior_total_kwh: Decimal = prior_year.iter().filter(billable).map(|iv| iv.value).sum();
 
-    if prior_annual_kwh == Decimal::ZERO || prior_period_kwh == Decimal::ZERO {
+    if prior_window_kwh.is_zero() || prior_total_kwh.is_zero() {
         return None;
     }
 
-    // Seasonal factor = this period's daily rate ÷ the prior year's daily rate.
-    // If this period is normally higher-than-average consumption, factor > 1.
-    // Both denominators are calendar day counts: the observation window in
-    // Berlin days, the prior year at its own real length.
-    let period_days = Decimal::from(crate::calendar::days_between(obs_from, obs_to).max(1) as u32);
-    let prior_year_days = crate::calendar::days_in_year(crate::calendar::local_year(prior_to));
-    let prior_daily = prior_annual_kwh / Decimal::from(prior_year_days);
-    let prior_period_daily = prior_period_kwh / period_days;
+    // Both rates are per Berlin calendar day: the window over its own span, the
+    // reference over the span the prior-year data actually covers. Dividing the
+    // total by a flat 365 would inflate the factor whenever the caller supplies
+    // less than a full year — the failure mode of assuming "prior year" means
+    // "a whole year".
+    let window_days = crate::calendar::days_between(prior_from, prior_to).max(1);
+    let prior_first = prior_year.iter().map(|iv| iv.from).min()?;
+    let prior_last = prior_year.iter().map(|iv| iv.to).max()?;
+    let reference_days = crate::calendar::days_between(prior_first, prior_last).max(1);
 
-    if prior_daily == Decimal::ZERO {
+    let window_daily = prior_window_kwh / Decimal::from(window_days);
+    let reference_daily = prior_total_kwh / Decimal::from(reference_days);
+    if reference_daily.is_zero() {
         return None;
     }
 
-    Some((prior_period_daily / prior_daily).round_dp(4))
+    Some((window_daily / reference_daily).round_dp(4))
 }
 
 // ── tests ─────────────────────────────────────────────────────────────────────
@@ -479,6 +324,7 @@ fn compute_seasonal_factor(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::interval::QualityFlag;
     use rust_decimal::dec;
     use time::{
         Duration,
@@ -489,101 +335,96 @@ mod tests {
         MeterInterval {
             from,
             to: from + Duration::minutes(15),
-            value_kwh: kwh,
+            value: kwh,
             quality: QualityFlag::Measured,
             obis_code: None,
         }
     }
 
-    #[test]
-    fn annual_projection_simple() {
-        // 30 days of data, 2 kWh per 15-min interval = 8 kWh/h = 192 kWh/day
-        let base = datetime!(2026-01-01 00:00 UTC);
-        let intervals: Vec<_> =
-            (0..30 * 96) // 30 days × 96 intervals
-                .map(|i| make_iv(base + Duration::minutes(15 * i), dec!(2.0)))
-                .collect();
+    /// `n` days of quarter-hours from local midnight on `start`, `kwh` each.
+    fn aligned_days(start: time::Date, days: i64, kwh: Decimal) -> Vec<MeterInterval> {
+        let base = crate::calendar::day_start_utc(start);
+        (0..days * 96)
+            .map(|i| make_iv(base + Duration::minutes(15 * i), kwh))
+            .collect()
+    }
 
-        let forecast = project_annual_consumption("51238696780", &intervals, None).unwrap();
-        assert!(forecast.observed_days >= 30);
-        // Should project ~70080 kWh per year (192 kWh/day × 365 days)
-        assert!(forecast.projected_annual_kwh > dec!(60000));
-        assert_eq!(forecast.method, ForecastMethod::AnnualProjection);
-        assert!(!forecast.seasonal_correction_applied);
+    #[test]
+    fn a_flat_fortnight_projects_the_flat_year() {
+        let intervals = aligned_days(date!(2026 - 01 - 01), 14, dec!(1));
+        let f = project_annual_consumption(&intervals, None).unwrap();
+        assert_eq!(f.observed_days, 14);
+        assert_eq!(f.daily_average_kwh(), dec!(96));
+        assert_eq!(f.projected_annual, dec!(96) * dec!(365));
+        assert!(!f.seasonal_correction_applied);
+        assert_eq!(f.seasonal_factor, Decimal::ONE);
     }
 
     #[test]
     fn insufficient_data_returns_none() {
-        let base = datetime!(2026-01-01 00:00 UTC);
-        let intervals = vec![make_iv(base, dec!(1.0))];
-        assert!(project_annual_consumption("test", &intervals, None).is_none());
+        assert!(project_annual_consumption(&[], None).is_none());
+        let one = vec![make_iv(datetime!(2026-01-01 00:00 UTC), dec!(1))];
+        assert!(project_annual_consumption(&one, None).is_none());
+        // Six days is below the floor; seven is not.
+        assert!(
+            project_annual_consumption(&aligned_days(date!(2026 - 01 - 01), 6, dec!(1)), None)
+                .is_none()
+        );
+        assert!(
+            project_annual_consumption(&aligned_days(date!(2026 - 01 - 01), 7, dec!(1)), None)
+                .is_some()
+        );
     }
 
+    /// A leap year is 366 days of consumption, not 365.
     #[test]
-    fn empty_intervals_returns_none() {
-        assert!(project_annual_consumption("test", &[], None).is_none());
-    }
+    fn projection_scales_to_the_real_year_length() {
+        let common =
+            project_annual_consumption(&aligned_days(date!(2026 - 01 - 01), 14, dec!(1)), None)
+                .unwrap();
+        let leap =
+            project_annual_consumption(&aligned_days(date!(2028 - 01 - 01), 14, dec!(1)), None)
+                .unwrap();
 
-    #[test]
-    fn confidence_bounds_bracket_the_projection() {
-        // 14 days with day-to-day variation → computable 95% CI.
-        let base = datetime!(2026-01-01 00:00 UTC);
-        let intervals: Vec<_> = (0..14 * 96)
-            .map(|i| {
-                let day = i / 96;
-                let kwh = if day % 2 == 0 { dec!(1.0) } else { dec!(1.4) };
-                make_iv(base + Duration::minutes(15 * i), kwh)
-            })
-            .collect();
-        let f = project_annual_consumption("51238696781", &intervals, None).expect("forecast");
-        let lower = f.confidence_lower_kwh.expect("lower bound computed");
-        let upper = f.confidence_upper_kwh.expect("upper bound computed");
-        assert!(lower < f.projected_annual_kwh && f.projected_annual_kwh < upper);
-        assert!(lower >= Decimal::ZERO, "lower bound clamped at zero");
-    }
-
-    #[test]
-    fn constant_consumption_has_a_tight_interval() {
-        // Aligned to the Berlin day boundary, so all 14 daily sums are equal —
-        // starting at 00:00 UTC would leave a partial first and last local day
-        // and a variance that is real rather than an artefact.
-        let base = crate::calendar::day_start_utc(time::macros::date!(2026 - 01 - 01));
-        let intervals: Vec<_> = (0..14 * 96)
-            .map(|i| make_iv(base + Duration::minutes(15 * i), dec!(1.0)))
-            .collect();
-        let f = project_annual_consumption("51238696781", &intervals, None).expect("forecast");
-        // Zero day-to-day variance → CI collapses onto the projection.
-        assert_eq!(f.confidence_lower_kwh, Some(f.projected_annual_kwh));
-        assert_eq!(f.confidence_upper_kwh, Some(f.projected_annual_kwh));
+        assert_eq!(common.target_year_days, 365);
+        assert_eq!(leap.target_year_days, 366);
+        assert_eq!(
+            leap.projected_annual - common.projected_annual,
+            dec!(96),
+            "the difference is exactly one day"
+        );
     }
 
     /// An observation window spanning the spring transition is 24n − 1 hours,
-    /// so `whole_days()` counted 13 days for 14 and inflated the daily average —
-    /// and the projection — by 7.7 %.
+    /// so `whole_days()` counted 13 days for 14 and inflated the projection by
+    /// 7.7 %.
     #[test]
     fn observation_window_spanning_dst_counts_calendar_days() {
-        // Two identical 14-day windows: one ordinary, one crossing 2026-03-29.
-        let window = |start: time::Date| {
+        // Fourteen *calendar* days of quarter-hours. The March window holds
+        // four fewer intervals than the June one, because one of its days is
+        // 23 hours long — which is the whole point.
+        let calendar_days = |start: time::Date, days: i64| {
             let base = crate::calendar::day_start_utc(start);
-            let count = (0..14)
+            let count: u32 = (0..days)
                 .map(|d| {
                     crate::calendar::intervals_in_day(
                         start.checked_add(Duration::days(d)).unwrap(),
-                        crate::resolution::IntervalResolution::QuarterHour,
+                        crate::IntervalResolution::QuarterHour,
                     )
                     .unwrap()
                 })
-                .sum::<u32>();
+                .sum();
             (0..i64::from(count))
                 .map(|i| make_iv(base + Duration::minutes(15 * i), dec!(1)))
                 .collect::<Vec<_>>()
         };
 
-        let across_dst = window(date!(2026 - 03 - 23)); // contains the 23-hour day
-        let ordinary = window(date!(2026 - 06 - 01));
+        let across_dst = calendar_days(date!(2026 - 03 - 23), 14); // holds the 23-hour day
+        let ordinary = calendar_days(date!(2026 - 06 - 01), 14);
+        assert_eq!(across_dst.len() + 4, ordinary.len());
 
-        let a = project_annual_consumption("51238696781", &across_dst, None).unwrap();
-        let b = project_annual_consumption("51238696781", &ordinary, None).unwrap();
+        let a = project_annual_consumption(&across_dst, None).unwrap();
+        let b = project_annual_consumption(&ordinary, None).unwrap();
 
         assert_eq!(a.observed_days, 14, "fourteen calendar days, not thirteen");
         assert_eq!(b.observed_days, 14);
@@ -591,224 +432,190 @@ mod tests {
         // The DST window holds four fewer intervals (the lost hour), so its
         // projection is legitimately a touch lower — but only by that hour, not
         // by the 7.7 % a truncated day count would have added.
-        let ratio = a.projected_annual_kwh / b.projected_annual_kwh;
+        let ratio = a.projected_annual / b.projected_annual;
         assert!(
             ratio > dec!(0.997) && ratio < dec!(1.0),
-            "projections must differ only by the lost hour, got ratio {ratio}"
+            "projections must differ only by the lost hour, got {ratio}"
         );
     }
 
-    /// A Jahresprognose scales to the target year's real length. 2028 is a leap
-    /// year: projecting it over 365 days would understate the year by one day.
+    // ── prediction interval ──────────────────────────────────────────────────
+
     #[test]
-    fn projection_scales_to_the_real_year_length() {
-        let daily_kwh = dec!(96); // 96 intervals × 1 kWh
-        let series = |start_year| {
-            let base = crate::calendar::day_start_utc(
-                time::Date::from_calendar_date(start_year, time::Month::January, 1).unwrap(),
-            );
-            (0..14 * 96)
-                .map(|i| make_iv(base + Duration::minutes(15 * i), dec!(1.0)))
+    fn bounds_bracket_the_projection() {
+        let base = crate::calendar::day_start_utc(date!(2026 - 01 - 01));
+        let intervals: Vec<_> = (0..14 * 96)
+            .map(|i| {
+                let kwh = if (i / 96) % 2 == 0 {
+                    dec!(1.0)
+                } else {
+                    dec!(1.4)
+                };
+                make_iv(base + Duration::minutes(15 * i), kwh)
+            })
+            .collect();
+        let f = project_annual_consumption(&intervals, None).unwrap();
+        let lower = f.confidence_lower.unwrap();
+        let upper = f.confidence_upper.unwrap();
+        assert!(lower < f.projected_annual && f.projected_annual < upper);
+        assert!(lower >= Decimal::ZERO, "lower bound clamped at zero");
+    }
+
+    /// Zero day-to-day variance collapses the interval onto the projection.
+    #[test]
+    fn constant_consumption_has_a_zero_width_interval() {
+        let f =
+            project_annual_consumption(&aligned_days(date!(2026 - 01 - 01), 14, dec!(1.0)), None)
+                .unwrap();
+        assert_eq!(f.confidence_lower, Some(f.projected_annual));
+        assert_eq!(f.confidence_upper, Some(f.projected_annual));
+    }
+
+    /// The estimation term dominates a short window. Omitting it — as the
+    /// previous `1.96 · σ · √Y` did — reported an interval about five times
+    /// too narrow at n = 14.
+    #[test]
+    fn the_interval_includes_the_estimation_error() {
+        let base = crate::calendar::day_start_utc(date!(2026 - 01 - 01));
+        let intervals: Vec<_> = (0..14 * 96)
+            .map(|i| {
+                let kwh = if (i / 96) % 2 == 0 {
+                    dec!(1.0)
+                } else {
+                    dec!(2.0)
+                };
+                make_iv(base + Duration::minutes(15 * i), kwh)
+            })
+            .collect();
+        let f = project_annual_consumption(&intervals, None).unwrap();
+        let half = (f.confidence_upper.unwrap() - f.projected_annual)
+            .to_f64()
+            .unwrap();
+
+        // Daily sums alternate 96 and 192 kWh: σ ≈ 49.9 over n = 14.
+        let sigma = 49.9_f64;
+        let y = 365.0_f64;
+        let old = 1.96 * sigma * y.sqrt(); // the formula that was there
+        let new = 1.96 * (sigma * sigma * (y * y / 14.0 + y)).sqrt();
+
+        assert!(
+            (half - new).abs() / new < 0.05,
+            "half-width {half:.0} should be near {new:.0}"
+        );
+        assert!(
+            half > old * 4.0,
+            "the corrected interval must be several times the old one: {half:.0} vs {old:.0}"
+        );
+    }
+
+    /// A longer window shrinks the interval, which is the whole point of the
+    /// estimation term.
+    #[test]
+    fn a_longer_window_narrows_the_interval() {
+        let alternating = |days: i64| {
+            let base = crate::calendar::day_start_utc(date!(2026 - 01 - 01));
+            (0..days * 96)
+                .map(|i| {
+                    let kwh = if (i / 96) % 2 == 0 {
+                        dec!(1.0)
+                    } else {
+                        dec!(2.0)
+                    };
+                    make_iv(base + Duration::minutes(15 * i), kwh)
+                })
                 .collect::<Vec<_>>()
         };
+        let short = project_annual_consumption(&alternating(14), None).unwrap();
+        let long = project_annual_consumption(&alternating(120), None).unwrap();
 
-        let common = project_annual_consumption("51238696781", &series(2026), None).unwrap();
-        assert_eq!(common.projected_annual_kwh, daily_kwh * dec!(365));
-
-        let leap = project_annual_consumption("51238696781", &series(2028), None).unwrap();
-        assert_eq!(
-            leap.projected_annual_kwh,
-            daily_kwh * dec!(366),
-            "2028 is a leap year — 366 days of consumption, not 365"
-        );
-        assert_eq!(
-            leap.projected_annual_kwh - common.projected_annual_kwh,
-            daily_kwh,
-            "the difference is exactly one day"
+        let width = |f: &AnnualForecast| f.confidence_upper.unwrap() - f.confidence_lower.unwrap();
+        assert!(
+            width(&long) < width(&short),
+            "120 days must give a tighter interval than 14: {} vs {}",
+            width(&long),
+            width(&short)
         );
     }
 
+    // ── seasonality ──────────────────────────────────────────────────────────
+
+    /// A January window on a heating load: the prior year says January runs at
+    /// twice the annual daily rate, so the naive projection halves.
     #[test]
-    fn prior_period_substitution_uses_same_slot() {
-        // 7 days of prior-period data — same hour every day = 1.5 kWh
-        let base = datetime!(2026-01-01 00:00 UTC);
-        let prior: Vec<_> = (0..7 * 96)
-            .map(|i| make_iv(base + Duration::minutes(15 * i), dec!(1.5)))
+    fn seasonal_correction_scales_a_winter_window_down() {
+        // Prior year: January at 2 kWh per quarter-hour, the rest at 1.
+        let base = crate::calendar::day_start_utc(date!(2025 - 01 - 01));
+        let prior: Vec<_> = (0..365 * 96)
+            .map(|i| {
+                let kwh = if i < 31 * 96 { dec!(2) } else { dec!(1) };
+                make_iv(base + Duration::minutes(15 * i), kwh)
+            })
             .collect();
 
-        let gap_from = datetime!(2026-01-08 00:00 UTC);
-        let gap_to = datetime!(2026-01-08 01:00 UTC); // 4 intervals
+        let observed = aligned_days(date!(2026 - 01 - 05), 14, dec!(2));
+        let uncorrected = project_annual_consumption(&observed, None).unwrap();
+        let corrected = project_annual_consumption(&observed, Some(&prior)).unwrap();
 
-        let subs = substitute_values(
-            gap_from,
-            gap_to,
-            900,
-            crate::substitute::SubstituteMethod::PriorPeriodAverage,
-            &prior,
-            None,
-            None,
-        );
-        assert_eq!(subs.len(), 4);
-        // All should use PriorPeriodSameSlot and value ≈ 1.5
-        for s in &subs {
-            assert_eq!(s.method, ForecastMethod::PriorPeriodSameSlot);
-            assert!((s.interval.value_kwh - dec!(1.5)).abs() < dec!(0.001));
-            assert_eq!(s.interval.quality, QualityFlag::Substituted);
-        }
-    }
-
-    #[test]
-    fn prior_period_fallback_to_carry_forward() {
-        // No prior-period data — should fall back to last known value
-        let gap_from = datetime!(2026-06-01 00:00 UTC);
-        let gap_to = datetime!(2026-06-01 00:15 UTC);
-        let subs = substitute_values(
-            gap_from,
-            gap_to,
-            900,
-            crate::substitute::SubstituteMethod::PriorPeriodAverage,
-            &[],
-            Some(dec!(2.5)),
-            None,
-        );
-        assert_eq!(subs.len(), 1);
-        assert_eq!(subs[0].method, ForecastMethod::LastValueCarryForward);
-        assert_eq!(subs[0].interval.value_kwh, dec!(2.5));
-    }
-
-    #[test]
-    fn forecast_method_descriptions_non_empty() {
-        for m in [
-            ForecastMethod::PriorPeriodSameSlot,
-            ForecastMethod::WeightedRollingAverage,
-            ForecastMethod::LinearInterpolation,
-            ForecastMethod::LastValueCarryForward,
-            ForecastMethod::ZeroFill,
-            ForecastMethod::ProfileBased,
-            ForecastMethod::AnnualProjection,
-        ] {
-            assert!(!m.description().is_empty());
-        }
-    }
-}
-
-#[cfg(test)]
-mod db_vocabulary_tests {
-    use super::ForecastMethod;
-
-    /// `ForecastMethod`'s Debug names are not a persistence vocabulary.
-    ///
-    /// `edmd` writes substitutions to `substitute_value_log`, whose `method`
-    /// CHECK accepts only the § 60 Abs. 2 MsbG categories. Emitting the Debug form
-    /// violated that CHECK on the default path, so the audit INSERT failed after
-    /// the billable substitute had already been committed.
-    ///
-    /// This pins the variant set: adding a variant makes the exhaustive match in
-    /// `edmd::server::forecast_method_to_db` fail to compile, which is the point.
-    #[test]
-    fn every_variant_is_accounted_for() {
-        let all = [
-            ForecastMethod::PriorPeriodSameSlot,
-            ForecastMethod::WeightedRollingAverage,
-            ForecastMethod::LinearInterpolation,
-            ForecastMethod::LastValueCarryForward,
-            ForecastMethod::ZeroFill,
-            ForecastMethod::ProfileBased,
-            ForecastMethod::AnnualProjection,
-        ];
-        assert_eq!(all.len(), 7, "ForecastMethod gained or lost a variant");
-    }
-    #[test]
-    fn each_requested_strategy_is_the_one_applied() {
-        use super::substitute_values;
-        use crate::interval::{MeterInterval, QualityFlag};
-        use crate::substitute::SubstituteMethod;
-        use rust_decimal::dec;
-        use time::macros::datetime;
-        let from = datetime!(2026-03-09 00:00 UTC);
-        let to = datetime!(2026-03-09 01:00 UTC); // four quarter-hours
-
-        // ZeroFill must not silently become a prior-period average, even when
-        // reference data and bracketing values are available.
-        let prior = vec![MeterInterval {
-            from: datetime!(2026-03-02 00:00 UTC),
-            to: datetime!(2026-03-02 00:15 UTC),
-            value_kwh: dec!(99),
-            quality: QualityFlag::Measured,
-            obis_code: None,
-        }];
-
-        let zero = substitute_values(
-            from,
-            to,
-            900,
-            SubstituteMethod::ZeroFill,
-            &prior,
-            Some(dec!(50)),
-            Some(dec!(70)),
-        );
-        assert_eq!(zero.len(), 4);
+        assert!(corrected.seasonal_correction_applied);
         assert!(
-            zero.iter().all(|e| e.interval.value_kwh == dec!(0)),
-            "ZeroFill must produce zeros regardless of available reference data"
+            corrected.seasonal_factor > dec!(1.5) && corrected.seasonal_factor < dec!(2.0),
+            "January runs hot relative to the year: {}",
+            corrected.seasonal_factor
         );
         assert!(
-            zero.iter().all(|e| e.method == ForecastMethod::ZeroFill),
-            "the reported method must be the one applied"
-        );
-
-        let carry = substitute_values(
-            from,
-            to,
-            900,
-            SubstituteMethod::LastValueCarryForward,
-            &prior,
-            Some(dec!(50)),
-            Some(dec!(70)),
-        );
-        assert!(carry.iter().all(|e| e.interval.value_kwh == dec!(50)));
-
-        // Linear interpolation walks from the leading value toward the trailing
-        // one across the gap.
-        let linear = substitute_values(
-            from,
-            to,
-            900,
-            SubstituteMethod::LinearInterpolation,
-            &prior,
-            Some(dec!(0)),
-            Some(dec!(100)),
-        );
-        let values: Vec<_> = linear.iter().map(|e| e.interval.value_kwh).collect();
-        assert_eq!(values, vec![dec!(0), dec!(25), dec!(50), dec!(75)]);
-        assert!(
-            linear
-                .iter()
-                .all(|e| e.method == ForecastMethod::LinearInterpolation)
+            corrected.projected_annual > uncorrected.projected_annual,
+            "the factor scales the projection"
         );
     }
 
+    /// A caller passing six months of "prior year" data must not have it
+    /// treated as a full year — that would double the reference daily rate and
+    /// halve the factor.
     #[test]
-    fn a_strategy_with_no_data_reports_what_it_fell_back_to() {
-        use super::substitute_values;
-        use crate::substitute::SubstituteMethod;
-        use rust_decimal::dec;
-        use time::macros::datetime;
-        // Linear interpolation with no closing value has no slope to follow.
-        let entries = substitute_values(
-            datetime!(2026-03-09 00:00 UTC),
-            datetime!(2026-03-09 00:15 UTC),
-            900,
-            SubstituteMethod::LinearInterpolation,
-            &[],
-            Some(dec!(42)),
-            None,
-        );
-        assert_eq!(entries[0].interval.value_kwh, dec!(42));
+    fn a_partial_prior_year_is_measured_over_its_own_span() {
+        // Six months of perfectly flat prior data. A flat reference means the
+        // window rate equals the overall rate, so the factor is 1 whatever the
+        // span — unless the span is assumed to be 365 days, in which case it
+        // comes out near 2.
+        let prior = aligned_days(date!(2025 - 01 - 01), 180, dec!(1));
+        let observed = aligned_days(date!(2026 - 02 - 01), 14, dec!(1));
+        let f = project_annual_consumption(&observed, Some(&prior)).unwrap();
         assert_eq!(
-            entries[0].method,
-            ForecastMethod::LastValueCarryForward,
-            "the audit record must name the fallback that ran, not the request"
+            f.seasonal_factor,
+            Decimal::ONE,
+            "a flat reference is seasonally neutral over any span"
         );
+        assert!(!f.seasonal_correction_applied);
+    }
+
+    #[test]
+    fn no_prior_overlap_leaves_the_projection_uncorrected() {
+        // Prior data from a completely different part of the year.
+        let prior = aligned_days(date!(2025 - 08 - 01), 30, dec!(5));
+        let observed = aligned_days(date!(2026 - 01 - 05), 14, dec!(1));
+        let f = project_annual_consumption(&observed, Some(&prior)).unwrap();
+        assert!(!f.seasonal_correction_applied);
+        assert_eq!(f.seasonal_factor, Decimal::ONE);
+    }
+
+    #[test]
+    fn non_billable_intervals_do_not_contribute() {
+        let mut intervals = aligned_days(date!(2026 - 01 - 01), 14, dec!(1));
+        for iv in intervals.iter_mut().take(96) {
+            iv.quality = QualityFlag::Faulty;
+        }
+        let f = project_annual_consumption(&intervals, None).unwrap();
+        assert_eq!(
+            f.observed,
+            dec!(1) * Decimal::from(13 * 96),
+            "the faulty day is excluded from the sum"
+        );
+        assert_eq!(f.observed_days, 14, "but the window is still fourteen days");
+    }
+
+    #[test]
+    fn the_note_says_what_the_interval_does_not_model() {
+        let note = AnnualForecast::prediction_interval_note();
+        assert!(note.contains("autocorrelated"), "{note}");
     }
 }

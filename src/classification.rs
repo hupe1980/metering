@@ -3,18 +3,28 @@
 //! ## Legal basis
 //!
 //! - **§ 2 MsbG**: RLM = registrierende Lastgangmessung (15-min or 60-min intervals).
-//! - **§ 12 StromNZV**: SLP = Standardlastprofil (daily, monthly, or annual totals).
-//! - **§41a Abs. 2 EnWG**: iMSys (intelligente Messsysteme) require 15-min
-//!   interval resolution for dynamic tariff billing.
-//! - **BNetzA MaBiS-Beschluss BK6-12-200**: RLM threshold ≥ 100 000 kWh/year.
+//! - **§ 2 MsbG** — registrierende Lastgangmessung and intelligentes Messsystem.
+//! - **§ 41a Abs. 2 EnWG** — suppliers with more than 100 000 Letztverbraucher
+//!   must offer a dynamic tariff to customers who *have* an iMSys. Note this is
+//!   an obligation on the **supplier**, not a resolution mandate on the meter;
+//!   earlier releases read it as "iMSys require 15-minute resolution", which
+//!   the provision does not say.
 //!
-//! ## Classification rules
+//! ## What this classifies, and what it cannot
 //!
-//! | Messtyp | Interval | Threshold |
-//! |---|---|---|
-//! | `Slp` | any (daily/monthly aggregates) | < 100 000 kWh/year |
-//! | `Rlm` | 15 min or 60 min | ≥ 100 000 kWh/year |
-//! | `IMsys` | 15 min (from SMGW direct push) | mandatory for §41a |
+//! Classification here is **from the observed series alone**: the interval
+//! length, plus an optional statement about where the data came from.
+//!
+//! | Observed | Messtyp |
+//! |---|---|
+//! | source says SMGW / iMSys | `IMsys` |
+//! | 15, 30 or 60 minute intervals | `Rlm` |
+//! | anything coarser | `Slp` |
+//!
+//! The **consumption thresholds do not appear here** — the SLP/RLM boundary at
+//! 100 000 kWh/a is a property of the Marktlokation's master data and annual
+//! quantity, neither of which is in a `MeterInterval`. An earlier version of
+//! this table listed those thresholds beside rules that never read them.
 
 use crate::interval::MeterInterval;
 use crate::resolution::IntervalResolution;
@@ -27,14 +37,14 @@ use serde::{Deserialize, Serialize};
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[cfg_attr(feature = "serde", serde(rename_all = "SCREAMING_SNAKE_CASE"))]
 pub enum Messtyp {
-    /// Standard load profile — daily or monthly aggregates.
-    /// No 15-min resolution. § 12 StromNZV.
+    /// Standard load profile — daily or coarser aggregates, with no interval
+    /// series to read a Viertelstundenleistung out of.
     Slp,
-    /// Registrierende Lastgangmessung — 15-min or 60-min intervals.
-    /// Required for ≥100 000 kWh/year. § 2 MsbG.
+    /// Registrierende Lastgangmessung — an equidistant interval series,
+    /// 15 to 60 minutes (§ 2 MsbG).
     Rlm,
-    /// iMSys / SMGW direct push — always 15-min.
-    /// Required for §41a EnWG dynamic tariff billing.
+    /// Intelligentes Messsystem — a metering system behind a Smart-Meter-
+    /// Gateway (§ 2 Satz 1 Nr. 7 MsbG), delivering quarter-hour values.
     IMsys,
 }
 
@@ -45,7 +55,8 @@ impl Messtyp {
         matches!(self, Messtyp::Rlm | Messtyp::IMsys)
     }
 
-    /// `true` when the Messtyp supports §41a EnWG dynamic tariff billing.
+    /// `true` when the Messtyp can serve a § 41a EnWG dynamic tariff, which
+    /// needs the quarter-hour values a Smart-Meter-Gateway delivers.
     #[must_use]
     pub fn supports_dynamic_tariff(&self) -> bool {
         matches!(self, Messtyp::IMsys)
@@ -91,39 +102,76 @@ pub fn detect_interval_length(intervals: &[MeterInterval]) -> Option<IntervalRes
     })
 }
 
-/// Classify the metering type based on interval length and source hint.
+/// How a series reached the system, where that settles the Messtyp on its own.
 ///
-/// - `source = Some("SMGW")` or `Some("CLS_GATEWAY")` → always `IMsys`
-/// - 15-min intervals with non-SMGW source → `Rlm`
-/// - 60-min intervals → `Rlm`
-/// - Daily/monthly or fewer intervals → `Slp`
+/// A series that arrived through a Smart-Meter-Gateway is from an
+/// intelligentes Messsystem by definition (§ 2 Satz 1 Nr. 7 MsbG), whatever its
+/// interval length looks like. Nothing else about the transport is decisive, so
+/// this enum has exactly the two answers that matter.
+///
+/// It replaces a free-text `Option<&str>` that was matched with
+/// `contains("SMGW") || contains("CLS") || contains("IMSYS")`. Substring
+/// matching on a caller-supplied label is a latent misclassification: a source
+/// named `"LEGACY_NON_SMGW_IMPORT"` classified as iMSys, and a gateway feed
+/// labelled `"Gateway"` did not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "SCREAMING_SNAKE_CASE"))]
+pub enum SeriesOrigin {
+    /// Delivered by a Smart-Meter-Gateway — directly, or over a CLS channel.
+    SmartMeterGateway,
+    /// Anything else: an MSCONS delivery, a manual entry, a file import.
+    ///
+    /// Says nothing about the Messtyp on its own, so classification falls back
+    /// to the observed interval length.
+    Other,
+}
+
+impl SeriesOrigin {
+    /// Every variant, in declaration order.
+    pub const ALL: [Self; 2] = [Self::SmartMeterGateway, Self::Other];
+}
+
+/// Classify the metering type from the observed series and, optionally, how it
+/// arrived.
+///
+/// | Evidence | Messtyp |
+/// |---|---|
+/// | [`SeriesOrigin::SmartMeterGateway`] | `IMsys` |
+/// | intervals of 15, 30 or 60 minutes | `Rlm` |
+/// | anything coarser, or no usable series | `Slp` |
+///
+/// The gateway wins over the interval length: an iMSys delivering hourly values
+/// is still an iMSys.
 ///
 /// # Example
 /// ```rust
 /// use metering::{classify_messtyp, Messtyp};
-/// use metering::interval::MeterInterval;
-/// use metering::interval::QualityFlag;
-/// use rust_decimal::Decimal;
+/// use metering::classification::SeriesOrigin;
+/// use metering::interval::{MeterInterval, QualityFlag};
+/// use rust_decimal::dec;
 /// use time::macros::datetime;
 ///
-/// // 15-min intervals without SMGW source → RLM
 /// let iv = MeterInterval {
 ///     from: datetime!(2026-01-01 0:00 UTC),
 ///     to:   datetime!(2026-01-01 0:15 UTC),
-///     value_kwh: Decimal::from(2u32),
+///     value: dec!(2),
 ///     quality: QualityFlag::Measured,
 ///     obis_code: None,
 /// };
-/// assert_eq!(classify_messtyp(&[iv], None), Messtyp::Rlm);
+///
+/// // Quarter-hours with no gateway claim → RLM.
+/// assert_eq!(classify_messtyp(&[iv.clone()], None), Messtyp::Rlm);
+/// // ...the same series from a gateway → iMSys.
+/// assert_eq!(
+///     classify_messtyp(&[iv], Some(SeriesOrigin::SmartMeterGateway)),
+///     Messtyp::IMsys,
+/// );
 /// ```
 #[must_use]
-pub fn classify_messtyp(intervals: &[MeterInterval], source: Option<&str>) -> Messtyp {
-    // SMGW/CLS direct push is always iMSys
-    if let Some(src) = source {
-        let src_upper = src.to_uppercase();
-        if src_upper.contains("SMGW") || src_upper.contains("CLS") || src_upper.contains("IMSYS") {
-            return Messtyp::IMsys;
-        }
+pub fn classify_messtyp(intervals: &[MeterInterval], origin: Option<SeriesOrigin>) -> Messtyp {
+    if origin == Some(SeriesOrigin::SmartMeterGateway) {
+        return Messtyp::IMsys;
     }
 
     match detect_interval_length(intervals) {
@@ -148,7 +196,7 @@ mod tests {
         MeterInterval {
             from: base + time::Duration::minutes(i as i64 * 15),
             to: base + time::Duration::minutes(i as i64 * 15 + 15),
-            value_kwh: dec!(2.0),
+            value: dec!(2.0),
             quality: QualityFlag::Measured,
             obis_code: None,
         }
@@ -161,13 +209,31 @@ mod tests {
     }
 
     #[test]
-    fn classify_imsys_from_smgw_source() {
+    fn a_gateway_origin_outranks_the_interval_length() {
         let intervals: Vec<_> = (0..4).map(iv_15min).collect();
-        assert_eq!(classify_messtyp(&intervals, Some("SMGW")), Messtyp::IMsys);
         assert_eq!(
-            classify_messtyp(&intervals, Some("CLS_GATEWAY")),
+            classify_messtyp(&intervals, Some(SeriesOrigin::SmartMeterGateway)),
             Messtyp::IMsys
         );
+        assert_eq!(
+            classify_messtyp(&intervals, Some(SeriesOrigin::Other)),
+            Messtyp::Rlm
+        );
+
+        // Even a daily series from a gateway is an iMSys.
+        let base = datetime!(2026-01-01 0:00 UTC);
+        let daily = vec![MeterInterval {
+            from: base,
+            to: base + time::Duration::days(1),
+            value: dec!(24.0),
+            quality: QualityFlag::Measured,
+            obis_code: None,
+        }];
+        assert_eq!(
+            classify_messtyp(&daily, Some(SeriesOrigin::SmartMeterGateway)),
+            Messtyp::IMsys
+        );
+        assert_eq!(classify_messtyp(&daily, None), Messtyp::Slp);
     }
 
     #[test]
@@ -176,7 +242,7 @@ mod tests {
         let intervals = vec![MeterInterval {
             from: base,
             to: base + time::Duration::days(1),
-            value_kwh: dec!(24.0),
+            value: dec!(24.0),
             quality: QualityFlag::Measured,
             obis_code: None,
         }];

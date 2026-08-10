@@ -79,6 +79,9 @@ jobs:
         run: cargo test --all-features --all-targets
       - name: doctests (all features)
         run: cargo test --all-features --doc
+      # The example asserts its own invariants, so running it is a test.
+      - name: examples
+        run: cargo run --all-features --example pipeline
 
   features:
     name: 🎛️ feature matrix

@@ -1,8 +1,8 @@
 //! German energy metering domain library.
 //!
-//! A **standalone**, **pure** library for meter data calculations required by
-//! BDEW MaKo, MsbG, GasGVV, and EnWG. Zero I/O, no async, no clock, exact
-//! decimal quantities.
+//! A **standalone**, **pure** library for the quantity calculations German
+//! energy metering requires — MsbG, EnWG, StromNEV, MessEV and the BNetzA
+//! Festlegungen. Zero I/O, no async, no clock, exact decimal quantities.
 //!
 //! It computes **energy and volume**, not money: there is no currency, price or
 //! tariff-rate type here. What leaves this crate is kWh, m³ and kW, which a
@@ -12,46 +12,58 @@
 //!
 //! | Module | Contents |
 //! |---|---|
-//! | [`interval`] | `MeterInterval`, `Sparte`, `QualityFlag`, `demand_kw()` |
-//! | [`calendar`] | Europe/Berlin calendar days, months and years — DST-correct interval counts |
-//! | [`error`] | `ParseError` — the single error type every `FromStr` here returns |
-//! | [`conversion`] | Gas m³ → kWh_Hs (§25 Nr. 4 MessEV / DVGW G 685) |
-//! | [`aggregation`] | Billing period: `arbeitsmenge_kwh`, `spitzenleistung_kw`, HT/NT |
-//! | [`classification`] | SLP/RLM/iMSys detection, interval length |
-//! | [`imbalance`] | Mehr-/Mindermengensaldo (§ 13 StromNZV, compute_imbalance) |
-//! | [`quality`] | Hampel-filter quality scoring (M7), `score_intervals_raw` for f64 |
-//! | [`validation`] | V01–V11 validation engine, order-independent |
-//! | [`substitute`] | § 60 Abs. 2 MsbG Ersatzwertbildung (4 methods, slot matching) |
-//! | [`forecast`] | § 60 Abs. 2 MsbG Jahresprognose with 95% confidence bounds |
-//! | [`load_profile`] | SLP classes incl. BDEW 2025 (H25/G25/L25/P25/S25) + Dynamisierung |
-//! | [`zaehlzeit`] | Zählzeitdefinition — time-variable register resolution (§14a EnWG) |
-//! | [`rollout`] | §29 MsbG Pflichteinbaufälle + §45 MsbG Rollout-Fahrplan |
-//! | [`smgw`] | SMGW sessions, certificates, CLS channels (BSI TR-03109) |
-//! | [`virtual_meter`] | Sum/Residual/GGV virtual meters (§42b EnWG) |
+//! | [`interval`] | `MeterInterval` — the Lastgang; `Sparte`, `QualityFlag` |
+//! | [`reading`] | `MeterReading` — the Zählerstand, and the ZSG → Lastgang conversion |
+//! | [`obis`] | Typed `ObisCode`, one canonical string per channel |
+//! | [`calendar`] | Europe/Berlin days, months and years — DST-correct interval counts |
+//! | [`holiday`] | Bundesland statutory holidays; SLP day typing |
+//! | [`resolution`] | `IntervalResolution` — fixed vs calendar lengths |
+//! | [`conversion`] | Gas m³ → kWh_Hs, unit normalisation, HeizkostenV warm water |
+//! | [`aggregation`] | Billing period: Arbeitsmenge, Spitzenleistung, coverage |
+//! | [`zaehlzeit`] | Tariff registers — HT/NT and § 14a Modul 3 |
+//! | [`mod@resample`] | Down-sampling to Berlin calendar buckets |
+//! | [`validation`] | The rule engine — V01–V09, V11, V12 — order-independent |
+//! | [`quality`] | Hampel filter, and an A/B/C/F grade over the findings |
+//! | [`substitute`] | Ersatzwertbildung — 4 methods, with an audit trail |
+//! | [`forecast`] | Jahresprognose with a 95 % prediction interval |
+//! | [`load_profile`] | SLP classes incl. BDEW 2025 (H25/G25/L25/P25/S25) |
+//! | [`classification`] | SLP / RLM / iMSys detection from the observed series |
+//! | [`virtual_meter`] | Sum / Residual / GGV virtual meters (§ 42b EnWG) |
+//! | [`aggregation_rule`] | The rules `virtual_meter` evaluates |
+//! | [`imbalance`] | Jahresmehr-/-mindermengen (GPKE Kap. 8.4) |
+//! | [`losses`] | Netzverlust balance (§ 22 Abs. 1 EnWG) |
+//! | [`power_quality`] | EN 50160 — statistical, over a week of 10-minute means |
+//! | [`measurement_point`] | What is metered, and on whose account |
+//! | [`measurement_series`] | A named series with its provenance |
+//! | [`lifecycle`] | Meter installation, exchange and retirement events |
+//! | [`rollout`] | § 29 MsbG Pflichteinbaufälle + § 45 MsbG Rollout-Fahrplan |
+//! | [`sharing`] | § 42c EnWG Energy-Sharing eligibility |
+//! | [`error`] | `ParseError` — the one error every `FromStr` here returns |
 //!
 //! # Numeric types
 //!
-//! Every **metered quantity** is [`rust_decimal::Decimal`] — `value_kwh`,
-//! `arbeitsmenge_kwh`, `spitzenleistung_kw`, the HT/NT split, the gas m³→kWh_Hs
-//! conversion, GGV allocations and substitute values are exact decimal
-//! arithmetic end to end, never routed through a float and back.
+//! Every **metered quantity** is [`rust_decimal::Decimal`] — `value`,
+//! `arbeitsmenge`, `spitzenleistung_kw`, the per-register split, the gas
+//! m³→kWh_Hs conversion, GGV allocations and substitute values are exact
+//! decimal arithmetic end to end, never routed through a float and back.
 //!
 //! `f64` is used, deliberately, for **statistics and diagnostics**:
-//! `coverage_pct`, the Hampel filter's threshold and median absolute deviation,
-//! [`ValidationConfig::spike_factor`] and the forecast confidence bounds. Those
-//! are comparisons and indicators, not amounts.
+//! `coverage_pct`, the Hampel filter's median absolute deviation and threshold,
+//! and the forecast prediction interval. Those are comparisons and indicators,
+//! not amounts.
 //!
-//! The two meet in exactly one place, documented at the call site: the V04 spike
-//! rule converts a value to `f64` to compare it against the `f64` spike factor.
-//! That comparison decides whether to *flag* an interval; it never alters one.
+//! The two meet in exactly one place: the V04 outlier rule converts values to
+//! `f64` to run the Hampel filter over them. That comparison decides whether to
+//! *flag* an interval; it never alters one. Nothing a float touches is ever
+//! written back into a quantity.
 //!
 //! # Determinism
 //!
 //! **No function in this crate reads the system clock, the filesystem, the
 //! network or any other ambient state.** Every input is an argument, so equal
 //! inputs always produce equal outputs, and any result can be replayed or
-//! cached. Where a timestamp is needed — a provenance entry, an SMGW
-//! communication-fault assessment — it is a parameter:
+//! cached. Where a timestamp is needed — a provenance entry, a validity check,
+//! a "was this reading in the future" test — it is a parameter:
 //!
 //! ```rust
 //! # use metering::{MeasurementSeries, MeasurementSource};
@@ -74,13 +86,18 @@
 //!
 //! # Time is Europe/Berlin
 //!
-//! German metering periods are **local calendar periods**. A day, a month and a
-//! §13 StromNZV settlement period all begin at 00:00 Europe/Berlin — 23:00 UTC
-//! the previous day in winter, 22:00 UTC in summer — and a day is 23 or 25 hours
-//! long at the DST transitions. [`calendar`] owns those rules; [`mod@resample`]
-//! buckets through it, and [`tariff_window`] and [`zaehlzeit`] resolve local
-//! windows through the same tz database. Interval timestamps themselves are
-//! always UTC.
+//! German metering periods are **local calendar periods**. A Liefertag, a
+//! Liefermonat and a settlement year all begin at 00:00 Europe/Berlin — 23:00
+//! UTC the previous day in winter, 22:00 UTC in summer — and a day is 23 or 25
+//! hours long at the DST transitions. [`calendar`] owns those rules;
+//! [`mod@resample`] buckets through it, and [`zaehlzeit`] and
+//! [`holiday`] resolve local windows and dates through the same tz database.
+//!
+//! Interval timestamps themselves are always **UTC**, which is the market's own
+//! split. EDI@Energy *Allgemeine Festlegungen* v6.1b, Kap. 3: *"Die Angabe von
+//! Zeiten in einer EDIFACT Nachricht erfolgt in koordinierter Weltzeit (UTC) …
+//! Alle in den Prozessen genannten Zeitpunkte … nutzen die gesetzliche deutsche
+//! Zeit."*
 //!
 //! Because a calendar period has no fixed second count,
 //! [`IntervalResolution::fixed_seconds`] returns `None` for `Day`, `Month` and
@@ -178,12 +195,12 @@
 //! let iv = MeterInterval {
 //!     from: datetime!(2026-06-01 0:00 UTC),
 //!     to:   datetime!(2026-06-01 0:15 UTC),
-//!     value_kwh: Decimal::from_str_exact("2.345").unwrap(),
+//!     value: Decimal::from_str_exact("2.345").unwrap(),
 //!     quality: QualityFlag::Measured,
 //!     obis_code: None,
 //! };
-//! let period = aggregate(&[iv], &AggregationConfig::rlm_strom());
-//! assert!(period.arbeitsmenge_kwh > Decimal::ZERO);
+//! let period = aggregate(&[iv], &AggregationConfig::rlm());
+//! assert!(period.arbeitsmenge > Decimal::ZERO);
 //! ```
 //!
 //! # Quick start — Gas m³ → kWh_Hs
@@ -200,15 +217,41 @@
 //! assert!(kwh > Decimal::from(1000u32));
 //! ```
 //!
-//! # Quick start — quality scoring (f64 API, e.g. from DB)
+//! # Quick start — validate, then grade
 //!
 //! ```rust
-//! use metering::{score_intervals_raw, QualityGrade};
+//! use metering::{MeterInterval, QualityConfig, QualityGrade, QualityFlag, score_intervals};
+//! use rust_decimal::dec;
+//! use time::{Duration, macros::datetime};
 //!
-//! let values = vec![2.3_f64, 2.4, 2.3, 2.5, 2.2, 2.4, 2.3];
-//! let grade = score_intervals_raw(&values, 3, 3.0);
-//! assert_eq!(grade, QualityGrade::A);
+//! let day: Vec<MeterInterval> = (0..96).map(|i| MeterInterval {
+//!     from: datetime!(2026-06-01 0:00 UTC) + Duration::minutes(i * 15),
+//!     to:   datetime!(2026-06-01 0:00 UTC) + Duration::minutes(i * 15 + 15),
+//!     value: dec!(2.0),
+//!     quality: QualityFlag::Measured,
+//!     obis_code: None,
+//! }).collect();
+//!
+//! let report = score_intervals(&day, &QualityConfig::default());
+//! assert_eq!(report.grade, QualityGrade::A);
+//! assert!(report.issues.is_empty());
 //! ```
+//!
+//! # Scope — what belongs here and what does not
+//!
+//! This crate computes **quantities**. It deliberately excludes three
+//! neighbouring concerns, each of which has its own home:
+//!
+//! | Not here | Why | Where |
+//! |---|---|---|
+//! | Money — prices, tariffs, invoices | what leaves here is kWh, m³ and kW | a billing layer |
+//! | EDIFACT / XML market messages | parsing a MSCONS is not arithmetic | [`mako`](https://github.com/hupe1980/mako) |
+//! | Fristen — counting Werktage to a GPKE deadline | a process-engine concern | a process engine |
+//!
+//! The third is the least obvious. [`holiday`] does carry a German statutory
+//! holiday calendar, because SLP day typing and HT/NT classification cannot be
+//! done without one — but it counts no business days and knows nothing of the
+//! EDI@Energy rule that a holiday in one Bundesland counts nationwide.
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 
@@ -217,9 +260,9 @@ pub mod aggregation_rule;
 pub mod calendar;
 pub mod classification;
 pub mod conversion;
-pub mod demand;
 pub mod error;
 pub mod forecast;
+pub mod holiday;
 pub mod imbalance;
 pub mod interval;
 pub mod lifecycle;
@@ -230,65 +273,61 @@ pub mod measurement_series;
 pub mod obis;
 pub mod power_quality;
 pub mod quality;
-pub mod register;
+pub mod reading;
 pub mod resample;
 pub mod resolution;
 pub mod rollout;
 pub mod sharing;
-pub mod smgw;
 pub mod substitute;
-pub mod tariff_window;
 pub mod validation;
 pub mod virtual_meter;
 pub mod zaehlzeit;
 
 // ── Re-exports ────────────────────────────────────────────────────────────────
 
-pub use aggregation::{AggregationConfig, BillingPeriod, HtNtSplit, aggregate};
-pub use aggregation_rule::AggregationRule;
+pub use aggregation::{AggregationConfig, BillingPeriod, aggregate};
+pub use aggregation_rule::{AggregationRule, VirtualMeterKind};
 pub use calendar::{DayKind, day_length, day_start_utc, intervals_in_day, local_day};
-pub use classification::{Messtyp, classify_messtyp, detect_interval_length};
+pub use classification::{Messtyp, SeriesOrigin, classify_messtyp, detect_interval_length};
 pub use conversion::{
-    GasConversionParams, WarmWaterAdjustments, gas_m3_to_kwh_hs, normalize_interval_to_kwh,
-    warm_water_heat_kwh, warm_water_heat_kwh_unmetered,
+    G685FinalRounding, G685Rounding, GasConversionParams, WarmWaterAdjustments, gas_m3_to_kwh_hs,
+    gas_m3_to_kwh_hs_rounded, normalize_to_kwh, warm_water_heat_kwh, warm_water_heat_kwh_unmetered,
 };
-pub use demand::{DemandInterval, DemandWindow};
 pub use error::ParseError;
-pub use forecast::{
-    AnnualForecast, ForecastMethod, SubstituteValueEntry, project_annual_consumption,
-    substitute_values,
-};
+pub use forecast::{AnnualForecast, project_annual_consumption};
+pub use holiday::{Bundesland, Holiday, slp_day_type};
 pub use imbalance::{ImbalanceSaldo, compute_imbalance};
 pub use interval::{MeasurementUnit, MeterInterval, QualityFlag, Sparte, UnitScale};
 pub use lifecycle::{
     MeterExchangeEvent, MeterLifecycleEvent, MeterLifecycleEventType, MeterStatus,
 };
-pub use load_profile::LoadProfile;
+pub use load_profile::{DynamicSlpProfile, Dynamization, LoadProfile, SlpDayType};
 pub use losses::{NetworkLosses, network_losses};
 pub use measurement_point::{EnergyFlow, MarktRolle, MeasurementPoint};
 pub use measurement_series::{
     MeasurementSeries, MeasurementSource, ProvenanceEntry, ProvenanceEventType,
 };
-pub use obis::ObisCode;
-pub use power_quality::PowerQualityInterval;
-pub use quality::{
-    QualityConfig, QualityGrade, QualityReport, hampel_filter, hampel_filter_with_floor,
-    score_intervals, score_intervals_f64, score_intervals_raw,
+pub use obis::{ObisCode, RegisterUnit};
+pub use power_quality::{
+    En50160Limits, En50160Report, LimitOutcome, PowerQualityInterval, assess_en50160,
 };
-pub use register::{EnergyDirection, MeterRegister, RegisterUnit};
+pub use quality::{
+    K_MAD, QualityConfig, QualityGrade, QualityReport, hampel_filter, hampel_filter_with_floor,
+    score_intervals,
+};
+pub use reading::{
+    Anomaly, AnomalyKind, Lastgang, LastgangConfig, MeterReading, Rollover, to_lastgang,
+};
 pub use resample::{ResampleConfig, ResampledBucket, resample};
 pub use resolution::IntervalResolution;
-pub use smgw::{
-    CertificateType, ClsChannel, ClsChannelStatus, ClsDeviceType, GatewayCertificate,
-    GatewayStatus, SmgwSession,
-};
+pub use rollout::{RolloutObligation, classify_rollout_obligation};
+pub use sharing::{Bilanzierungsmethode, Capability, Delivery, SharingReadiness, Zaehlertyp};
 pub use substitute::{
-    FillGapsConfig, SubstituteMethod, SubstitutionReason, fill_gaps, fill_gaps_with_config,
-    linear_interpolation,
+    FillGapsConfig, FilledSeries, SubstituteEntry, SubstituteMethod, SubstitutionReason, fill_gaps,
 };
-pub use tariff_window::{HtNtSchedule, TariffWindow, TariffWindowDays};
 pub use validation::{
     ValidationConfig, ValidationIssue, ValidationResult, ValidationRuleId, ValidationSeverity,
     validate_intervals,
 };
 pub use virtual_meter::{VirtualMeterError, compute_virtual_meter};
+pub use zaehlzeit::{DayGroup, ZaehlzeitFenster, Zaehlzeitdefinition};

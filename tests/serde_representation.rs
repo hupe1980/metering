@@ -196,12 +196,12 @@ fn meter_interval_field_names_are_stable() {
     let iv = MeterInterval {
         from: datetime!(2026-01-01 0:00 UTC),
         to: datetime!(2026-01-01 0:15 UTC),
-        value_kwh: dec!(2.5),
+        value: dec!(2.5),
         quality: QualityFlag::Measured,
         obis_code: Some(ObisCode::STROM_BEZUG_TOTAL),
     };
     let encoded = json(&iv);
-    for field in ["from", "to", "value_kwh", "quality", "obis_code"] {
+    for field in ["from", "to", "value", "quality", "obis_code"] {
         assert!(encoded.contains(&format!("\"{field}\"")), "{field} missing");
     }
     assert!(encoded.contains("\"1-0:1.8.0\""));
@@ -210,19 +210,20 @@ fn meter_interval_field_names_are_stable() {
     assert_eq!(decoded, iv, "round trip");
 }
 
+/// Encode, decode, and assert the value survived unchanged.
+fn round_trip<T>(v: T)
+where
+    T: serde::Serialize + serde::de::DeserializeOwned + PartialEq + std::fmt::Debug,
+{
+    let encoded = json(&v);
+    let decoded: T = serde_json::from_str(&encoded)
+        .unwrap_or_else(|e| panic!("{v:?} failed to decode from {encoded}: {e}"));
+    assert_eq!(decoded, v);
+}
+
 /// Everything that goes out must come back in as itself.
 #[test]
 fn every_enum_round_trips_through_json() {
-    fn round_trip<T>(v: T)
-    where
-        T: serde::Serialize + serde::de::DeserializeOwned + PartialEq + std::fmt::Debug,
-    {
-        let encoded = json(&v);
-        let decoded: T = serde_json::from_str(&encoded)
-            .unwrap_or_else(|e| panic!("{v:?} failed to decode from {encoded}: {e}"));
-        assert_eq!(decoded, v);
-    }
-
     for v in Sparte::ALL {
         round_trip(v);
     }
@@ -261,6 +262,112 @@ fn every_enum_round_trips_through_json() {
     ] {
         round_trip(v);
     }
+}
+
+/// The tags introduced in 0.17. Same commitment as everything above: these are
+/// a wire format, so a rename is a breaking change.
+#[test]
+fn tags_added_in_0_17_are_pinned() {
+    use metering::classification::SeriesOrigin;
+    use metering::holiday::{Bundesland, Holiday};
+    use metering::reading::AnomalyKind;
+    use metering::sharing::{Bilanzierungsmethode, Zaehlertyp};
+    use metering::{SubstituteMethod, SubstitutionReason, VirtualMeterKind};
+
+    // Bundesland — the ISO 3166-2:DE subdivision code, uppercase, no prefix.
+    assert_eq!(serde_json::to_string(&Bundesland::By).unwrap(), r#""BY""#);
+    assert_eq!(serde_json::to_string(&Bundesland::Nw).unwrap(), r#""NW""#);
+    for land in Bundesland::ALL {
+        let encoded = serde_json::to_string(&land).unwrap();
+        assert_eq!(encoded, format!(r#""{}""#, land.as_str()));
+        assert_eq!(
+            serde_json::from_str::<Bundesland>(&encoded).unwrap(),
+            land,
+            "{land} must round-trip"
+        );
+    }
+
+    assert_eq!(
+        serde_json::to_string(&Holiday::BussUndBettag).unwrap(),
+        r#""BUSS_UND_BETTAG""#
+    );
+    assert_eq!(
+        serde_json::to_string(&Holiday::ChristiHimmelfahrt).unwrap(),
+        r#""CHRISTI_HIMMELFAHRT""#
+    );
+    assert_eq!(
+        serde_json::to_string(&VirtualMeterKind::GgvProportionalAllocation).unwrap(),
+        r#""GGV_PROPORTIONAL_ALLOCATION""#
+    );
+    assert_eq!(
+        serde_json::to_string(&AnomalyKind::BackwardsWithoutRegisterWidth).unwrap(),
+        r#""BACKWARDS_WITHOUT_REGISTER_WIDTH""#
+    );
+    assert_eq!(
+        serde_json::to_string(&SeriesOrigin::SmartMeterGateway).unwrap(),
+        r#""SMART_METER_GATEWAY""#
+    );
+    assert_eq!(
+        serde_json::to_string(&Zaehlertyp::IntelligentesMesssystem).unwrap(),
+        r#""INTELLIGENTES_MESSSYSTEM""#
+    );
+    assert_eq!(
+        serde_json::to_string(&Bilanzierungsmethode::Rlm).unwrap(),
+        r#""RLM""#
+    );
+    assert_eq!(
+        serde_json::to_string(&SubstituteMethod::PriorPeriodAverage).unwrap(),
+        r#""PRIOR_PERIOD_AVERAGE""#
+    );
+    assert_eq!(
+        serde_json::to_string(&SubstitutionReason::GatewayCommFailure).unwrap(),
+        r#""GATEWAY_COMM_FAILURE""#
+    );
+
+    // Every variant of each new enum round-trips.
+    for h in Holiday::ALL {
+        round_trip(h);
+    }
+    for k in VirtualMeterKind::ALL {
+        round_trip(k);
+    }
+    for k in AnomalyKind::ALL {
+        round_trip(k);
+    }
+    for o in SeriesOrigin::ALL {
+        round_trip(o);
+    }
+    for z in Zaehlertyp::ALL {
+        round_trip(z);
+    }
+    for b in Bilanzierungsmethode::ALL {
+        round_trip(b);
+    }
+    for m in SubstituteMethod::ALL {
+        round_trip(m);
+    }
+    for r in SubstitutionReason::ALL {
+        round_trip(r);
+    }
+}
+
+/// `MeterReading`'s field names, like `MeterInterval`'s above.
+#[test]
+fn meter_reading_field_names_are_stable() {
+    use metering::reading::MeterReading;
+    use rust_decimal::dec;
+    use time::macros::datetime;
+
+    let reading = MeterReading::measured(datetime!(2026-06-01 0:00 UTC), dec!(14230.5));
+    let encoded = serde_json::to_string(&reading).unwrap();
+    for field in ["at", "value", "quality", "obis_code"] {
+        assert!(
+            encoded.contains(&format!(r#""{field}":"#)),
+            "field {field} missing from {encoded}"
+        );
+    }
+    let decoded: MeterReading = serde_json::from_str(&encoded).unwrap();
+    assert_eq!(decoded, reading);
 }
 
 /// A tag that no longer exists must fail loudly, not silently pick a default.

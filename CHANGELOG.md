@@ -4,6 +4,328 @@ All notable changes to `metering` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the crate follows
 semver, with the `serde` representation explicitly in scope (see the crate docs).
 
+## [0.17.0] — 2026-08-10
+
+A correctness release, and a large one. Several statutory citations were wrong —
+one of them inverted the obligation it described. A validation rule could not
+fire on the data model it validated, another diagnosed the wrong fault. Three
+modules computed nothing or duplicated a fourth. Substitute-value interpolation
+was off by one interval and the forecast interval was about five times too
+narrow.
+
+Every removal is a hard cut; there are no deprecated shims.
+
+### Removed
+
+- **`smgw`** — 570 lines of Smart-Meter-Gateway records: statuses, certificate
+  metadata, CLS channels. Its entire computational content was two date
+  subtractions, and nothing else in the crate referenced any of it. Certificate
+  lifecycle is a PKI problem, and a module whose own docs say it does not parse
+  X.509 has no business modelling it. The one metering-side concept — a gateway
+  outage requiring an Ersatzwert — already exists as
+  `SubstitutionReason::GatewayCommFailure`.
+- **`tariff_window`** — `TariffWindow`, `TariffWindowDays` and `HtNtSchedule`.
+  See *one tariff-register mechanism* below.
+- **`register`** — merged into `measurement_point`. See *one measurement point*
+  below.
+- **`demand`** — after `DemandWindow` went, what remained was a `DemandInterval`
+  nothing constructed and an `energy_to_demand_kw()` duplicating
+  `MeterInterval::demand_kw`.
+- **`validation` V10 (register rollover)** and its rule number, retired rather
+  than recycled. It compared consecutive `value_kwh` for a drop over 50 000 kWh,
+  but a `MeterInterval` carries interval energy, not a cumulative Zählerstand:
+  for it to fire, one quarter-hour had to carry 50 MWh — 200 MW of average load.
+  Rollover detection now lives in `reading`, where readings are. Leaving `V10`
+  unused means a stored finding cannot be silently reinterpreted.
+- **`quality::score_intervals_raw` and `score_intervals_f64`** — two more copies
+  of gap detection, zero-run counting, interval consistency and coverage, each
+  subtly different from the validation engine's. A series could grade `A` while
+  validation reported errors on it. The `score_intervals_f64` docs also claimed
+  SIMD auto-vectorisation of loops that allocate a `Vec` per window.
+- **`forecast::substitute_values`, `ForecastMethod`, `SubstituteValueEntry`** —
+  a second Ersatzwertbildung engine. See *one substitute engine* below.
+- **`substitute::linear_interpolation`** — its time fraction was `mid/total`,
+  which is always `0.5`: a midpoint average dressed up as an interpolation.
+- **`AggregationConfig::include_ht_nt` / `ht_window` / `rlm_zweitarif`,
+  `BillingPeriod::ht_nt`, `HtNtSplit`** — see *one tariff-register mechanism*.
+- **`impl Default for PowerQualityInterval`** — it invented a zero-length
+  interval at the Unix epoch. Use `PowerQualityInterval::empty(from, to)`.
+- **`MeterRegister::register_number`** — duplicated OBIS value group E, was free
+  to contradict it, and documented itself as 0–9 when E has run 0–62 since
+  2023-10-01. Use `ObisCode::tariff_register()`.
+
+### Fixed — statutory citations
+
+These were wrong, not merely imprecise. Each module now states the correction in
+its docs rather than quietly changing it.
+
+- **§ 60 Abs. 6 MsbG was described backwards.** It was cited as *"3-year
+  retention with full provenance for billing data"*. It is a **deletion** duty:
+  personenbezogene Messwerte must be erased or anonymised as soon as they are no
+  longer needed, *"spätestens jedoch nach drei Jahren ab dem Schluss des
+  Kalenderjahres"*. Three years is a ceiling. A system built to retain for three
+  years *because the law says so* has it inverted.
+- **§ 60 Abs. 2 MsbG was over-read.** It names Plausibilisierung and
+  Ersatzwertbildung and says they should happen in the Smart-Meter-Gateway. It
+  prescribes no method, reference period or ranking — so claims such as
+  *"prior-period same-slot average is the preferred method per § 60 Abs. 2"* are
+  gone. The duty is § 60 Abs. 1; the procedures are BNetzA Festlegungen
+  (BK6-24-174) and VDE-AR-N 4400.
+- **`substitute` carried a self-contradictory sentence**: *"the MsbG was
+  repealed by Art. 12 G. v. 29.08.2016 and folded into the MsbG"*.
+- **Spitzenleistung was cited as § 12 StromNZV and § 18 Abs. 1 StromNEV.**
+  Neither is about peak demand: § 12 StromNZV was *"Standardisierte Lastprofile;
+  Zählerstandsgangmessung"* (repealed with effect from the end of 31.12.2025),
+  and § 18 StromNEV is *"Entgelt für dezentrale Einspeisung"*. It is
+  **§ 17 Abs. 2 StromNEV**.
+- **BK6-22-024 was cited for GPKE, MaBiS and MMM billing.** It is the
+  *Lieferantenwechsel in 24 Stunden* (LFW24) Festlegung. Replaced with
+  BK6-06-009 (GPKE), BK6-07-002 (MaBiS) and the consolidated Lesefassung
+  **BK6-24-174**.
+- **§ 42a EEG was cited for residual-load metering.** No such provision exists;
+  § 42a EnWG is *Mieterstromverträge*. Residual load is arithmetic the market
+  does not legislate, so it now carries no citation.
+- **§ 42b Abs. 5 EnWG was misquoted.** The quoted per-tenant sentence does not
+  appear in it. Abs. 5 caps the **pool** at the lesser of generation and total
+  participant consumption; the per-tenant `max(0, …)` is the BDEW
+  Anwendungshilfe's `Pos()` operator. Both are now stated, separately.
+- **§ 29 MsbG appeared with three different meanings** across `rollout`, `smgw`
+  and `power_quality`. It is *"Ausstattung von Messstellen mit intelligenten
+  Messsystemen …"*, and only `rollout` implements it.
+- **§ 41a Abs. 2 EnWG was read as a 15-minute resolution mandate.** It obliges
+  suppliers with more than 100 000 customers to *offer* a dynamic tariff to
+  customers who have an iMSys.
+- **Mehr-/Mindermengen were described as monthly.** They are **Jahres**mehr- und
+  -mindermengen (GPKE Kap. 8.4).
+- **`calendar` cited § 20 StromNZV** for German local time. Replaced with the
+  EDI@Energy *Allgemeine Festlegungen* v6.1b, Kap. 3, which states the UTC /
+  gesetzliche deutsche Zeit split directly.
+- **`register` documented OBIS group D as the direction** (`8` = import,
+  `9` = export), contradicting `obis`, which correctly places direction in
+  group C. `9` is Vorschub.
+- **`lifecycle` called the MeLo-ID 11 digits.** It is 33 characters; the MaLo-ID
+  is 11 digits.
+- **The 2025 SLP Dynamisierungsfunktion is no longer assumed.** The lookup
+  applied the 1999 VDEW quartic to H25, P25 and S25 on the assumption that the
+  revision retained it. The BDEW Anwendungshilfe publishes its function as an
+  **image**, so the coefficients cannot be read out, quoted or compared.
+  `Dynamization::vdew()` → **`vdew_1999()`**, documented as the 1999 function and
+  only that; `DynamicSlpProfile` gains a `dynamization` field and `value_at`
+  returns `None` for a profile that needs one and has none.
+
+### Fixed — behaviour
+
+- **V02 missed overlaps.** It compared each interval only against its immediate
+  predecessor, so a long interval swallowing several short ones reported the
+  first collision and passed the rest. It now tracks the furthest end seen.
+- **V04 could not see a run of spikes.** It compared each value against the
+  **mean of the whole series**, which the spikes inflate — so a run of bad
+  values raised its own threshold and hid itself, and a global mean judged quiet
+  hours against a threshold set by busy ones. Now a Hampel identifier (local
+  median ± `t`·MAD·1.4826), whose 50 % breakdown point a spike cannot move.
+- **V06 flagged the two correct days of the year.** `expected_interval_secs` is
+  a fixed count and a German calendar day is 82 800 s in spring and 90 000 s in
+  autumn, so a daily gas or water series drew a warning on both DST days for
+  being exactly right.
+- **V07 diagnosed the wrong fault.** It compared the whole day's covered
+  duration against 25 hours, so *any* two missing quarter-hours on a fall-back
+  day produced a confident "the repeated hour 02:00–03:00 was collapsed". It now
+  looks only at the two-hour UTC window the two passes occupy, so a midday gap
+  is a V01 gap and nothing else.
+- **Substitute interpolation was off by one interval.** `forecast` placed the
+  substitutes at fractions `0/n … (n-1)/n`, so the first synthesised value
+  equalled the last *measured* one and the series never approached the closing
+  value — a systematic bias on any rising or falling gap. The fractions are now
+  interior: `1/(n+1) … n/(n+1)`.
+- **The forecast prediction interval omitted the estimation error.** It computed
+  `1.96·σ·√Y`, the spread of a realised year around a *known* daily mean. The
+  mean is estimated from `n` observed days, so the variance is `Y²σ²/n + Yσ²`.
+  At `Y = 365, n = 14` the missing term is twenty-six times the one present.
+- **A long gap silently changed method past 100 intervals.** The gap-length scan
+  was capped at 100, and the length was re-measured from a moving cursor, so the
+  last `short_gap_threshold` intervals of every long gap reverted to
+  interpolation. The length is now measured once, at the gap's first slot.
+- **A daily gap fill drifted across DST.** Stepping a fixed 86 400 s puts every
+  slot after the last Sunday in March an hour off its Liefertag, so measured
+  values stop matching the grid and the remainder of the year is silently
+  substituted. The grid is an `IntervalResolution` and walks calendar periods.
+- **`normalize_interval_to_kwh` silently mis-scaled unknown units.** It fell
+  through to *"assume already kWh"*, so `"MWh"` — which the crate's own
+  `MeasurementUnit::parse_scaled` reads correctly — passed unconverted,
+  understating the reading a thousandfold. Replaced by `normalize_to_kwh`,
+  returning `Result<_, ConversionError>`.
+- **`is_bezug` and `is_einspeisung` could both be true**, on both
+  `MeasurementPoint` and `MeterRegister`: they combined the master-data
+  direction and the OBIS code with `||`.
+- **`MeterRegister::is_active` ignored `valid_from`**, so a configuration
+  entered in advance took effect the moment it was recorded.
+- **`MeterExchangeEvent` clamped backwards readings to zero** under the name
+  *"rollover protection"*. It was concealment: a Jahresabrechnung whose old
+  register had wrapped billed **0 kWh** for the whole pre-exchange span. The
+  three consumption methods now return `Result` and delegate to
+  `reading::consumption_between`, which reconstructs the wrap.
+- **`ResampledBucket` reported unknown as perfect.** A calendar source
+  resolution has no fixed count, which was stored as `0` — making
+  `coverage_pct()` return 100 % and `is_complete()` return `true` for a bucket
+  nobody could assess.
+- **`aggregate` counted non-billable intervals** in `interval_count` while
+  excluding them from the sum, and measured coverage against the extent of the
+  data itself, so a month whose last week never arrived reported 100 %.
+- **`virtual_meter` was quadratic.** Each aligned timestamp did a linear `find`
+  per source series — 35 040² probes per source on a year of quarter-hours.
+- **`power_quality` claimed EN 50160 conformance from one interval.** Every
+  EN 50160 limit is a **share of 10-minute means over an observation window**;
+  a week is 1 008 samples and up to 50 may sit outside `Un ± 10 %` with the
+  supply conforming. The per-interval predicates are documented as triage
+  indicators, and `assess_en50160` answers the standard's actual question.
+- **docs.rs would have published the crate without any `serde` impls.** There
+  was no `[package.metadata.docs.rs]`, so the hosted documentation would have
+  built with default features — hiding the wire representation this crate
+  documents as semver-covered.
+- Two `as u32` casts could silently truncate a `usize`; a `usize` subtraction in
+  V05 was guarded only by an invariant three lines away.
+
+### Changed — one mechanism where there were two
+
+- **One tariff-register mechanism.** `Zaehlzeitdefinition` now covers every
+  time-of-use split, with `ht_nt()` for the classic Zweitarif and **`modul_3()`**
+  for § 14a EnWG Modul 3. The removed `TariffWindow` could not do the job:
+  **Modul 3 has three tariff levels and every Netzbetreiber has been obliged to
+  offer it since 1 April 2025**, while `TariffWindow` had two outcomes and
+  hour-granularity bounds. Two mechanisms for one question also meant two places
+  to fix when Feiertage turned out to matter, and only one got fixed.
+
+  `aggregate` no longer computes the split: it returns one Arbeitsmenge, and the
+  breakdown is `Zaehlzeitdefinition::split_energy`, which handles any number of
+  registers. The split always reconstructs the total — asserted across both DST
+  transitions, where a 00:00–06:00 band holds 20, 24 or 28 quarter-hours.
+- **One measurement point.** `MeterRegister` and `MeasurementPoint` modelled the
+  same thing with **two different direction enums** that could disagree about
+  one register. `EnergyDirection` is gone; `EnergyFlow` is the one direction
+  enum and gains `draws_from_grid()`, `feeds_grid()` and `is_storage()`.
+  `wandler_factor` and `apply_wandler()` survive on `MeasurementPoint`.
+- **One substitute engine.** `forecast`'s Ersatzwertbildung is gone;
+  `substitute::SubstituteEntry` carries the audit record, and its `method` field
+  reports **what actually ran**, not what was requested.
+- **One quality ranking.** `QualityFlag::severity_rank`, `worse_of` and
+  `worst_of` replace three private copies in `resample`, `virtual_meter` and
+  `measurement_series` that were free to drift apart.
+- **One grading path.** `score_intervals` runs the validation engine and grades
+  its output, so the two cannot disagree.
+- **`RegisterUnit` moved to `obis` and is derived, not stored.**
+  `ObisCode::register_unit()` reads it off the value groups: `1-0:3.8.0` is
+  kvarh and `1-0:1.6.0` is kW whatever a field says.
+
+### Changed — API
+
+- **`MeterInterval::value_kwh` → `value`.** `Sparte::Wasser` is supported, water
+  is billed in cubic metres, and a field named `_kwh` holding m³ is a lie the
+  compiler cannot catch. Everything derived follows:
+  `BillingPeriod::arbeitsmenge`, `HtNtSplit::{ht, nt}`,
+  `ResampledBucket::total`, `MeasurementSeries::total()`, the `AnnualForecast`
+  quantities, `MeterLifecycleEvent::reading`, `MeterExchangeEvent`'s readings,
+  `ValidationIssue::affected_value`. `demand_kw`, `spitzenleistung_kw` and
+  `peak_kw` **keep** their suffix — a power is only meaningful where the unit is
+  energy. **This changes the `serde` wire format.**
+- **`fill_gaps`** takes `(&[MeterInterval], &FillGapsConfig)` like every other
+  entry point. The resolution and period are constructor arguments —
+  `FillGapsConfig::new(resolution, from, to)` — because they are the two things
+  a gap fill cannot proceed without and the two most easily got wrong.
+  `fill_gaps_with_config` is gone; `fill_gaps` returns the `FilledSeries`.
+- **`project_annual_consumption`** no longer takes a `malo_id` it never read,
+  and `AnnualForecast` no longer carries one.
+- **`classify_messtyp`** takes `Option<SeriesOrigin>` instead of `Option<&str>`.
+  The old signature matched substrings, so `"LEGACY_NON_SMGW_IMPORT"` classified
+  as iMSys and `"Gateway"` did not.
+- **`sharing`** takes `Zaehlertyp` and `Bilanzierungsmethode` enums instead of
+  `Option<String>` compared against literals, and returns `Vec<Finding>` instead
+  of `Vec<String>` of German prose. A record whose source spelled a value
+  differently was silently `Disqualified` — not `Unknown` — so a vocabulary
+  mismatch looked like a finding rather than a bug.
+- **`AggregationConfig`** presets collapse: `rlm_strom()` → **`rlm()`**;
+  `slp_strom()` and `gas()`, which had become byte-identical, →
+  **`arbeitsmenge_only()`**.
+- **`MeasurementSource::VirtualMeter`** carries `rule: VirtualMeterKind` and
+  `source_ids` instead of `rule_type: String`; `AggregationRule::rule_type()` →
+  `kind()`.
+- **`ValidationConfig`**: `spike_factor` → `outlier_sigma` / `outlier_window` /
+  `outlier_min_sigma`; `rollover_threshold_kwh` removed; new `period` /
+  `over_period()` extends V01 to the head and tail of the series. New rule
+  `V12 ImplausiblePower`, split out of `ImpossibleSpike` (now
+  `StatisticalOutlier`) so the two can be filtered apart.
+- **`QualityConfig`** is `{ validation, max_zero_run_allowed, min_coverage_pct }`;
+  `QualityReport` replaces its `Vec<String>` fields with counts plus typed
+  `issues`. `QualityGrade` is now `Ord`, best-first.
+- **`virtual_meter::SourceMap<S>`** — the source map is generic over its hasher,
+  so a caller holding an `FxHashMap` need not rebuild it.
+- **`TariffWindowDays`** → `zaehlzeit::DayGroup` (`WeekdaysOnly` → `Weekdays`).
+- **`QualityFlag::is_billable` / `is_provisional`** take `self` and are `const`.
+
+### Added
+
+- **`reading`** — Zählerstände and the **Zählerstandsgang → Lastgang**
+  conversion, the operation BNetzA **BK6-24-174** (*"Datenübermittlung ZSG"*,
+  in force 6 June 2025) makes the Messstellenbetreiber's job. § 2 Satz 1 Nr. 27
+  MsbG defines the input; the crate modelled only the output.
+
+  `MeterReading`, `to_lastgang`, `consumption_between`, `Rollover`, `Anomaly`.
+  This is where register rollover belongs. Two safeguards keep reconstruction
+  from becoming a hazard: without a configured register width nothing is
+  reconstructed, and a plausibility cap distinguishes a genuine wrap from an
+  undocumented meter exchange. Where no honest difference exists the conversion
+  emits **no interval**, so the hole becomes an ordinary V01 gap that
+  `substitute` fills with an audit trail.
+- **`holiday`** — a computed German statutory holiday calendar: `Bundesland`
+  (all sixteen, ISO 3166-2:DE), `Holiday` (nineteen feasts with their Land
+  scope), `easter_sunday`, `slp_day_type`. The crate defined `SlpDayType` and
+  classified HT/NT by weekday but had no way to produce a day type or to put a
+  Feiertag on the off-peak register. Easter is pinned against published dates
+  from 2020 to 2285 and asserted to be a Sunday in 22 March – 25 April for 300
+  consecutive years.
+
+  It is deliberately **not** a Fristenkalender: counting Werktage to a GPKE
+  deadline belongs in a process engine.
+- **`power_quality::assess_en50160`** with `En50160Limits`, `En50160Report`,
+  `LimitOutcome` and `voltage_percentile` — the statistical test the standard
+  actually specifies. Unbalance is not assessed: it needs phase angles that
+  three RMS magnitudes do not carry.
+- **`calendar::dst_transition_utc(day)`** — the instant the UTC offset changes,
+  and the anchor for the repeated hour.
+- **`examples/pipeline.rs`** — one Liefertag end to end, on the 25-hour autumn
+  DST day with a wrapped register and a corrupt reading planted in it. It
+  asserts its own invariants, so CI runs it as a test.
+- `ConversionError`, `FilledSeries`, `SubstituteEntry`, `VirtualMeterKind`,
+  `ValidationRuleId::code`/`ALL`, `SubstituteMethod::ALL`/`description`,
+  `SubstitutionReason::ALL`/`description`, `QualityGrade::ALL`,
+  `MIN_OBSERVATION_DAYS`, `AnnualForecast::daily_average`,
+  `ValidationResult::by_rule`, `Zaehlzeitdefinition::{registers, until, in_land}`,
+  `ZaehlzeitFenster::{new, spanning, on_days, in_months}`,
+  `DynamicSlpProfile::value_on`.
+- Re-exports that were missing: `gas_m3_to_kwh_hs_rounded`, `G685Rounding`,
+  `G685FinalRounding`, `Dynamization`, `DynamicSlpProfile`, `SlpDayType`,
+  `Zaehlzeitdefinition`, `ZaehlzeitFenster`, `RolloutObligation`,
+  `classify_rollout_obligation`, `Capability`, `Delivery`, `SharingReadiness`,
+  `K_MAD`.
+- `sharing`'s `Capability`, `Delivery` and `SharingReadiness` now derive
+  `Deserialize` as well as `Serialize`; they could be written but not read back.
+
+### Documentation
+
+- **A documentation site** at `site/`, built with Zola and deployed to GitHub
+  Pages. Twelve guides covering the calendar, readings, validation,
+  Ersatzwertbildung, tariff registers, gas conversion, power quality, virtual
+  meters, the full pipeline, the regulatory basis and the design constraints.
+  `zola check` runs in CI, so a broken internal link fails the build.
+- **The README is a README again** — from 44 KB to about 9 KB. Pitch,
+  installation, one worked example, scope and pointers; the depth is on the
+  site.
+- `tests/readme_samples.rs` → **`tests/doc_samples.rs`**: every code block in
+  the README *and* on the site is an executable assertion.
+- The crate-level module table listed 18 of 27 modules and described
+  `aggregation` as computing an HT/NT split it no longer computes. The opening
+  line cited **GasGVV**, which never governed the gas conversion — MessEG and
+  MessEV do.
+
 ## [0.16.0] — 2026-07-27
 
 One theme: **a value must have exactly one string.** Two spellings of one value

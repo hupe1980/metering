@@ -35,7 +35,7 @@ fn make_intervals(kwhs: Vec<Decimal>, quality: QualityFlag) -> Vec<MeterInterval
         .map(|(i, kwh)| MeterInterval {
             from: base + time::Duration::minutes(i as i64 * 15),
             to: base + time::Duration::minutes((i + 1) as i64 * 15),
-            value_kwh: kwh,
+            value: kwh,
             quality,
             obis_code: None,
         })
@@ -91,7 +91,7 @@ proptest! {
         let intervals = vec![MeterInterval {
             from: base,
             to: base + time::Duration::minutes(15),
-            value_kwh: neg,
+            value: neg,
             quality: QualityFlag::Measured,
             obis_code: None,
         }];
@@ -110,7 +110,7 @@ proptest! {
         let intervals = vec![MeterInterval {
             from: base,
             to: base + time::Duration::minutes(15),
-            value_kwh: neg,
+            value: neg,
             quality: QualityFlag::Measured,
             obis_code: None,
         }];

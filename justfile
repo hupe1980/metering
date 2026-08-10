@@ -12,7 +12,7 @@ default:
     @just --list
 
 # ✅ Everything CI runs, in CI order
-ci: fmt-check lint purity test doc package
+ci: fmt-check lint purity test example doc package
     @echo "✅ all checks passed"
 
 # 🧊 Enforce the "zero I/O, no clock" guarantee over non-comment source lines
@@ -52,6 +52,10 @@ check:
 # 🧪 Full test suite (all features, incl. doctests)
 test:
     cargo test --all-features
+
+# ▶️  Run the end-to-end pipeline example
+example:
+    cargo run --all-features --example pipeline
 
 # 🧪 Run tests matching a filter, e.g. `just test-one gas_m3`
 test-one filter:
@@ -102,6 +106,16 @@ tag:
     git tag -a "v${version}" -m "v${version}"
     echo "🏷️  tagged v${version} — push with: git push origin v${version}"
 
+# 🌐 Serve the documentation site locally (needs `zola`)
+site:
+    zola --root site serve
+
+# 🌐 Build the site and validate every internal link
+site-build:
+    zola --root site check
+    zola --root site build --output-dir public --force
+
 # 🧹 Remove build artifacts
 clean:
     cargo clean
+    rm -rf site/public

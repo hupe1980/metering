@@ -15,7 +15,7 @@ fn quarter_hour(from: OffsetDateTime, kwh: Decimal) -> MeterInterval {
     MeterInterval {
         from,
         to: from + Duration::minutes(15),
-        value_kwh: kwh,
+        value: kwh,
         quality: QualityFlag::Measured,
         obis_code: None,
     }
@@ -75,12 +75,14 @@ fn a_complete_dst_day_resamples_as_complete() {
         assert_eq!(bucket.from, calendar::day_start_utc(day), "{day} start");
         assert_eq!(bucket.to, calendar::day_end_utc(day), "{day} end");
         assert_eq!(
-            bucket.interval_count, bucket.expected_count,
+            bucket.expected_count,
+            Some(bucket.interval_count),
             "{day} must be complete"
         );
-        assert!(bucket.is_complete(), "{day}");
-        assert!(!bucket.has_missing_data, "{day}");
-        assert_eq!(bucket.total_kwh, Decimal::from(bucket.interval_count));
+        assert_eq!(bucket.is_complete(), Some(true), "{day}");
+        assert!(!bucket.has_missing_data(), "{day}");
+        assert!(!bucket.has_surplus_data(), "{day}");
+        assert_eq!(bucket.total, Decimal::from(bucket.interval_count));
     }
 }
 
@@ -95,13 +97,13 @@ fn ninety_six_intervals_on_the_long_day_is_a_gap() {
         .collect();
 
     let buckets = resample(&intervals, &ResampleConfig::to_daily());
-    assert_eq!(buckets[0].expected_count, 100);
+    assert_eq!(buckets[0].expected_count, Some(100));
     assert_eq!(buckets[0].interval_count, 96);
     assert!(
-        buckets[0].has_missing_data,
+        buckets[0].has_missing_data(),
         "a flat 96 would have hidden four missing intervals"
     );
-    assert!((buckets[0].coverage_pct() - 96.0).abs() < 0.01);
+    assert!((buckets[0].coverage_pct().unwrap() - 96.0).abs() < 0.01);
 }
 
 /// The spring mirror image: 96 intervals on a 23-hour day overshoots into the
@@ -117,7 +119,11 @@ fn ninety_six_intervals_on_the_short_day_spills_over() {
     let buckets = resample(&intervals, &ResampleConfig::to_daily());
     assert_eq!(buckets.len(), 2, "the last four intervals are the 30th");
     assert_eq!(buckets[0].interval_count, 92);
-    assert!(buckets[0].is_complete(), "the 29th is full at 92");
+    assert_eq!(
+        buckets[0].is_complete(),
+        Some(true),
+        "the 29th is full at 92"
+    );
     assert_eq!(buckets[1].interval_count, 4);
 }
 
@@ -134,8 +140,8 @@ fn month_totals_use_the_german_boundary() {
     ];
     let buckets = resample(&intervals, &ResampleConfig::to_monthly());
     assert_eq!(buckets.len(), 2);
-    assert_eq!(buckets[0].total_kwh, dec!(10), "December");
-    assert_eq!(buckets[1].total_kwh, dec!(1), "January");
+    assert_eq!(buckets[0].total, dec!(10), "December");
+    assert_eq!(buckets[1].total, dec!(1), "January");
     assert_eq!(buckets[1].from, calendar::year_start_utc(2026));
 }
 

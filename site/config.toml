@@ -1,0 +1,36 @@
+# Zola configuration — https://www.getzola.org/documentation/getting-started/configuration/
+base_url = "https://hupe1980.github.io/metering"
+title = "metering"
+description = "German energy metering domain library for Rust — DST-correct Europe/Berlin calendar arithmetic, Zählerstandsgang to Lastgang, gas m³→kWh_Hs, Ersatzwertbildung, EN 50160 and §14a Modul 3 tariff registers."
+default_language = "en"
+
+compile_sass = true
+build_search_index = true
+generate_feeds = true
+feed_filenames = ["atom.xml"]
+
+minify_html = true
+
+taxonomies = [{ name = "topics", feed = true }]
+
+[markdown]
+smart_punctuation = false
+bottom_footnotes = true
+
+
+[search]
+index_format = "elasticlunr_json"
+
+[extra]
+repo = "https://github.com/hupe1980/metering"
+crate = "https://crates.io/crates/metering"
+api_docs = "https://docs.rs/metering"
+author = "hupe1980"
+
+[link_checker]
+# Links into this repository's own tree resolve only once a change is merged, so
+# checking them pre-merge fails on exactly the files a PR is adding. Internal
+# links — the ones a reader actually hits from the site — are still validated.
+skip_prefixes = ["https://github.com/hupe1980/metering/blob/"]
+# docs.rs and crates.io rate-limit CI runners; a 429 is not a broken link.
+skip_anchor_prefixes = ["https://docs.rs/", "https://crates.io/"]

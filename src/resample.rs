@@ -5,8 +5,7 @@
 //! | Use case | Target resolution |
 //! |---|---|
 //! | API summaries (client dashboards) | Hourly or daily |
-//! | MMM billing (GPKE BK6-22-024 §3) | Monthly totals |
-//! | Mehr-/Mindermengensaldo (§ 13 StromNZV) | Monthly |
+//! | Jahresmehr-/-mindermengen (GPKE Kap. 8.4) | Yearly |
 //! | MABIS Summenzeitreihe | Monthly |
 //! | SLP compatibility (daily totals) | Daily |
 //!
@@ -23,8 +22,8 @@
 //! through [`crate::calendar`]. A German Liefertag starts at 00:00 Berlin —
 //! 23:00 UTC the previous day in winter, 22:00 UTC in summer — so bucketing on
 //! the UTC date would book the first hour of every day, and the first hours of
-//! every month, into the preceding period. For a §13 StromNZV monthly
-//! Mehr-/Mindermengensaldo that is a billing error on every single settlement.
+//! every month, into the preceding period — a systematic error on every daily
+//! and monthly figure the market exchanges.
 //!
 //! Sub-daily buckets (quarter-hour, half-hour, hour, `Custom`) are snapped in
 //! UTC, which is equivalent: every Europe/Berlin offset is a whole number of
@@ -39,9 +38,11 @@
 //!
 //! ## Regulatory basis
 //!
-//! - **§ 2 MsbG**: RLM = 15-min interval metering.
-//! - **GPKE BK6-22-024 §3**: MMM billing uses monthly arbeitsmenge totals.
-//! - **§ 13 StromNZV**: Mehr-/Mindermengen use calendar-month totals.
+//! - **§ 2 MsbG** — RLM, the 15-minute interval metering these buckets start from.
+//! - **GPKE Kap. 8.4** (BNetzA **BK6-24-174**) — Jahresmehr- und
+//!   Jahresmindermengen, which are settled **annually**, not monthly. Earlier
+//!   releases described them as calendar-month totals and cited *§ 13 StromNZV*,
+//!   which was repealed with effect from the end of 31 December 2025.
 
 use std::collections::BTreeMap;
 
@@ -65,40 +66,66 @@ pub struct ResampledBucket {
     pub from: OffsetDateTime,
     /// Bucket end (UTC, exclusive).
     pub to: OffsetDateTime,
-    /// Sum of all `value_kwh` from contributing intervals.
-    pub total_kwh: Decimal,
+    /// Sum of all `value` from contributing intervals.
+    pub total: Decimal,
     /// Peak demand in kW across contributing intervals.
     ///
-    /// Computed as `max(interval.value_kwh / interval_duration_h)`.
+    /// Computed as `max(interval.value / interval_duration_h)`.
     /// `None` only when no intervals contributed (should not normally occur).
     pub peak_kw: Option<Decimal>,
     /// Number of intervals that contributed to this bucket.
     pub interval_count: u32,
-    /// Expected number of intervals for full coverage at the source resolution.
+    /// How many intervals a complete bucket holds, when that is knowable.
     ///
-    /// When `interval_count < expected_count`, the bucket has missing data.
-    pub expected_count: u32,
+    /// `None` when [`ResampleConfig::source_resolution`] is a calendar period,
+    /// which has no fixed count to divide by. It was previously `0` for that
+    /// case, and `0` made [`coverage_pct`](Self::coverage_pct) report 100 % and
+    /// [`is_complete`](Self::is_complete) report `true` — so a bucket nobody
+    /// could assess looked like a perfect one.
+    pub expected_count: Option<u32>,
     /// Worst quality flag among all contributing intervals.
     pub quality: QualityFlag,
-    /// `true` when some source intervals are missing (gap in the time series).
-    pub has_missing_data: bool,
 }
 
 impl ResampledBucket {
-    /// Coverage percentage (0.0–100.0).
+    /// Coverage as a percentage, or `None` when the expected count is unknown.
+    ///
+    /// Not capped at 100: more intervals than expected means duplicates, and
+    /// hiding that behind a cap would turn a data fault into a clean bucket.
     #[must_use]
-    pub fn coverage_pct(&self) -> f64 {
-        if self.expected_count == 0 {
-            100.0
-        } else {
-            f64::from(self.interval_count) / f64::from(self.expected_count) * 100.0
+    pub fn coverage_pct(&self) -> Option<f64> {
+        let expected = self.expected_count?;
+        if expected == 0 {
+            return None;
         }
+        Some(f64::from(self.interval_count) / f64::from(expected) * 100.0)
     }
 
-    /// `true` when this bucket has complete, uninterrupted coverage.
+    /// `true` when the bucket holds exactly the intervals it should, `false`
+    /// when it does not, and `None` when that cannot be determined.
+    ///
+    /// Three states rather than two, because "unknown" is not "complete".
     #[must_use]
-    pub fn is_complete(&self) -> bool {
-        !self.has_missing_data && self.interval_count >= self.expected_count
+    pub fn is_complete(&self) -> Option<bool> {
+        Some(self.interval_count == self.expected_count?)
+    }
+
+    /// `true` when the bucket is short of its expected count.
+    ///
+    /// `false` when it is complete, over-full, or unknown — use
+    /// [`is_complete`](Self::is_complete) to tell the last case apart.
+    #[must_use]
+    pub fn has_missing_data(&self) -> bool {
+        self.expected_count
+            .is_some_and(|expected| self.interval_count < expected)
+    }
+
+    /// `true` when more intervals landed here than the bucket can hold —
+    /// duplicates, or a source resolution finer than the one configured.
+    #[must_use]
+    pub fn has_surplus_data(&self) -> bool {
+        self.expected_count
+            .is_some_and(|expected| self.interval_count > expected)
     }
 }
 
@@ -111,10 +138,9 @@ pub struct ResampleConfig {
     pub target_resolution: IntervalResolution,
     /// Resolution of the source intervals.
     ///
-    /// Used to calculate `expected_count` per bucket, so it must be a fixed
-    /// resolution ([`IntervalResolution::fixed_seconds`]); a calendar source
-    /// resolution leaves `expected_count` at 0 and `has_missing_data` false,
-    /// since no count can be derived. Default: [`IntervalResolution::QuarterHour`].
+    /// Used to derive [`ResampledBucket::expected_count`], so a calendar source
+    /// resolution leaves that `None` — there is no fixed count to divide a
+    /// bucket by. Default: [`IntervalResolution::QuarterHour`].
     pub source_resolution: IntervalResolution,
 }
 
@@ -140,8 +166,7 @@ impl ResampleConfig {
         Self::new(IntervalResolution::QuarterHour, IntervalResolution::Day)
     }
 
-    /// Berlin calendar month totals — MMM billing and Mehr-/Mindermengensaldo
-    /// (§ 13 StromNZV).
+    /// Berlin calendar month totals — monthly settlement and reporting.
     #[must_use]
     pub const fn to_monthly() -> Self {
         Self::new(IntervalResolution::QuarterHour, IntervalResolution::Month)
@@ -164,14 +189,21 @@ impl Default for ResampleConfig {
 
 /// Down-sample a slice of meter intervals to the target resolution.
 ///
-/// Input intervals do **not** need to be contiguous — gaps reduce `interval_count`
-/// relative to `expected_count` and set `has_missing_data = true`.
+/// Input intervals need not be contiguous or sorted: gaps show up as an
+/// `interval_count` below [`ResampledBucket::expected_count`], and the output
+/// is always ascending by `from`.
 ///
-/// Output is sorted ascending by `from`. Empty input returns an empty vec.
+/// ## An interval is assigned by its start
 ///
-/// ## Panics
+/// A source interval that straddles a bucket boundary is booked **whole** into
+/// the bucket it begins in; it is not split pro rata. Splitting would require
+/// assuming the energy is spread evenly inside the interval, which is exactly
+/// the assumption interval metering exists to avoid making.
 ///
-/// Does not panic.
+/// At the resolutions this is used for the case does not arise — quarter-hours
+/// nest inside hours, days and months without remainder. It arises for a
+/// `Custom` source resolution that does not divide the target, and there the
+/// caller should resample in two steps instead.
 #[must_use]
 pub fn resample(intervals: &[MeterInterval], config: &ResampleConfig) -> Vec<ResampledBucket> {
     if intervals.is_empty() {
@@ -186,65 +218,39 @@ pub fn resample(intervals: &[MeterInterval], config: &ResampleConfig) -> Vec<Res
 
         let entry = buckets
             .entry(bucket_start.unix_timestamp())
-            .or_insert_with(|| {
-                let expected = crate::calendar::intervals_between(
+            .or_insert_with(|| ResampledBucket {
+                from: bucket_start,
+                to: bucket_end,
+                total: Decimal::ZERO,
+                peak_kw: None,
+                interval_count: 0,
+                expected_count: crate::calendar::intervals_between(
                     bucket_start,
                     bucket_end,
                     config.source_resolution,
-                )
-                .unwrap_or(0);
-                ResampledBucket {
-                    from: bucket_start,
-                    to: bucket_end,
-                    total_kwh: Decimal::ZERO,
-                    peak_kw: None,
-                    interval_count: 0,
-                    expected_count: expected,
-                    quality: QualityFlag::Measured,
-                    has_missing_data: false,
-                }
+                ),
+                quality: QualityFlag::Measured,
             });
 
-        entry.total_kwh += iv.value_kwh;
+        entry.total += iv.value;
         entry.interval_count += 1;
 
         // Peak demand = energy / duration_h
         let duration_secs = (iv.to - iv.from).whole_seconds().max(1);
         let duration_h = Decimal::from(duration_secs) / Decimal::from(3_600u32);
         if duration_h > Decimal::ZERO {
-            let kw = iv.value_kwh / duration_h;
+            let kw = iv.value / duration_h;
             entry.peak_kw = Some(entry.peak_kw.map_or(kw, |prev| prev.max(kw)));
         }
 
-        // Quality: keep worst
-        if quality_rank(iv.quality) > quality_rank(entry.quality) {
-            entry.quality = iv.quality;
-        }
+        // Quality: keep the worst contributor — see `QualityFlag::severity_rank`.
+        entry.quality = entry.quality.worse_of(iv.quality);
     }
 
-    buckets
-        .into_values()
-        .map(|mut b| {
-            if b.interval_count < b.expected_count {
-                b.has_missing_data = true;
-            }
-            b
-        })
-        .collect()
+    buckets.into_values().collect()
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
-
-fn quality_rank(q: QualityFlag) -> u8 {
-    match q {
-        QualityFlag::Faulty | QualityFlag::Unknown => 5,
-        QualityFlag::Preliminary => 4,
-        QualityFlag::Estimated => 3,
-        QualityFlag::Corrected | QualityFlag::Substituted => 2,
-        QualityFlag::Calculated => 1,
-        QualityFlag::Measured => 0,
-    }
-}
 
 /// The half-open bucket `[start, end)` containing `ts`.
 ///
@@ -292,11 +298,11 @@ mod tests {
     use rust_decimal::dec;
     use time::macros::{date, datetime};
 
-    fn make_iv(from: OffsetDateTime, value_kwh: Decimal) -> MeterInterval {
+    fn make_iv(from: OffsetDateTime, value: Decimal) -> MeterInterval {
         MeterInterval {
             from,
             to: from + Duration::minutes(15),
-            value_kwh,
+            value,
             quality: QualityFlag::Measured,
             obis_code: None,
         }
@@ -310,10 +316,10 @@ mod tests {
             .collect();
         let result = resample(&ivs, &ResampleConfig::to_hourly());
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0].total_kwh, dec!(10.0));
+        assert_eq!(result[0].total, dec!(10.0));
         assert_eq!(result[0].interval_count, 4);
-        assert_eq!(result[0].expected_count, 4);
-        assert!(result[0].is_complete());
+        assert_eq!(result[0].expected_count, Some(4));
+        assert_eq!(result[0].is_complete(), Some(true));
     }
 
     #[test]
@@ -325,8 +331,8 @@ mod tests {
                 .collect();
         let result = resample(&ivs, &ResampleConfig::to_hourly());
         assert_eq!(result.len(), 1);
-        assert!(result[0].has_missing_data);
-        assert!(!result[0].is_complete());
+        assert!(result[0].has_missing_data());
+        assert_eq!(result[0].is_complete(), Some(false));
     }
 
     /// A German day runs 00:00–00:00 Berlin, so a full day's 96 intervals
@@ -339,9 +345,9 @@ mod tests {
             .collect();
         let result = resample(&ivs, &ResampleConfig::to_daily());
         assert_eq!(result.len(), 1, "one Berlin calendar day");
-        assert_eq!(result[0].total_kwh, dec!(96.0));
-        assert_eq!(result[0].expected_count, 96);
-        assert!(result[0].is_complete());
+        assert_eq!(result[0].total, dec!(96.0));
+        assert_eq!(result[0].expected_count, Some(96));
+        assert_eq!(result[0].is_complete(), Some(true));
     }
 
     /// The bug that motivated calendar bucketing: a UTC-day grouping would split
@@ -356,7 +362,7 @@ mod tests {
         assert_eq!(result.len(), 2, "a UTC day straddles two German days");
         assert_eq!(result[0].interval_count, 92, "01:00 CET to midnight");
         assert_eq!(result[1].interval_count, 4, "midnight to 01:00 CET");
-        assert!(result.iter().all(|b| !b.is_complete()));
+        assert!(result.iter().all(|b| b.is_complete() == Some(false)));
         assert_eq!(
             result[0].from,
             crate::calendar::day_start_utc(date!(2026 - 03 - 15))
@@ -377,9 +383,17 @@ mod tests {
                 .collect();
             let result = resample(&full, &ResampleConfig::to_daily());
             assert_eq!(result.len(), 1, "{day}");
-            assert_eq!(result[0].expected_count, expected, "{day} expected_count");
-            assert!(result[0].is_complete(), "{day} must be complete");
-            assert!(!result[0].has_missing_data, "{day}");
+            assert_eq!(
+                result[0].expected_count,
+                Some(expected),
+                "{day} expected_count"
+            );
+            assert_eq!(
+                result[0].is_complete(),
+                Some(true),
+                "{day} must be complete"
+            );
+            assert!(!result[0].has_missing_data(), "{day}");
         }
 
         // 96 intervals on the 25-hour day is a four-interval gap, not a full day.
@@ -389,10 +403,10 @@ mod tests {
             .collect();
         let result = resample(&short, &ResampleConfig::to_daily());
         assert!(
-            result[0].has_missing_data,
+            result[0].has_missing_data(),
             "96 of 100 intervals must not read as a complete autumn day"
         );
-        assert_eq!(result[0].expected_count, 100);
+        assert_eq!(result[0].expected_count, Some(100));
     }
 
     /// Month boundaries are Berlin-local: 23:30 UTC on 31 January is already
@@ -409,7 +423,7 @@ mod tests {
             result[0].from,
             crate::calendar::month_start_utc(date!(2026 - 02 - 01))
         );
-        assert_eq!(result[0].expected_count, 28 * 96);
+        assert_eq!(result[0].expected_count, Some(28 * 96));
 
         // One interval on either side of the real boundary splits the buckets.
         let straddling = vec![
@@ -428,13 +442,13 @@ mod tests {
             &[make_iv(datetime!(2026-03-15 12:00 UTC), dec!(1.0))],
             &ResampleConfig::to_monthly(),
         );
-        assert_eq!(march[0].expected_count, 2_972);
+        assert_eq!(march[0].expected_count, Some(2_972));
 
         let october = resample(
             &[make_iv(datetime!(2026-10-15 12:00 UTC), dec!(1.0))],
             &ResampleConfig::to_monthly(),
         );
-        assert_eq!(october[0].expected_count, 2_980);
+        assert_eq!(october[0].expected_count, Some(2_980));
     }
 
     #[test]
@@ -443,7 +457,7 @@ mod tests {
             &[make_iv(datetime!(2028-06-15 12:00 UTC), dec!(1.0))],
             &ResampleConfig::to_yearly(),
         );
-        assert_eq!(leap[0].expected_count, 366 * 96);
+        assert_eq!(leap[0].expected_count, Some(366 * 96));
         assert_eq!(leap[0].from, crate::calendar::year_start_utc(2028));
     }
 
@@ -469,6 +483,51 @@ mod tests {
         assert_eq!(result[0].quality, QualityFlag::Estimated);
     }
 
+    /// "Unknown" must not read as "complete". A calendar source resolution has
+    /// no fixed count, so the bucket cannot be assessed — and used to report
+    /// 100 % coverage and `is_complete() == true` for exactly that reason.
+    #[test]
+    fn an_unknown_expected_count_is_not_a_complete_bucket() {
+        let cfg = ResampleConfig::new(IntervalResolution::Day, IntervalResolution::Month);
+        let daily = vec![MeterInterval {
+            from: crate::calendar::day_start_utc(date!(2026 - 03 - 15)),
+            to: crate::calendar::day_end_utc(date!(2026 - 03 - 15)),
+            value: dec!(100),
+            quality: QualityFlag::Measured,
+            obis_code: None,
+        }];
+        let result = resample(&daily, &cfg);
+        assert_eq!(result[0].expected_count, None);
+        assert_eq!(result[0].is_complete(), None, "unknown, not complete");
+        assert_eq!(result[0].coverage_pct(), None, "unknown, not 100 %");
+        assert!(!result[0].has_missing_data());
+        assert!(!result[0].has_surplus_data());
+    }
+
+    /// More intervals than a bucket can hold is a data fault — duplicates, or a
+    /// finer source than configured — and is reported rather than capped away.
+    #[test]
+    fn a_surplus_is_visible_rather_than_capped() {
+        let base = datetime!(2026-01-01 00:00 UTC);
+        // Eight quarter-hours claiming to be in one hour: four are duplicates.
+        let mut ivs: Vec<_> = (0..4)
+            .map(|i| make_iv(base + Duration::minutes(15 * i), dec!(1.0)))
+            .collect();
+        ivs.extend(ivs.clone());
+
+        let result = resample(&ivs, &ResampleConfig::to_hourly());
+        assert_eq!(result[0].interval_count, 8);
+        assert_eq!(result[0].expected_count, Some(4));
+        assert!(result[0].has_surplus_data());
+        assert!(!result[0].has_missing_data());
+        assert_eq!(result[0].is_complete(), Some(false));
+        assert!(
+            result[0].coverage_pct().unwrap() > 100.0,
+            "coverage is not capped: {:?}",
+            result[0].coverage_pct()
+        );
+    }
+
     #[test]
     fn empty_input_returns_empty() {
         assert!(resample(&[], &ResampleConfig::to_hourly()).is_empty());
@@ -479,6 +538,6 @@ mod tests {
         let base = datetime!(2026-01-01 00:00 UTC);
         let ivs = vec![make_iv(base, dec!(1.0))]; // 1 of 4
         let result = resample(&ivs, &ResampleConfig::to_hourly());
-        assert!((result[0].coverage_pct() - 25.0).abs() < 0.01);
+        assert!((result[0].coverage_pct().unwrap() - 25.0).abs() < 0.01);
     }
 }

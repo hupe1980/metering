@@ -5,7 +5,7 @@
 //! | Rule type | German term | Application |
 //! |---|---|---|
 //! | `Sum` | Summenmessung | Aggregation of parallel MaLos (e.g. grid intake + local PV) |
-//! | `Residual` | Residuallast | Grid withdrawal = total load − own generation (§42a EEG) |
+//! | `Residual` | Residuallast | Grid withdrawal = total load − own generation |
 //! | `PvSelfConsumption` | PV-Eigenverbrauch | Consumed from own PV plant before grid feed-in |
 //! | `GgvConstantAllocation` | GGV Nutzungsplan (konstant) | §42b EnWG constant-fraction allocation (UTILTS CCI+ZG6) |
 //! | `GgvProportionalAllocation` | GGV Nutzungsplan (variabel) | §42b EnWG proportional consumption-based allocation |
@@ -21,7 +21,7 @@
 //! ```text
 //! net_grid_draw = max(0, melo_consumption - fraction × melo_generation)
 //! ```
-//! — BDEW "Anwendungshilfe Solarpaket 1" Beispiel 1 (§25.01.2024, v1.0)
+//! — BDEW "Anwendungshilfe Solarpaket 1" Beispiel 1 (v1.0, 25.01.2024)
 //!
 //! **Proportional allocation (variable, UTILTS Z74 Divisionsquotient):**
 //! ```text
@@ -47,8 +47,15 @@
 //!
 //! - **§42b EnWG 2023 (Solarpaket I)** — Gemeinschaftliche Gebäudeversorgung (GGV)
 //! - **BDEW "Anwendungshilfe Beispiele von Berechnungsformeln für das Solarpaket 1"** (25.01.2024 v1.0)
-//! - **§42a EEG** — residual load calculation for feed-in metering
-//! - **BK6-22-024 (MaBiS)** — portfolio aggregation for BKV settlement
+//! - **MaBiS (BNetzA BK6-07-002)**, in the consolidated Lesefassung of
+//!   **BK6-24-174** — portfolio aggregation for Bilanzkreis settlement
+//!
+//! Earlier releases cited *§42a EEG* for the residual-load rule and
+//! *BK6-22-024* for MaBiS. Neither holds: §42a EnWG is *Mieterstromverträge*
+//! and there is no §42a EEG governing residual metering, while BK6-22-024 is
+//! the *Lieferantenwechsel in 24 Stunden* (LFW24) Festlegung. Residual load is
+//! arithmetic the market does not legislate — two metered series subtracted —
+//! so it now carries no citation at all.
 
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
@@ -81,9 +88,10 @@ pub enum AggregationRule {
     /// Common application: grid feed-in metering at a building with local PV.
     /// The net grid intake = building load − PV generation.
     ///
-    /// ## §42a EEG (residual load metering for feed-in)
-    ///
-    /// For feed-in compensation contracts: net feed-in = gross generation − own consumption.
+    /// Net feed-in for a generation contract is the same shape: gross
+    /// generation minus own consumption. This is arithmetic, not a regulated
+    /// procedure — which series to subtract from which is the contract's to
+    /// say.
     Residual {
         /// MaLo whose value is the minuend (total).
         total_malo_id: String,
@@ -124,13 +132,12 @@ pub enum AggregationRule {
     ///                 = min(tenant_consumption[t], fraction × plant_generation[t])
     /// ```
     ///
-    /// ## §42b Abs. 5 EnWG constraint
+    /// ## The `max(0, …)` cap
     ///
-    /// "Die einem einzelnen teilnehmenden Letztverbraucher im Wege der rechnerischen
-    /// Aufteilung innerhalb eines 15-Minuten-Zeitintervalls zuteilbare Strommenge ist
-    /// begrenzt auf die durch ihn in diesem Zeitintervall verbrauchte Strommenge."
-    ///
-    /// The `max(0, ...)` ensures this constraint is never violated.
+    /// No tenant is credited more PV than they drew in the interval. This is
+    /// the `Pos()` operator of the BDEW Anwendungshilfe; § 42b Abs. 5 EnWG caps
+    /// the **pool**, not the individual share. See
+    /// [`crate::virtual_meter`] for the two bounds side by side.
     ///
     /// ## UTILTS encoding
     ///
@@ -185,7 +192,57 @@ pub enum AggregationRule {
     },
 }
 
+/// Which kind of [`AggregationRule`] produced a derived series.
+///
+/// The rule itself carries the MaLo IDs it references and is configuration; this
+/// is the tag a *result* records, so a stored virtual-meter series can say what
+/// made it without embedding the whole rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "SCREAMING_SNAKE_CASE"))]
+pub enum VirtualMeterKind {
+    /// [`AggregationRule::Sum`].
+    Sum,
+    /// [`AggregationRule::Residual`].
+    Residual,
+    /// [`AggregationRule::PvSelfConsumption`].
+    PvSelfConsumption,
+    /// [`AggregationRule::GgvConstantAllocation`].
+    GgvConstantAllocation,
+    /// [`AggregationRule::GgvProportionalAllocation`].
+    GgvProportionalAllocation,
+}
+
+impl VirtualMeterKind {
+    /// Every kind, in declaration order.
+    pub const ALL: [Self; 5] = [
+        Self::Sum,
+        Self::Residual,
+        Self::PvSelfConsumption,
+        Self::GgvConstantAllocation,
+        Self::GgvProportionalAllocation,
+    ];
+}
+
+impl From<&AggregationRule> for VirtualMeterKind {
+    fn from(rule: &AggregationRule) -> Self {
+        rule.kind()
+    }
+}
+
 impl AggregationRule {
+    /// Which kind of rule this is.
+    #[must_use]
+    pub const fn kind(&self) -> VirtualMeterKind {
+        match self {
+            Self::Sum { .. } => VirtualMeterKind::Sum,
+            Self::Residual { .. } => VirtualMeterKind::Residual,
+            Self::PvSelfConsumption { .. } => VirtualMeterKind::PvSelfConsumption,
+            Self::GgvConstantAllocation { .. } => VirtualMeterKind::GgvConstantAllocation,
+            Self::GgvProportionalAllocation { .. } => VirtualMeterKind::GgvProportionalAllocation,
+        }
+    }
+
     /// All source MaLo / MeLo IDs referenced by this rule.
     ///
     /// Used to enumerate which underlying series must be fetched
@@ -222,18 +279,6 @@ impl AggregationRule {
             }
         }
     }
-
-    /// Human-readable rule type name.
-    #[must_use]
-    pub fn rule_type(&self) -> &'static str {
-        match self {
-            Self::Sum { .. } => "Sum",
-            Self::Residual { .. } => "Residual",
-            Self::PvSelfConsumption { .. } => "PvSelfConsumption",
-            Self::GgvConstantAllocation { .. } => "GgvConstantAllocation",
-            Self::GgvProportionalAllocation { .. } => "GgvProportionalAllocation",
-        }
-    }
 }
 
 #[cfg(test)]
@@ -248,7 +293,7 @@ mod tests {
         };
         let sources = rule.source_malo_ids();
         assert_eq!(sources, vec!["MALO_A", "MALO_B"]);
-        assert_eq!(rule.rule_type(), "Sum");
+        assert_eq!(rule.kind(), VirtualMeterKind::Sum);
     }
 
     #[test]
@@ -260,7 +305,7 @@ mod tests {
         let sources = rule.source_malo_ids();
         assert!(sources.contains(&"TOTAL"));
         assert!(sources.contains(&"PV"));
-        assert_eq!(rule.rule_type(), "Residual");
+        assert_eq!(rule.kind(), VirtualMeterKind::Residual);
     }
 
     #[test]
@@ -274,7 +319,7 @@ mod tests {
         assert_eq!(sources.len(), 2);
         assert!(sources.contains(&"MELO_PLANT"));
         assert!(sources.contains(&"MELO_T1"));
-        assert_eq!(rule.rule_type(), "GgvConstantAllocation");
+        assert_eq!(rule.kind(), VirtualMeterKind::GgvConstantAllocation);
     }
 
     #[test]
@@ -288,6 +333,6 @@ mod tests {
         // plant + t1 + t2
         assert_eq!(sources.len(), 3);
         assert!(sources.contains(&"MELO_PLANT"));
-        assert_eq!(rule.rule_type(), "GgvProportionalAllocation");
+        assert_eq!(rule.kind(), VirtualMeterKind::GgvProportionalAllocation);
     }
 }

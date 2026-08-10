@@ -215,7 +215,7 @@ impl ObisCode {
     /// in the EDI@Energy Codeliste — a load profile — **not** a maximum. The
     /// peak-demand register is [`STROM_BEZUG_MAXIMUM`] (D = 6), and a demand in
     /// kW is derived from this channel by
-    /// [`DemandInterval::energy_to_demand_kw`](crate::demand::DemandInterval::energy_to_demand_kw).
+    /// [`MeterInterval::demand_kw`](crate::MeterInterval::demand_kw).
     ///
     /// [`STROM_BEZUG_MAXIMUM`]: Self::STROM_BEZUG_MAXIMUM
     pub const STROM_BEZUG_LASTGANG: Self = Self {
@@ -239,8 +239,8 @@ impl ObisCode {
 
     /// Wirkleistung Bezug — **Maximum** (`1-0:1.6.0`), in kW.
     ///
-    /// The Spitzenleistung register billed under § 18 Abs. 1 StromNEV. D = 6 is
-    /// *Maximum* in the EDI@Energy Codeliste; MSCONS PID 13016 / 13017 carry it.
+    /// The Jahreshöchstleistung register priced under § 17 Abs. 2 StromNEV.
+    /// D = 6 is *Maximum* in the EDI@Energy Codeliste.
     pub const STROM_BEZUG_MAXIMUM: Self = Self {
         a: 1,
         b: 0,
@@ -518,7 +518,7 @@ impl ObisCode {
 
     /// `true` when this code is a **maximum** register (D = 6).
     ///
-    /// `1-0:1.6.0` is the Spitzenleistung billed under § 18 Abs. 1 StromNEV.
+    /// `1-0:1.6.0` is the Jahreshöchstleistung priced under § 17 Abs. 2 StromNEV.
     /// D = 29 is the load profile it is derived from, not the maximum itself —
     /// conflating the two bills a 15-minute energy quantity as a power.
     #[must_use]
@@ -669,6 +669,56 @@ impl ObisCode {
         None
     }
 
+    /// The physical unit this register counts in, derived from the value
+    /// groups.
+    ///
+    /// A stored `unit` field would be a second source of truth that can
+    /// contradict the code — a register tagged `KWh` with code `1-0:3.8.0` is
+    /// kvarh however the field is set — so the unit is derived rather than
+    /// carried.
+    ///
+    /// `None` for a code whose unit this crate cannot name: an abstract code
+    /// (medium 0), a Heizkostenverteiler (medium 4, which counts dimensionless
+    /// Verbrauchseinheiten), or an electricity Messgröße outside the active and
+    /// reactive groups.
+    ///
+    /// ```rust
+    /// use metering::obis::{ObisCode, RegisterUnit};
+    ///
+    /// assert_eq!(ObisCode::STROM_BEZUG_TOTAL.register_unit(),      Some(RegisterUnit::KiloWattHour));
+    /// assert_eq!(ObisCode::STROM_BLINDARBEIT_Q1.register_unit(),   Some(RegisterUnit::KiloVarHour));
+    /// assert_eq!(ObisCode::STROM_BEZUG_MAXIMUM.register_unit(),    Some(RegisterUnit::KiloWatt));
+    /// assert_eq!(ObisCode::GAS_VOLUME_M3.register_unit(),          Some(RegisterUnit::CubicMetre));
+    /// assert_eq!(ObisCode::WAERME_ENERGY.register_unit(),          Some(RegisterUnit::KiloWattHourThermal));
+    /// // A Heizkostenverteiler counts units, not a physical quantity.
+    /// assert_eq!("4-0:1.0.0".parse::<ObisCode>().unwrap().register_unit(), None);
+    /// ```
+    #[must_use]
+    pub fn register_unit(&self) -> Option<RegisterUnit> {
+        match self.a {
+            // Electricity: the Messgröße picks active or reactive, the Messart
+            // picks energy or power.
+            1 => {
+                let reactive = self.is_reactive();
+                let active = matches!(self.c, 1 | 2);
+                if !reactive && !active {
+                    return None;
+                }
+                Some(match (reactive, self.is_maximum()) {
+                    (false, false) => RegisterUnit::KiloWattHour,
+                    (false, true) => RegisterUnit::KiloWatt,
+                    (true, false) => RegisterUnit::KiloVarHour,
+                    (true, true) => RegisterUnit::KiloVar,
+                })
+            }
+            // Cooling and heat meters register thermal energy.
+            5 | 6 => Some(RegisterUnit::KiloWattHourThermal),
+            // Gas and water registers count a volume.
+            7..=9 => Some(RegisterUnit::CubicMetre),
+            _ => None,
+        }
+    }
+
     /// `true` when value group F is [`STORAGE_UNUSED`] — the ordinary case, and
     /// the one where [`Display`](fmt::Display) omits the `*F` suffix.
     ///
@@ -727,6 +777,64 @@ impl ObisCode {
     /// Returns a [`ParseError`] when the string does not conform to OBIS format.
     pub fn normalize(s: &str) -> Result<String, ParseError> {
         Ok(s.parse::<Self>()?.to_string())
+    }
+}
+
+/// The physical unit a meter register counts in.
+///
+/// Finer than [`MeasurementUnit`](crate::MeasurementUnit), which is the
+/// *storage* vocabulary and has exactly two values. This distinguishes energy
+/// from power and active from reactive, because a register does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "SCREAMING_SNAKE_CASE"))]
+pub enum RegisterUnit {
+    /// Active energy, kWh.
+    KiloWattHour,
+    /// Reactive energy, kvarh.
+    KiloVarHour,
+    /// Active power, kW — a maximum register.
+    KiloWatt,
+    /// Reactive power, kvar — a maximum register.
+    KiloVar,
+    /// Volume, m³ — gas and water.
+    CubicMetre,
+    /// Thermal energy, kWh_th — heat and cooling.
+    KiloWattHourThermal,
+}
+
+impl RegisterUnit {
+    /// Every variant, in declaration order.
+    pub const ALL: [Self; 6] = [
+        Self::KiloWattHour,
+        Self::KiloVarHour,
+        Self::KiloWatt,
+        Self::KiloVar,
+        Self::CubicMetre,
+        Self::KiloWattHourThermal,
+    ];
+
+    /// The unit symbol, as printed on a meter display.
+    #[must_use]
+    pub const fn symbol(self) -> &'static str {
+        match self {
+            Self::KiloWattHour => "kWh",
+            Self::KiloVarHour => "kvarh",
+            Self::KiloWatt => "kW",
+            Self::KiloVar => "kvar",
+            Self::CubicMetre => "m³",
+            Self::KiloWattHourThermal => "kWh_th",
+        }
+    }
+
+    /// `true` when the register counts a quantity that accumulates — an energy
+    /// or a volume — rather than an instantaneous power.
+    ///
+    /// Only a cumulative register can be differenced into a Lastgang; see
+    /// [`crate::reading`].
+    #[must_use]
+    pub const fn is_cumulative(self) -> bool {
+        !matches!(self, Self::KiloWatt | Self::KiloVar)
     }
 }
 

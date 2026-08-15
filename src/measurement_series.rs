@@ -60,6 +60,7 @@ use time::OffsetDateTime;
 use serde::{Deserialize, Serialize};
 
 use crate::aggregation_rule::VirtualMeterKind;
+use crate::ids::{MaloId, MeloId};
 use crate::interval::{MeterInterval, QualityFlag};
 use crate::obis::ObisCode;
 use crate::resolution::IntervalResolution;
@@ -70,6 +71,15 @@ use crate::resolution::IntervalResolution;
 ///
 /// Stored per series (not per interval) since all intervals in one MSCONS
 /// message share the same ingestion source.
+///
+/// ## Provenance is not billability
+///
+/// Whether a value may be billed is decided by each interval's
+/// [`QualityFlag`] — only `Faulty` and `Unknown` block billing — never by
+/// where the series came from: a manual entry after a dispute and a GGV
+/// virtual-meter result are billed every day. An earlier
+/// `is_billable_source` predicate on this type said otherwise for both, which
+/// was a second, contradictory notion of billability; it is gone.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[cfg_attr(feature = "serde", serde(rename_all = "SCREAMING_SNAKE_CASE"))]
@@ -164,18 +174,6 @@ impl MeasurementSource {
             Self::RedispatchImport { .. } => "Redispatch 2.0",
         }
     }
-
-    /// `true` when this source produces intervals that may be billed.
-    #[must_use]
-    pub fn is_billable_source(&self) -> bool {
-        matches!(
-            self,
-            Self::Mscons { .. }
-                | Self::SmgwDirectPush { .. }
-                | Self::AutoSubstitute { .. }
-                | Self::RetroactiveCorrection { .. }
-        )
-    }
 }
 
 // ── ProvenanceEntry ───────────────────────────────────────────────────────────
@@ -249,11 +247,12 @@ pub enum ProvenanceEventType {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct MeasurementSeries {
-    /// 11-digit MaLo-ID.
-    pub malo_id: String,
+    /// Marktlokations-ID, check-digit validated at the parse — see
+    /// [`MaloId`].
+    pub malo_id: MaloId,
 
-    /// 33-character MeLo-ID (if available).
-    pub melo_id: Option<String>,
+    /// Messlokations-ID (if available) — see [`MeloId`].
+    pub melo_id: Option<MeloId>,
 
     /// OBIS code identifying this measurement channel.
     pub obis_code: Option<ObisCode>,
@@ -284,7 +283,7 @@ impl MeasurementSeries {
     /// series back.
     #[must_use]
     pub fn new(
-        malo_id: impl Into<String>,
+        malo_id: MaloId,
         obis_code: Option<ObisCode>,
         intervals: Vec<MeterInterval>,
         source: MeasurementSource,
@@ -293,7 +292,7 @@ impl MeasurementSeries {
         let resolution = obis_code.and_then(|o| o.default_resolution());
         let actor = source.label().to_owned();
         Self {
-            malo_id: malo_id.into(),
+            malo_id,
             melo_id: None,
             obis_code,
             resolution,
@@ -310,8 +309,8 @@ impl MeasurementSeries {
 
     /// Attach the MeLo-ID (builder style).
     #[must_use]
-    pub fn with_melo_id(mut self, melo_id: impl Into<String>) -> Self {
-        self.melo_id = Some(melo_id.into());
+    pub fn with_melo_id(mut self, melo_id: MeloId) -> Self {
+        self.melo_id = Some(melo_id);
         self
     }
 
@@ -434,6 +433,10 @@ mod tests {
         }
     }
 
+    fn malo() -> MaloId {
+        "51238696781".parse().unwrap()
+    }
+
     fn mscons() -> MeasurementSource {
         MeasurementSource::Mscons {
             pid: 13005,
@@ -452,7 +455,7 @@ mod tests {
         intervals[1].quality = QualityFlag::Estimated;
 
         let mut series = MeasurementSeries::new(
-            "51238696780",
+            malo(),
             Some(ObisCode::STROM_BEZUG_TOTAL),
             intervals,
             mscons(),
@@ -474,7 +477,7 @@ mod tests {
 
     #[test]
     fn empty_series_has_unknown_worst_quality() {
-        let series = MeasurementSeries::new("51238696780", None, vec![], mscons(), INGEST);
+        let series = MeasurementSeries::new(malo(), None, vec![], mscons(), INGEST);
         assert_eq!(series.worst_quality(), QualityFlag::Unknown);
         assert!(
             !series.has_unbillable_intervals(),
@@ -487,8 +490,8 @@ mod tests {
     #[test]
     fn construction_is_deterministic() {
         let intervals = vec![make_interval(datetime!(2026-01-01 0:00 UTC), dec!(1.0))];
-        let a = MeasurementSeries::new("51238696780", None, intervals.clone(), mscons(), INGEST);
-        let b = MeasurementSeries::new("51238696780", None, intervals, mscons(), INGEST);
+        let a = MeasurementSeries::new(malo(), None, intervals.clone(), mscons(), INGEST);
+        let b = MeasurementSeries::new(malo(), None, intervals, mscons(), INGEST);
         assert_eq!(a, b, "equal inputs must give equal series");
         assert_eq!(a.provenance[0].occurred_at, INGEST);
         assert_eq!(a.provenance[0].event_type, ProvenanceEventType::Ingested);
@@ -496,7 +499,7 @@ mod tests {
 
     #[test]
     fn recorded_events_append_in_the_order_given() {
-        let mut series = MeasurementSeries::new("51238696780", None, vec![], mscons(), INGEST);
+        let mut series = MeasurementSeries::new(malo(), None, vec![], mscons(), INGEST);
         let later = INGEST + Duration::hours(3);
         series.record_event(ProvenanceEventType::QualityAssessed, "validator", later);
         series.record_event_with_note(
@@ -525,7 +528,7 @@ mod tests {
         intervals[1].quality = QualityFlag::Faulty; // not billable
 
         let series = MeasurementSeries::new(
-            "51238696780",
+            malo(),
             None,
             intervals,
             MeasurementSource::ManualEntry {
@@ -545,7 +548,7 @@ mod tests {
             make_interval(base + Duration::minutes(15), dec!(1.0)),
         ];
         let series = MeasurementSeries::new(
-            "51238696780",
+            malo(),
             None,
             intervals,
             MeasurementSource::SmgwDirectPush {
@@ -561,7 +564,7 @@ mod tests {
     #[test]
     fn empty_series_reports_correctly() {
         let series = MeasurementSeries::new(
-            "51238696780",
+            malo(),
             None,
             vec![],
             MeasurementSource::AutoSubstitute {
@@ -577,12 +580,12 @@ mod tests {
 
     #[test]
     fn builders_set_optional_context() {
-        let series = MeasurementSeries::new("51238696780", None, vec![], mscons(), INGEST)
-            .with_melo_id("DE0001234567890000000000000000123")
+        let series = MeasurementSeries::new(malo(), None, vec![], mscons(), INGEST)
+            .with_melo_id("DE00056266802AO6G56M11SN51G21M24S".parse().unwrap())
             .with_resolution(IntervalResolution::Hour);
         assert_eq!(
-            series.melo_id.as_deref(),
-            Some("DE0001234567890000000000000000123")
+            series.melo_id.as_ref().map(MeloId::as_str),
+            Some("DE00056266802AO6G56M11SN51G21M24S")
         );
         assert_eq!(series.resolution, Some(IntervalResolution::Hour));
     }
@@ -624,7 +627,7 @@ mod tests {
     #[test]
     fn obis_default_resolution_wires_into_series() {
         let series = MeasurementSeries::new(
-            "51238696780",
+            malo(),
             Some(ObisCode::STROM_BEZUG_TOTAL),
             vec![],
             mscons(),

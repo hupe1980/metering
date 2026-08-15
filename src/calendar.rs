@@ -138,6 +138,83 @@ pub fn day_end_utc(day: Date) -> OffsetDateTime {
     day_start_utc(day.next_day().unwrap_or(day))
 }
 
+// ── the Gastag ────────────────────────────────────────────────────────────────
+
+/// The UTC instant at which the **Gastag** `day` begins — 06:00 Europe/Berlin.
+///
+/// The German gas market balances on gas days, not calendar days: a Gastag
+/// runs from 06:00 local time to 06:00 the next morning (GaBi Gas, following
+/// the EU-wide convention of Art. 3 Nr. 6 VO (EU) 312/2014; the BDEW/VKU/GEODE
+/// Leitfaden *SLP Gas* forms its daily mean temperatures over the same span).
+/// Summing a gas Lastgang over the *calendar* day books the 00:00–06:00 draw
+/// into the wrong Bilanzierungstag — six hours, every day.
+///
+/// Berlin has never moved its clocks at 06:00, so this instant is always
+/// unambiguous; a Gastag containing a DST transition is 23 or 25 hours long,
+/// exactly as a calendar day is. Note **which** Gastag that is: the clocks
+/// change at 02:00/03:00 local, which lies before 06:00 — so the long or
+/// short Gastag is the one *named after the Saturday*, not the transition
+/// Sunday. The SLP-Gas Leitfaden calls this out: *"die Zeitumstellung \[ist\]
+/// in den Werten für den Samstag vor der Umstellung zu berücksichtigen."*
+///
+/// ```rust
+/// use metering::calendar;
+/// use time::macros::{date, datetime};
+///
+/// // Winter: 06:00 CET is 05:00 UTC.
+/// assert_eq!(calendar::gas_day_start_utc(date!(2026 - 01 - 15)), datetime!(2026-01-15 5:00 UTC));
+/// // The 25-hour Gastag is Saturday's — the transition happens at 03:00
+/// // local on Sunday, inside the gas day that began Saturday 06:00.
+/// let saturday = calendar::gas_day_end_utc(date!(2026 - 10 - 24))
+///     - calendar::gas_day_start_utc(date!(2026 - 10 - 24));
+/// assert_eq!(saturday.whole_hours(), 25);
+/// let sunday = calendar::gas_day_end_utc(date!(2026 - 10 - 25))
+///     - calendar::gas_day_start_utc(date!(2026 - 10 - 25));
+/// assert_eq!(sunday.whole_hours(), 24);
+/// ```
+#[must_use]
+pub fn gas_day_start_utc(day: Date) -> OffsetDateTime {
+    let naive = PrimitiveDateTime::new(day, Time::from_hms(6, 0, 0).unwrap_or(Time::MIDNIGHT));
+    match naive.assume_timezone(berlin()) {
+        OffsetResult::Some(t) => t,
+        OffsetResult::Ambiguous(first, _) => first,
+        OffsetResult::None => naive.assume_timezone_utc(berlin()),
+    }
+    .to_offset(time::UtcOffset::UTC)
+}
+
+/// The UTC instant at which the Gastag `day` ends (exclusive) — 06:00
+/// Europe/Berlin on the following calendar day.
+#[must_use]
+pub fn gas_day_end_utc(day: Date) -> OffsetDateTime {
+    gas_day_start_utc(day.next_day().unwrap_or(day))
+}
+
+/// The Gastag an instant belongs to.
+///
+/// An instant before 06:00 Berlin local time still belongs to the *previous*
+/// Gastag — the counterpart of [`local_day`] for gas balancing.
+///
+/// ```rust
+/// use metering::calendar;
+/// use time::macros::{date, datetime};
+///
+/// // 04:30 UTC on 15 July is 06:30 local — already the Gastag of the 15th...
+/// assert_eq!(calendar::local_gas_day(datetime!(2026-07-15 4:30 UTC)), date!(2026 - 07 - 15));
+/// // ...but 03:30 UTC (05:30 local) is still the Gastag of the 14th.
+/// assert_eq!(calendar::local_gas_day(datetime!(2026-07-15 3:30 UTC)), date!(2026 - 07 - 14));
+/// ```
+#[must_use]
+pub fn local_gas_day(instant: OffsetDateTime) -> Date {
+    let local = to_berlin(instant);
+    let day = local.date();
+    if local.time() < Time::from_hms(6, 0, 0).unwrap_or(Time::MIDNIGHT) {
+        day.previous_day().unwrap_or(day)
+    } else {
+        day
+    }
+}
+
 /// The UTC instant at which the Berlin calendar month containing `day` begins.
 #[must_use]
 pub fn month_start_utc(day: Date) -> OffsetDateTime {
@@ -379,6 +456,44 @@ pub fn shift_back_one_year(instant: OffsetDateTime) -> OffsetDateTime {
         return instant;
     };
     let naive = PrimitiveDateTime::new(shifted, local.time());
+    match naive.assume_timezone(berlin()) {
+        OffsetResult::Some(t) => t,
+        OffsetResult::Ambiguous(first, _) => first,
+        OffsetResult::None => naive.assume_timezone_utc(berlin()),
+    }
+    .to_offset(time::UtcOffset::UTC)
+}
+
+/// The same Berlin wall-clock time `days` calendar days earlier.
+///
+/// The day-granular counterpart of [`shift_back_one_year`], and for the same
+/// reason: subtracting `Duration::days(n)` is a fixed `n × 24` hours, which
+/// lands one hour off whenever a DST transition lies in between. Concretely,
+/// "one week earlier, same local time" is 167 UTC hours across the
+/// spring-forward and **169 across the fall-back** — the failure that made
+/// [`crate::substitute`]'s Vergleichstag window exclude the matching slot for
+/// a week every October.
+///
+/// An ambiguous local time (the repeated autumn hour) resolves to the earlier
+/// instant; a skipped one (the spring hour) to the instant the clock jumps.
+///
+/// ```rust
+/// use metering::calendar;
+/// use time::macros::datetime;
+///
+/// // Wed 2026-10-28 12:00 CET, one week back: Wed 2026-10-21 12:00 CEST —
+/// // 169 hours in UTC, because the 25-hour day lies between.
+/// let back = calendar::shift_back_days(datetime!(2026-10-28 11:00 UTC), 7);
+/// assert_eq!(back, datetime!(2026-10-21 10:00 UTC));
+/// assert_eq!((datetime!(2026-10-28 11:00 UTC) - back).whole_hours(), 169);
+/// ```
+#[must_use]
+pub fn shift_back_days(instant: OffsetDateTime, days: i64) -> OffsetDateTime {
+    let local = to_berlin(instant);
+    let Some(date) = local.date().checked_sub(Duration::days(days)) else {
+        return instant;
+    };
+    let naive = PrimitiveDateTime::new(date, local.time());
     match naive.assume_timezone(berlin()) {
         OffsetResult::Some(t) => t,
         OffsetResult::Ambiguous(first, _) => first,
@@ -744,5 +859,83 @@ mod tests {
     fn historical_transitions_come_from_the_tz_database() {
         assert_eq!(day_length(date!(1980 - 04 - 06)).whole_hours(), 23);
         assert_eq!(day_length(date!(1980 - 03 - 30)).whole_hours(), 24);
+    }
+
+    /// "Same local time, n days earlier" is not n × 24 hours across a DST
+    /// transition — 167 hours in spring, 169 in autumn.
+    #[test]
+    fn shifting_back_days_keeps_the_local_clock_time() {
+        // Ordinary week: exactly 168 h.
+        let plain = datetime!(2026-06-17 10:00 UTC);
+        assert_eq!(plain - shift_back_days(plain, 7), Duration::hours(168));
+
+        // Autumn: Wed 12:00 CET back to Wed 12:00 CEST is 169 h.
+        let autumn = datetime!(2026-10-28 11:00 UTC); // 12:00 CET
+        let back = shift_back_days(autumn, 7);
+        assert_eq!(back, datetime!(2026-10-21 10:00 UTC)); // 12:00 CEST
+        assert_eq!(autumn - back, Duration::hours(169));
+        assert_eq!(to_berlin(back).time(), to_berlin(autumn).time());
+
+        // Spring: 167 h.
+        let spring = datetime!(2026-04-01 10:00 UTC); // 12:00 CEST
+        assert_eq!(spring - shift_back_days(spring, 7), Duration::hours(167));
+
+        // Zero days is the identity.
+        assert_eq!(shift_back_days(plain, 0), plain);
+    }
+
+    /// The Gastag runs 06:00–06:00 local, tiles the timeline, and the DST
+    /// transition lands in **Saturday's** gas day — the clocks move at
+    /// 02:00/03:00, before the 06:00 boundary.
+    #[test]
+    fn gas_days_run_0600_to_0600_and_tile() {
+        // Winter and summer boundary instants.
+        assert_eq!(
+            gas_day_start_utc(date!(2026 - 01 - 15)),
+            datetime!(2026-01-15 5:00 UTC)
+        );
+        assert_eq!(
+            gas_day_start_utc(date!(2026 - 07 - 15)),
+            datetime!(2026-07-15 4:00 UTC)
+        );
+
+        // Consecutive gas days tile without gap or overlap across both
+        // transitions.
+        let mut day = date!(2026 - 03 - 25);
+        let mut cursor = gas_day_start_utc(day);
+        while day < date!(2026 - 04 - 02) {
+            assert_eq!(gas_day_start_utc(day), cursor, "{day}");
+            cursor = gas_day_end_utc(day);
+            day = day.next_day().unwrap();
+        }
+
+        // Spring: Saturday's Gastag is 23 hours, the transition Sunday's 24.
+        let sat = gas_day_end_utc(date!(2026 - 03 - 28)) - gas_day_start_utc(date!(2026 - 03 - 28));
+        let sun = gas_day_end_utc(date!(2026 - 03 - 29)) - gas_day_start_utc(date!(2026 - 03 - 29));
+        assert_eq!(sat.whole_hours(), 23);
+        assert_eq!(sun.whole_hours(), 24);
+
+        // Instants map to the gas day they belong to.
+        assert_eq!(
+            local_gas_day(datetime!(2026-07-15 3:30 UTC)), // 05:30 local
+            date!(2026 - 07 - 14)
+        );
+        assert_eq!(
+            local_gas_day(datetime!(2026-07-15 4:30 UTC)), // 06:30 local
+            date!(2026 - 07 - 15)
+        );
+        // Consistency: every instant lies inside its own gas day's bounds.
+        for ts in [
+            datetime!(2026-10-25 0:30 UTC),
+            datetime!(2026-10-25 4:59 UTC),
+            datetime!(2026-10-25 5:00 UTC),
+            datetime!(2026-03-29 0:30 UTC),
+        ] {
+            let day = local_gas_day(ts);
+            assert!(
+                gas_day_start_utc(day) <= ts && ts < gas_day_end_utc(day),
+                "{ts}"
+            );
+        }
     }
 }

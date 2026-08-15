@@ -351,6 +351,44 @@ fn tags_added_in_0_17_are_pinned() {
     }
 }
 
+/// The tags and string forms introduced or changed in 0.18.
+///
+/// The gas `LoadProfile` codes changed **deliberately**: `"EF"`, `"MF"` and
+/// `"GHD"` were not BDEW gas profile codes — the real set is HEF/HMF/HKO plus
+/// the eleven Gewerbe types. Archives written under the old tags fail to
+/// decode, which is the honest outcome; `LoadProfile::parse` still reads
+/// `"EF"`/`"MF"` leniently for callers migrating stored strings by hand.
+#[test]
+fn tags_added_in_0_18_are_pinned() {
+    use metering::{LoadProfile, MaloId, MeloId};
+
+    // MaLo/MeLo travel as their canonical strings.
+    let malo: MaloId = "41373559241".parse().unwrap();
+    assert_eq!(json(&malo), r#""41373559241""#);
+    round_trip(malo);
+    // ...and the check digit is enforced on the way back in.
+    assert!(serde_json::from_str::<MaloId>(r#""41373559240""#).is_err());
+
+    let melo: MeloId = "DE00056266802AO6G56M11SN51G21M24S".parse().unwrap();
+    assert_eq!(json(&melo), r#""DE00056266802AO6G56M11SN51G21M24S""#);
+    round_trip(melo);
+
+    // LoadProfile: the serde tag now equals the as_str code for every variant
+    // — including the gas profiles and CUSTOM, which the derived form spelt
+    // differently ("GasEF", "Custom").
+    for p in LoadProfile::ALL {
+        assert_eq!(json(&p), format!("\"{}\"", p.as_str()), "{p:?}");
+        round_trip(p);
+    }
+    assert_eq!(json(&LoadProfile::GasHEF), r#""HEF""#);
+    assert_eq!(json(&LoadProfile::GasGKO), r#""GKO""#);
+    assert_eq!(json(&LoadProfile::Custom), r#""CUSTOM""#);
+    assert!(
+        serde_json::from_str::<LoadProfile>(r#""GHD""#).is_err(),
+        "GHD never named a gas SLP and no longer decodes"
+    );
+}
+
 /// `MeterReading`'s field names, like `MeterInterval`'s above.
 #[test]
 fn meter_reading_field_names_are_stable() {

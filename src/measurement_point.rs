@@ -49,6 +49,7 @@ use time::Date;
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
+use crate::ids::{MaloId, MeloId};
 use crate::interval::Sparte;
 use crate::obis::{ObisCode, RegisterUnit};
 
@@ -101,12 +102,17 @@ impl MarktRolle {
         }
     }
 
-    /// `true` for roles that receive meter data via MSCONS from NB/MSB.
+    /// `true` for roles that receive meter data via MSCONS.
+    ///
+    /// The ÜNB is one of them: under MaBiS the Netzbetreiber transmits the
+    /// Bilanzierungs-Summenzeitreihen to the ÜNB as Bilanzkoordinator via
+    /// MSCONS, and the ÜNB acknowledges them — it is a receiver in exactly the
+    /// sense this predicate answers. Earlier releases said `false` for it.
     #[must_use]
     pub fn is_mscons_receiver(self) -> bool {
         matches!(
             self,
-            Self::Lf | Self::Bkv | Self::Mgv | Self::Direktvermarkter
+            Self::Lf | Self::Bkv | Self::Mgv | Self::Direktvermarkter | Self::Uenb
         )
     }
 }
@@ -192,13 +198,17 @@ impl EnergyFlow {
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct MeasurementPoint {
-    /// 11-digit Marktlokations-ID (billing reference).
-    pub malo_id: String,
+    /// Marktlokations-ID (billing reference).
+    ///
+    /// A [`MaloId`], not a `String`: the check digit is verified at the parse,
+    /// so a transposed digit is rejected at the boundary instead of becoming a
+    /// plausible-looking key for the wrong delivery point.
+    pub malo_id: MaloId,
 
-    /// 33-character Messlokations-ID (physical metering reference).
+    /// Messlokations-ID (physical metering reference).
     ///
     /// `None` for SLP customers without an explicit MeLo.
-    pub melo_id: Option<String>,
+    pub melo_id: Option<MeloId>,
 
     /// Physical meter serial number.
     ///
@@ -337,8 +347,8 @@ mod tests {
 
     fn bezug_point() -> MeasurementPoint {
         MeasurementPoint {
-            malo_id: "51238696780".to_owned(),
-            melo_id: Some("DE0012345678901234567890123456789".to_owned()),
+            malo_id: "51238696781".parse().unwrap(),
+            melo_id: Some("DE00056266802AO6G56M11SN51G21M24S".parse().unwrap()),
             meter_serial: Some("MSN-001".to_owned()),
             obis_code: ObisCode::STROM_BEZUG_TOTAL,
             sparte: Sparte::Strom,
@@ -480,6 +490,8 @@ mod tests {
     fn markt_rolle_mscons_receiver() {
         assert!(MarktRolle::Lf.is_mscons_receiver());
         assert!(MarktRolle::Bkv.is_mscons_receiver());
+        // MaBiS: the NB sends the Summenzeitreihen to the ÜNB via MSCONS.
+        assert!(MarktRolle::Uenb.is_mscons_receiver());
         assert!(!MarktRolle::Nb.is_mscons_receiver());
         assert!(!MarktRolle::Msb.is_mscons_receiver());
     }

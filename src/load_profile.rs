@@ -28,7 +28,9 @@
 //! | G0–G6 | Commercial, various sub-types | Electricity |
 //! | L0–L2 | Agricultural (Landwirtschaft) | Electricity |
 //! | P0 | Pumping stations | Electricity |
-//! | SLP-G | Gas standard profiles | Gas |
+//! | H25/G25/L25/P25/S25 | The 2025 revision | Electricity |
+//! | HEF/HMF/HKO | Households (heating / cooking gas) | Gas |
+//! | GKO…GMF | Eleven Gewerbe types (TUM/FfE) | Gas |
 //!
 //! ## Usage
 //!
@@ -132,20 +134,73 @@ pub enum LoadProfile {
     S25,
 
     // ── Gas profiles ─────────────────────────────────────────────────────────
-    /// EF — Einfamilienhaus Gas (single-family residential gas).
-    ///
-    /// Standard BDEW gas profile for residential heating customers.
-    GasEF,
+    // The TUM/FfE profile types of the BDEW/VKU/GEODE Leitfaden "Abwicklung
+    // von Standardlastprofilen Gas" — the temperature-dependent daily profiles
+    // whose arithmetic lives in `crate::gas_slp`. Earlier releases carried
+    // three invented codes ("EF", "MF", "GHD"); no gas SLP is named any of
+    // those, and "GHD" in particular does not exist — the commercial sector is
+    // eleven separate profile types.
+    /// HEF — Haushalt, Einfamilienhaushalt (single-family, heating gas).
+    #[cfg_attr(feature = "serde", serde(rename = "HEF"))]
+    GasHEF,
 
-    /// MF — Mehrfamilienhaus Gas (multi-family residential gas).
-    GasMF,
+    /// HMF — Haushalt, Mehrfamilienhaushalt (multi-family, heating gas).
+    #[cfg_attr(feature = "serde", serde(rename = "HMF"))]
+    GasHMF,
 
-    /// GHD — Gewerbe, Handel, Dienstleistungen Gas (commercial gas).
-    GasGHD,
+    /// HKO — Haushalt, Kochgas (cooking-gas-only household).
+    #[cfg_attr(feature = "serde", serde(rename = "HKO"))]
+    GasHKO,
+
+    /// GKO — Gebietskörperschaften, Kreditinstitute und Versicherungen,
+    /// Organisationen ohne Erwerbszweck, öffentliche Einrichtungen.
+    #[cfg_attr(feature = "serde", serde(rename = "GKO"))]
+    GasGKO,
+
+    /// GHA — Einzel- und Großhandel.
+    #[cfg_attr(feature = "serde", serde(rename = "GHA"))]
+    GasGHA,
+
+    /// GMK — Metall und Kfz.
+    #[cfg_attr(feature = "serde", serde(rename = "GMK"))]
+    GasGMK,
+
+    /// GBD — sonstige betriebliche Dienstleistungen.
+    #[cfg_attr(feature = "serde", serde(rename = "GBD"))]
+    GasGBD,
+
+    /// GGA — Gaststätten.
+    #[cfg_attr(feature = "serde", serde(rename = "GGA"))]
+    GasGGA,
+
+    /// GBH — Beherbergung.
+    #[cfg_attr(feature = "serde", serde(rename = "GBH"))]
+    GasGBH,
+
+    /// GWA — Wäschereien und chemische Reinigungen.
+    #[cfg_attr(feature = "serde", serde(rename = "GWA"))]
+    GasGWA,
+
+    /// GGB — Gartenbau.
+    #[cfg_attr(feature = "serde", serde(rename = "GGB"))]
+    GasGGB,
+
+    /// GBA — Backstuben (bakeries with a Backstube).
+    #[cfg_attr(feature = "serde", serde(rename = "GBA"))]
+    GasGBA,
+
+    /// GPD — Papier und Druck.
+    #[cfg_attr(feature = "serde", serde(rename = "GPD"))]
+    GasGPD,
+
+    /// GMF — haushaltsähnliche Gewerbebetriebe.
+    #[cfg_attr(feature = "serde", serde(rename = "GMF"))]
+    GasGMF,
 
     // ── Legacy / other ────────────────────────────────────────────────────────
     /// Custom profile — not a standard BDEW profile.
     /// The profile name is stored separately in the MaLo record.
+    #[cfg_attr(feature = "serde", serde(rename = "CUSTOM"))]
     Custom,
 }
 
@@ -173,15 +228,26 @@ impl LoadProfile {
             Self::L25 => "L25",
             Self::P25 => "P25",
             Self::S25 => "S25",
-            Self::GasEF => "EF",
-            Self::GasMF => "MF",
-            Self::GasGHD => "GHD",
+            Self::GasHEF => "HEF",
+            Self::GasHMF => "HMF",
+            Self::GasHKO => "HKO",
+            Self::GasGKO => "GKO",
+            Self::GasGHA => "GHA",
+            Self::GasGMK => "GMK",
+            Self::GasGBD => "GBD",
+            Self::GasGGA => "GGA",
+            Self::GasGBH => "GBH",
+            Self::GasGWA => "GWA",
+            Self::GasGGB => "GGB",
+            Self::GasGBA => "GBA",
+            Self::GasGPD => "GPD",
+            Self::GasGMF => "GMF",
             Self::Custom => "CUSTOM",
         }
     }
 
     /// Every variant, in declaration order.
-    pub const ALL: [Self; 21] = [
+    pub const ALL: [Self; 32] = [
         Self::H0,
         Self::G0,
         Self::G1,
@@ -199,17 +265,32 @@ impl LoadProfile {
         Self::L25,
         Self::P25,
         Self::S25,
-        Self::GasEF,
-        Self::GasMF,
-        Self::GasGHD,
+        Self::GasHEF,
+        Self::GasHMF,
+        Self::GasHKO,
+        Self::GasGKO,
+        Self::GasGHA,
+        Self::GasGMK,
+        Self::GasGBD,
+        Self::GasGGA,
+        Self::GasGBH,
+        Self::GasGWA,
+        Self::GasGGB,
+        Self::GasGBA,
+        Self::GasGPD,
+        Self::GasGMF,
         Self::Custom,
     ];
 
-    /// The accepted [`FromStr`](std::str::FromStr) codes, in the same order as
-    /// [`ALL`](Self::ALL).
+    /// The canonical codes, in the same order as [`ALL`](Self::ALL).
+    ///
+    /// [`parse`](Self::parse) also accepts `"EF"` and `"MF"` — the codes
+    /// earlier releases of this crate wrote for HEF and HMF — as lenient
+    /// aliases; they normalise onto the canonical spelling.
     pub const CODES: &'static [&'static str] = &[
         "H0", "G0", "G1", "G2", "G3", "G4", "G5", "G6", "L0", "L1", "L2", "P0", "H25", "G25",
-        "L25", "P25", "S25", "EF", "MF", "GHD", "CUSTOM",
+        "L25", "P25", "S25", "HEF", "HMF", "HKO", "GKO", "GHA", "GMK", "GBD", "GGA", "GBH", "GWA",
+        "GGB", "GBA", "GPD", "GMF", "CUSTOM",
     ];
 
     /// Parse from the BDEW profile identifier string.
@@ -236,9 +317,26 @@ impl LoadProfile {
             "L25" => Some(Self::L25),
             "P25" => Some(Self::P25),
             "S25" => Some(Self::S25),
-            "EF" => Some(Self::GasEF),
-            "MF" => Some(Self::GasMF),
-            "GHD" => Some(Self::GasGHD),
+            "HEF" => Some(Self::GasHEF),
+            "HMF" => Some(Self::GasHMF),
+            "HKO" => Some(Self::GasHKO),
+            "GKO" => Some(Self::GasGKO),
+            "GHA" => Some(Self::GasGHA),
+            "GMK" => Some(Self::GasGMK),
+            "GBD" => Some(Self::GasGBD),
+            "GGA" => Some(Self::GasGGA),
+            "GBH" => Some(Self::GasGBH),
+            "GWA" => Some(Self::GasGWA),
+            "GGB" => Some(Self::GasGGB),
+            "GBA" => Some(Self::GasGBA),
+            "GPD" => Some(Self::GasGPD),
+            "GMF" => Some(Self::GasGMF),
+            // Lenient aliases for the codes earlier releases wrote. "GHD" is
+            // deliberately not one: no gas SLP is named GHD, and there is no
+            // single profile it could map onto — the commercial sector is
+            // eleven distinct types.
+            "EF" => Some(Self::GasHEF),
+            "MF" => Some(Self::GasHMF),
             // `Custom` is a real variant with a real code, so it must parse
             // back — `as_str` emits "CUSTOM", and a mapping whose inverse drops
             // a variant turns a stored profile into a parse failure on read.
@@ -252,7 +350,13 @@ impl LoadProfile {
     pub fn is_residential(self) -> bool {
         matches!(
             self,
-            Self::H0 | Self::H25 | Self::P25 | Self::S25 | Self::GasEF | Self::GasMF
+            Self::H0
+                | Self::H25
+                | Self::P25
+                | Self::S25
+                | Self::GasHEF
+                | Self::GasHMF
+                | Self::GasHKO
         )
     }
 
@@ -271,7 +375,8 @@ impl LoadProfile {
         matches!(self, Self::H0 | Self::H25 | Self::P25 | Self::S25)
     }
 
-    /// `true` when this is a commercial profile (G0–G6 or GHD).
+    /// `true` when this is a commercial profile — G0–G6, G25, or one of the
+    /// eleven gas Gewerbe types.
     #[must_use]
     pub fn is_commercial(self) -> bool {
         matches!(
@@ -283,7 +388,18 @@ impl LoadProfile {
                 | Self::G4
                 | Self::G5
                 | Self::G6
-                | Self::GasGHD
+                | Self::G25
+                | Self::GasGKO
+                | Self::GasGHA
+                | Self::GasGMK
+                | Self::GasGBD
+                | Self::GasGGA
+                | Self::GasGBH
+                | Self::GasGWA
+                | Self::GasGGB
+                | Self::GasGBA
+                | Self::GasGPD
+                | Self::GasGMF
         )
     }
 
@@ -293,10 +409,27 @@ impl LoadProfile {
         matches!(self, Self::L0 | Self::L1 | Self::L2)
     }
 
-    /// `true` when this is a gas SLP profile.
+    /// `true` when this is a gas SLP profile — the TUM/FfE daily profiles
+    /// evaluated by [`crate::gas_slp`].
     #[must_use]
     pub fn is_gas(self) -> bool {
-        matches!(self, Self::GasEF | Self::GasMF | Self::GasGHD)
+        matches!(
+            self,
+            Self::GasHEF
+                | Self::GasHMF
+                | Self::GasHKO
+                | Self::GasGKO
+                | Self::GasGHA
+                | Self::GasGMK
+                | Self::GasGBD
+                | Self::GasGGA
+                | Self::GasGBH
+                | Self::GasGWA
+                | Self::GasGGB
+                | Self::GasGBA
+                | Self::GasGPD
+                | Self::GasGMF
+        )
     }
 }
 
@@ -545,9 +678,12 @@ mod tests {
             LoadProfile::L1,
             LoadProfile::L2,
             LoadProfile::P0,
-            LoadProfile::GasEF,
-            LoadProfile::GasMF,
-            LoadProfile::GasGHD,
+            LoadProfile::GasHEF,
+            LoadProfile::GasHMF,
+            LoadProfile::GasHKO,
+            LoadProfile::GasGKO,
+            LoadProfile::GasGGA,
+            LoadProfile::GasGMF,
         ];
         for p in &profiles {
             let s = p.as_str();
@@ -559,7 +695,12 @@ mod tests {
     #[test]
     fn residential_classification() {
         assert!(LoadProfile::H0.is_residential());
-        assert!(LoadProfile::GasEF.is_residential());
+        assert!(LoadProfile::GasHEF.is_residential());
+        assert!(LoadProfile::GasHKO.is_residential());
+        assert!(
+            !LoadProfile::GasGMF.is_residential(),
+            "GMF is haushaltsähnlich, not a household"
+        );
         assert!(!LoadProfile::G0.is_residential());
     }
 
@@ -581,9 +722,15 @@ mod tests {
 
     #[test]
     fn gas_classification() {
-        assert!(LoadProfile::GasEF.is_gas());
-        assert!(LoadProfile::GasMF.is_gas());
-        assert!(LoadProfile::GasGHD.is_gas());
+        let gas_codes = [
+            "HEF", "HMF", "HKO", "GKO", "GHA", "GMK", "GBD", "GGA", "GBH", "GWA", "GGB", "GBA",
+            "GPD", "GMF",
+        ];
+        for p in LoadProfile::ALL {
+            assert_eq!(p.is_gas(), gas_codes.contains(&p.as_str()), "{p}");
+        }
+        assert!(LoadProfile::GasHEF.is_gas());
+        assert!(LoadProfile::GasGKO.is_gas());
         assert!(!LoadProfile::H0.is_gas());
     }
 
@@ -591,7 +738,12 @@ mod tests {
     fn case_insensitive_parse() {
         assert_eq!(LoadProfile::parse("h0"), Some(LoadProfile::H0));
         assert_eq!(LoadProfile::parse("H0"), Some(LoadProfile::H0));
-        assert_eq!(LoadProfile::parse("ef"), Some(LoadProfile::GasEF));
+        assert_eq!(LoadProfile::parse("hef"), Some(LoadProfile::GasHEF));
+        // The pre-0.18 codes are lenient aliases onto the canonical spelling.
+        assert_eq!(LoadProfile::parse("EF"), Some(LoadProfile::GasHEF));
+        assert_eq!(LoadProfile::parse("MF"), Some(LoadProfile::GasHMF));
+        // ...but "GHD" never named a gas SLP and maps to nothing.
+        assert_eq!(LoadProfile::parse("GHD"), None);
     }
 
     #[test]

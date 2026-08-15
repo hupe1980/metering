@@ -1,7 +1,7 @@
 +++
 title = "Tariff registers"
 description = "HT/NT and § 14a EnWG Modul 3 in one mechanism: ordered windows over months, day groups and minute bands, resolved in Europe/Berlin local time."
-weight = 6
+weight = 7
 +++
 
 Every time-of-use split in the German market is the same shape: ordered windows

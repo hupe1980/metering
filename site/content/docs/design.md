@@ -1,7 +1,7 @@
 +++
 title = "Design constraints"
 description = "Determinism, exact decimals, one canonical string per value, serde stability and exhaustive domain enums — the invariants the library holds to."
-weight = 11
+weight = 12
 +++
 
 ## Determinism

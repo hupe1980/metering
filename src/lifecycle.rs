@@ -18,6 +18,7 @@
 use rust_decimal::Decimal;
 use time::{Date, OffsetDateTime};
 
+use crate::ids::MeloId;
 use crate::reading::{Anomaly, LastgangConfig, MeterReading, consumption_between};
 
 #[cfg(feature = "serde")]
@@ -66,8 +67,8 @@ pub struct MeterLifecycleEvent {
     pub event_id: String,
     /// Meter serial number (Zählernummer / Gerätenummer).
     pub meter_serial: String,
-    /// 33-character Messlokations-ID of the delivery point.
-    pub melo_id: String,
+    /// Messlokations-ID of the delivery point — see [`MeloId`].
+    pub melo_id: MeloId,
     /// Type of lifecycle event.
     pub event_type: MeterLifecycleEventType,
     /// When the event occurred (UTC).
@@ -115,8 +116,8 @@ pub struct MeterLifecycleEvent {
 pub struct MeterExchangeEvent {
     /// Unique exchange identifier.
     pub exchange_id: String,
-    /// 33-character MeLo where the exchange took place.
-    pub melo_id: String,
+    /// The MeLo where the exchange took place — see [`MeloId`].
+    pub melo_id: MeloId,
     /// Serial number of the removed meter.
     pub old_meter_serial: String,
     /// Final reading of the old meter (kWh).
@@ -217,7 +218,7 @@ mod tests {
     fn make_exchange() -> MeterExchangeEvent {
         MeterExchangeEvent {
             exchange_id: "EX-001".to_owned(),
-            melo_id: "DE000123456789".to_owned(),
+            melo_id: "DE00056266802AO6G56M11SN51G21M24S".parse().unwrap(),
             old_meter_serial: "OLD-1234".to_owned(),
             old_final_reading: dec!(12500),
             new_meter_serial: "NEW-5678".to_owned(),

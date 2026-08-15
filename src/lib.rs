@@ -15,7 +15,8 @@
 //! | [`interval`] | `MeterInterval` — the Lastgang; `Sparte`, `QualityFlag` |
 //! | [`reading`] | `MeterReading` — the Zählerstand, and the ZSG → Lastgang conversion |
 //! | [`obis`] | Typed `ObisCode`, one canonical string per channel |
-//! | [`calendar`] | Europe/Berlin days, months and years — DST-correct interval counts |
+//! | [`ids`] | Typed `MaloId` (check-digit validated) and `MeloId` |
+//! | [`calendar`] | Europe/Berlin days, months, years **and the 06:00 Gastag** — DST-correct |
 //! | [`holiday`] | Bundesland statutory holidays; SLP day typing |
 //! | [`resolution`] | `IntervalResolution` — fixed vs calendar lengths |
 //! | [`conversion`] | Gas m³ → kWh_Hs, unit normalisation, HeizkostenV warm water |
@@ -27,6 +28,7 @@
 //! | [`substitute`] | Ersatzwertbildung — 4 methods, with an audit trail |
 //! | [`forecast`] | Jahresprognose with a 95 % prediction interval |
 //! | [`load_profile`] | SLP classes incl. BDEW 2025 (H25/G25/L25/P25/S25) |
+//! | [`gas_slp`] | Gas SLP arithmetic — SigLinDe, Allokationstemperatur, Kundenwert |
 //! | [`classification`] | SLP / RLM / iMSys detection from the observed series |
 //! | [`virtual_meter`] | Sum / Residual / GGV virtual meters (§ 42b EnWG) |
 //! | [`aggregation_rule`] | The rules `virtual_meter` evaluates |
@@ -69,12 +71,13 @@
 //! # use metering::{MeasurementSeries, MeasurementSource};
 //! # use time::macros::datetime;
 //! let series = MeasurementSeries::new(
-//!     "51238696780",
+//!     "51238696781".parse()?, // a MaloId — the check digit is verified
 //!     None,
 //!     vec![],
 //!     MeasurementSource::ManualEntry { operator_id: "ops-1".into(), reason: "test".into() },
 //!     datetime!(2026-01-02 09:30 UTC), // ← supplied, never sampled
 //! );
+//! # Ok::<(), metering::ParseError>(())
 //! ```
 //!
 //! A clock read is ambient state in the same family as I/O: it makes
@@ -115,6 +118,8 @@
 //! - [`ObisCode`]: `1-0:1.8.0`. The `*F` group is omitted when F is 255 ("not
 //!   applicable", IEC 62056-6-1) — the spelling MSCONS carries and people type.
 //! - [`IntervalResolution`]: the ISO 8601 duration, `PT15M` / `P1D`.
+//! - [`MaloId`]: the eleven digits, with the **check digit verified** at the
+//!   parse; [`MeloId`]: the 33-character Zählpunktbezeichnung, uppercased.
 //!
 //! Parsing is deliberately lenient where writing is not: [`ObisCode`] also
 //! accepts `1-0:1.8.0*255`, leading zeros and surrounding whitespace, and
@@ -262,7 +267,9 @@ pub mod classification;
 pub mod conversion;
 pub mod error;
 pub mod forecast;
+pub mod gas_slp;
 pub mod holiday;
+pub mod ids;
 pub mod imbalance;
 pub mod interval;
 pub mod lifecycle;
@@ -295,7 +302,11 @@ pub use conversion::{
 };
 pub use error::ParseError;
 pub use forecast::{AnnualForecast, project_annual_consumption};
+pub use gas_slp::{
+    SigLinDe, WeekdayFactors, allocation_temperature, gas_daily_quantity, kundenwert,
+};
 pub use holiday::{Bundesland, Holiday, slp_day_type};
+pub use ids::{MaloId, MaloIssuer, MeloId};
 pub use imbalance::{ImbalanceSaldo, compute_imbalance};
 pub use interval::{MeasurementUnit, MeterInterval, QualityFlag, Sparte, UnitScale};
 pub use lifecycle::{

@@ -149,6 +149,66 @@ proptest! {
     }
 }
 
+// ── MaloId / MeloId ──────────────────────────────────────────────────────────
+
+mod market_ids {
+    use metering::{MaloId, MeloId};
+    use proptest::prelude::*;
+
+    /// A structurally valid MaLo-ID: leading digit 1–9, nine free digits, and
+    /// the check digit the Bildungsvorschrift derives from them.
+    pub fn arb_malo() -> impl Strategy<Value = MaloId> {
+        ("[1-9][0-9]{9}").prop_map(|body| {
+            let check = MaloId::compute_check_digit(&body).expect("ten digits");
+            format!("{body}{check}").parse().expect("constructed valid")
+        })
+    }
+
+    proptest! {
+        /// Stability + totality: eleven digits out, the same value back.
+        #[test]
+        fn malo_display_round_trips(id in arb_malo()) {
+            let s = id.to_string();
+            prop_assert_eq!(s.len(), MaloId::LEN);
+            prop_assert_eq!(s.parse::<MaloId>(), Ok(id));
+        }
+
+        /// Injectivity is trivial here — the string *is* the value — but the
+        /// check digit adds a stronger property: a single-digit corruption of
+        /// the first ten digits is rejected, **except** the scheme's one blind
+        /// spot — a ±5 change in an even position, which doubles to a shift of
+        /// exactly 10 and so leaves the check digit unchanged. The exception
+        /// is asserted explicitly below rather than glossed over.
+        #[test]
+        fn malo_single_digit_corruption_is_caught(id in arb_malo(), pos in 0usize..10, bump in 1u8..10) {
+            let mut bytes = id.to_string().into_bytes();
+            bytes[pos] = b'0' + ((bytes[pos] - b'0') + bump) % 10;
+            let corrupted = String::from_utf8(bytes).unwrap();
+            // 1-based even positions are the doubled group: a bump of 5 there
+            // shifts the total by 10 and is undetectable by construction.
+            let blind_spot = pos % 2 == 1 && bump == 5;
+            if blind_spot {
+                prop_assert!(corrupted.parse::<MaloId>().is_ok(), "{}", corrupted);
+            } else {
+                // Corrupting the leading digit to 0 fails on structure;
+                // everything else fails on the check digit.
+                prop_assert!(corrupted.parse::<MaloId>().is_err(), "{}", corrupted);
+            }
+        }
+
+        /// A well-shaped MeLo round-trips, and lowercase input converges on
+        /// the uppercase spelling.
+        #[test]
+        fn melo_round_trips_and_uppercases(tail in "[A-Z0-9]{25}") {
+            let canonical = format!("DE000562{tail}");
+            let id: MeloId = canonical.parse().unwrap();
+            prop_assert_eq!(id.as_str(), canonical.as_str());
+            let relaxed: MeloId = canonical.to_lowercase().parse().unwrap();
+            prop_assert_eq!(relaxed, id);
+        }
+    }
+}
+
 // ── The serde form is the same string ────────────────────────────────────────
 
 #[cfg(feature = "serde")]

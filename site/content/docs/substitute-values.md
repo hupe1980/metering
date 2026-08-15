@@ -1,7 +1,7 @@
 +++
 title = "Ersatzwertbildung"
 description = "Substitute values under § 60 MsbG: the four methods, the calendar-aware grid, and why the audit trail records what ran rather than what was asked for."
-weight = 5
+weight = 6
 +++
 
 ## The legal basis, precisely
@@ -33,6 +33,11 @@ a documented default rather than a hard-coded claim of conformance.
 | `LastValueCarryForward` | conservative fallback |
 | `ZeroFill` | an affirmatively documented shutdown |
 
+The Vergleichstag week is seven **Berlin calendar days**, not 168 hours: the
+matching slot one week earlier is 169 UTC hours back across the autumn
+fall-back, and a fixed-duration window would silently drop the reference and
+degrade the method to carry-forward for a week every October.
+
 ```rust
 use metering::{FillGapsConfig, IntervalResolution, SubstituteMethod, fill_gaps};
 # use metering::{MeterInterval, QualityFlag};
@@ -62,6 +67,12 @@ assert!(filled.substitutions.iter().all(|e| e.method == SubstituteMethod::Linear
 The interpolation fractions are **interior** — `1/(n+1) … n/(n+1)`. Using
 `i/n` would put the first substitute exactly on the last measured value and
 never reach the closing one: a systematic bias on every rising or falling gap.
+
+The anchors are the **billable** values either side, at their true grid-slot
+distances. A present-but-faulty slot is never overwritten — the fill invents
+only missing slots — but it does not anchor the line either: the missing slots
+around a faulty reading all land on the one straight line between the billable
+values that bracket it.
 
 ## The grid is calendar-aware, and mandatory
 

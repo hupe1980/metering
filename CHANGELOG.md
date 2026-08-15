@@ -4,6 +4,94 @@ All notable changes to `metering` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the crate follows
 semver, with the `serde` representation explicitly in scope (see the crate docs).
 
+## [0.18.0] — 2026-08-15
+
+Two gaps closed and two identifiers typed. The crate validated OBIS codes to
+the digit while carrying MaLo-IDs as unchecked strings — its own doc examples
+used a MaLo whose check digit is wrong. And it modelled gas conversion, gas
+quality configs and a gas balancing method while offering no way to compute
+the one thing a gas SLP delivery point is settled on: the temperature-driven
+daily profile. Every removal remains a hard cut; no deprecated shims.
+
+### Added
+
+- **`ids`** — [`MaloId`] and [`MeloId`]. `MaloId` enforces the full BDEW
+  Bildungsvorschrift at the parse — eleven digits, Vergabestelle in 1–9, and
+  the check digit of the Anwendungshilfe's "Lok- und
+  Waggon-Kennzeichnungsverfahren", whose worked example (`4137355924` → `1`)
+  the tests reproduce digit for digit. The docs state the scheme's one blind
+  spot (a ±5 change in an even position) instead of implying Luhn-grade
+  protection. `MeloId` validates the 33-character Zählpunktbezeichnung
+  structurally and canonicalises to uppercase. Both serialise as their
+  canonical strings.
+- **`gas_slp`** — the published SigLinDe/TUM gas SLP arithmetic from the
+  BDEW/VKU/GEODE Leitfaden *Abwicklung von Standardlastprofilen Gas*:
+  `h(ϑ) = A/(1+(B/(ϑ−ϑ₀))^C) + D + max(mH·ϑ+bH, mW·ϑ+bW)`, the
+  geometric-series Allokationstemperatur (exact — the weights are eighths),
+  `Q(D) = KW·h(ϑ)·F_WT`, Kundenwert derivation, and weekday factors that must
+  sum to 7.0000 and give Feiertage the Sunday factor (nationwide by default,
+  per-Land on request) — each rule quoted from the Leitfaden. The published
+  `DE_HEF34` coefficient row is embedded and its printed normalisation
+  `h(8 °C) = 1.00000` is pinned by a test.
+- **`calendar::gas_day_start_utc` / `gas_day_end_utc` / `local_gas_day`** —
+  the 06:00–06:00 Gastag. Summing a gas Lastgang over the calendar day books
+  six hours into the wrong Bilanzierungstag, every day. The 23/25-hour Gastag
+  is the one named after the *Saturday* — the clocks change before 06:00 —
+  which the tests pin.
+
+### Changed (breaking)
+
+- **The gas `LoadProfile` codes are now the real ones.** `GasEF`/`GasMF`/
+  `GasGHD` (codes `EF`, `MF`, `GHD`) were not BDEW gas profile codes; `GHD`
+  does not exist at all. The gas variants are now the fourteen published
+  TUM/FfE types — `HEF`, `HMF`, `HKO` and the eleven Gewerbe profiles `GKO`,
+  `GHA`, `GMK`, `GBD`, `GGA`, `GBH`, `GWA`, `GGB`, `GBA`, `GPD`, `GMF`.
+  `parse` accepts `EF`/`MF` as lenient aliases; `GHD` is a hard error because
+  there is no profile it could honestly map onto.
+- **`LoadProfile` serde tags now equal the `as_str` codes** for every variant.
+  The derived representation wrote the Rust variant names, so `GasEF`
+  serialised as `"GasEF"` (not `"EF"`) and `Custom` as `"Custom"` (not
+  `"CUSTOM"`) — two spellings per value, in violation of the crate's stated
+  one-string rule. `tests/serde_representation.rs` now pins every tag.
+- **`MeasurementPoint`, `MeasurementSeries` and the lifecycle events carry
+  `MaloId` / `MeloId`** instead of `String`. `MeasurementSeries::new` takes a
+  `MaloId`. Virtual-meter `SourceMap` keys deliberately stay `String` — they
+  are arbitrary series labels, not asserted MaLo-IDs.
+- **`MeasurementSource::is_billable_source` is removed.** Billability is a
+  property of each interval's `QualityFlag` — only `Faulty` and `Unknown`
+  block billing — never of provenance. The predicate said a manual entry and
+  a GGV virtual-meter result were unbillable; both are billed every day. A
+  second, contradictory notion of billability is worse than none.
+- **`MarktRolle::is_mscons_receiver` now includes `Uenb`.** Under MaBiS the
+  Netzbetreiber transmits the Bilanzierungs-Summenzeitreihen to the ÜNB as
+  Bilanzkoordinator via MSCONS; reporting the ÜNB as a non-receiver was
+  simply wrong.
+
+### Fixed
+
+- **`fill_gaps` Vergleichstag window vs. the autumn fall-back.** The
+  `PriorPeriodAverage` reference window was a fixed `Duration::days(7)` —
+  168 hours — while slots are matched on Berlin (weekday, hour, minute),
+  which recurs every 7 *local* days. Across the October transition the
+  matching slot is 169 UTC hours back, fell outside the window, and the
+  configured method silently degraded to `LastValueCarryForward` for the week
+  after every fall-back. The window is now seven Berlin calendar days
+  (`calendar::shift_back_days`, new — the day-granular sibling of
+  `shift_back_one_year`).
+- **`fill_gaps` interpolation geometry across faulty slots.** The gap length
+  was measured to the next *present* slot (quality-blind) while the closing
+  value came from the next *billable* one — so with a present-but-faulty slot
+  bordering a gap, the line reached the closing value at the faulty slot's
+  position and every interior value sat at the wrong fraction. The mirror
+  defect existed on the preceding side. Interpolation now anchors on the
+  billable values either side at their **true grid-slot distances**, so all
+  missing slots between two billable anchors land on one straight line
+  however faulty slots partition them. Faulty slots themselves are still
+  passed through untouched, never substituted.
+- The sample MaLo-ID used across the documentation (`51238696780`) failed the
+  BDEW check digit. It is now `51238696781`, which passes — and, since the
+  fields are typed, could not have survived otherwise.
+
 ## [0.17.0] — 2026-08-10
 
 A correctness release, and a large one. Several statutory citations were wrong —

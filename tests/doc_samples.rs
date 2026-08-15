@@ -300,7 +300,7 @@ fn calendar_section() {
 #[test]
 fn determinism_section() {
     let series = MeasurementSeries::new(
-        "51238696780",
+        "51238696781".parse().unwrap(),
         None,
         vec![],
         MeasurementSource::ManualEntry {
@@ -440,4 +440,48 @@ fn calendar_days_between_section() {
     let to = calendar::day_start_utc(date!(2026 - 04 - 06));
     assert_eq!((to - from).whole_days(), 13);
     assert_eq!(calendar::days_between(from, to), 14);
+}
+
+/// Docs — "Market identifiers".
+#[test]
+fn identifiers_section() {
+    use metering::{MaloId, MeloId};
+
+    let malo: MaloId = "41373559241".parse().unwrap();
+    assert_eq!(malo.check_digit(), 1);
+    assert!("41373559214".parse::<MaloId>().is_err());
+
+    let melo: MeloId = "DE00056266802AO6G56M11SN51G21M24S".parse().unwrap();
+    assert_eq!(melo.netzbetreiber_nr(), "000562");
+}
+
+/// Docs — "The gas SLP — SigLinDe, published in full".
+#[test]
+fn gas_slp_section() {
+    use metering::gas_daily_quantity;
+    use metering::gas_slp::{SigLinDe, allocation_temperature};
+
+    let theta = allocation_temperature(dec!(5.0), dec!(2.5), dec!(2.5), dec!(5.0));
+    assert_eq!(theta, dec!(4));
+
+    let h = SigLinDe::DE_HEF34.h_value(theta);
+    let q = gas_daily_quantity(dec!(60.3423), h, dec!(1));
+    assert!(q > dec!(90));
+}
+
+/// Docs — "The Gastag is a different day" / "The Gastag runs 06:00 to 06:00".
+#[test]
+fn gastag_section() {
+    assert_eq!(
+        calendar::gas_day_start_utc(date!(2026 - 01 - 15)),
+        datetime!(2026-01-15 5:00 UTC)
+    );
+    assert_eq!(
+        calendar::local_gas_day(datetime!(2026-07-15 3:30 UTC)),
+        date!(2026 - 07 - 14)
+    );
+    // The long Gastag is Saturday's, not the transition Sunday's.
+    let saturday = calendar::gas_day_end_utc(date!(2026 - 10 - 24))
+        - calendar::gas_day_start_utc(date!(2026 - 10 - 24));
+    assert_eq!(saturday.whole_hours(), 25);
 }

@@ -62,8 +62,13 @@ use crate::interval::{MeterInterval, QualityFlag};
 use crate::resolution::IntervalResolution;
 
 /// Length of the reference period used by
-/// [`SubstituteMethod::PriorPeriodAverage`]: the seven days immediately
-/// preceding the gap.
+/// [`SubstituteMethod::PriorPeriodAverage`]: the seven **Berlin calendar
+/// days** immediately preceding the gap.
+///
+/// Calendar days, not `7 × 24` hours: the matching slot one week earlier is
+/// 169 UTC hours back across the autumn fall-back
+/// ([`crate::calendar::shift_back_days`]), and a fixed-duration window would
+/// exclude it.
 pub const REFERENCE_PERIOD_DAYS: i64 = 7;
 
 // ── SubstituteMethod ──────────────────────────────────────────────────────────
@@ -341,6 +346,12 @@ impl FilledSeries {
 /// from a moving cursor shrinks it as the gap fills, which silently reverted
 /// the last few intervals of every long gap to interpolation.
 ///
+/// A **present but non-billable** slot (`Faulty`, `Unknown`) is never
+/// overwritten — this function fills *missing* slots — but it does not anchor
+/// an interpolation either: the straight line runs between the billable
+/// values either side, each at the grid slot it actually occupies, so the
+/// missing slots around a faulty reading land on one consistent line.
+///
 /// Leading and trailing gaps are filled too, and are the cases most likely to
 /// have no bracketing value: the entries record the fallback that ran.
 ///
@@ -427,16 +438,18 @@ pub fn fill_gaps(intervals: &[MeterInterval], config: &FillGapsConfig) -> Filled
 
     let mut out: Vec<MeterInterval> = Vec::new();
     let mut substitutions: Vec<SubstituteEntry> = Vec::new();
-    // The last plausible value seen, measured or substituted.
-    let mut last_value: Option<Decimal> = None;
+    // The last billable value seen — measured or substituted — with the grid
+    // slot it sits on. The slot index is what lets interpolation across a
+    // present-but-faulty slot use the value's true distance rather than
+    // pretending it sits adjacent to the gap.
+    let mut anchor: Option<(usize, Decimal)> = None;
     // Set at the first missing slot of a gap and cleared when it closes, so the
-    // whole gap shares one length and one bracket, and the position within it
-    // is counted rather than divided out of a duration that may vary.
+    // whole gap shares one length and one bracket.
     let mut gap: Option<Gap> = None;
-    let mut position = 0usize;
 
     let obis = intervals.first().and_then(|iv| iv.obis_code);
     let mut cursor = from;
+    let mut idx = 0usize;
     while cursor < to {
         let Some(next) = advance(cursor, resolution) else {
             break;
@@ -446,33 +459,30 @@ pub fn fill_gaps(intervals: &[MeterInterval], config: &FillGapsConfig) -> Filled
         if let Some(&iv) = measured.get(&ts) {
             out.push(iv.clone());
             if iv.quality.is_billable() {
-                last_value = Some(iv.value);
+                anchor = Some((idx, iv.value));
             }
             gap = None;
             cursor = next;
+            idx += 1;
             continue;
         }
 
         let current = match gap {
-            Some(ref g) => {
-                position += 1;
-                g.clone()
-            }
+            Some(ref g) => g.clone(),
             None => {
-                position = 0;
-                let g = Gap::measure(&measured, cursor, resolution, to, last_value);
+                let g = Gap::measure(&measured, cursor, idx, resolution, to, anchor);
                 gap = Some(g.clone());
                 g
             }
         };
 
-        let effective = if current.length <= config.short_gap_threshold {
+        let effective = if current.run_len <= config.short_gap_threshold {
             SubstituteMethod::LinearInterpolation
         } else {
             config.method
         };
         let (value, applied, reference_count) =
-            current.synthesise(effective, position, cursor, &reference, last_value);
+            current.synthesise(effective, idx, cursor, &reference, anchor.map(|(_, v)| v));
 
         let interval = MeterInterval {
             from: cursor,
@@ -488,8 +498,9 @@ pub fn fill_gaps(intervals: &[MeterInterval], config: &FillGapsConfig) -> Filled
             reason: config.reason,
             reference_count,
         });
-        last_value = Some(value);
+        anchor = Some((idx, value));
         cursor = next;
+        idx += 1;
     }
 
     FilledSeries {
@@ -521,92 +532,124 @@ fn advance(cursor: OffsetDateTime, resolution: IntervalResolution) -> Option<Off
 // ── gap resolution ────────────────────────────────────────────────────────────
 
 /// One contiguous run of missing grid slots, measured once when it opens.
+///
+/// Interpolation anchors on the **billable** values either side, at their true
+/// slot distances. The two are not the same thing as "the neighbouring
+/// slots": a present-but-faulty slot terminates the missing run — it is never
+/// overwritten — but the straight line must still run from the last billable
+/// value to the next one, each at the slot it actually occupies. Measuring
+/// the span to the nearest *present* slot while taking the endpoint value
+/// from the nearest *billable* one placed every interior value at the wrong
+/// fraction whenever the two differed.
 #[derive(Debug, Clone)]
 struct Gap {
-    /// Number of missing slots, measured once when the gap opens.
-    length: usize,
-    /// The last plausible value before the gap.
-    preceding: Option<Decimal>,
-    /// The first plausible value after the gap.
-    following: Option<Decimal>,
+    /// Number of contiguous missing slots — what is actually being invented,
+    /// and the length the short-gap threshold is compared against.
+    run_len: usize,
+    /// The last billable value before the run, with its grid slot index.
+    preceding: Option<(usize, Decimal)>,
+    /// The first billable value at or after the run's end, with its index.
+    following: Option<(usize, Decimal)>,
 }
 
 impl Gap {
     fn measure(
         measured: &BTreeMap<i64, &MeterInterval>,
         start: OffsetDateTime,
+        start_idx: usize,
         resolution: IntervalResolution,
         end: OffsetDateTime,
-        preceding: Option<Decimal>,
+        preceding: Option<(usize, Decimal)>,
     ) -> Self {
-        let mut length = 0usize;
+        // The contiguous missing run, bounded by the fill period.
+        let mut run_len = 0usize;
         let mut cursor = start;
         while cursor < end && !measured.contains_key(&cursor.unix_timestamp()) {
-            length += 1;
+            run_len += 1;
             let Some(next) = advance(cursor, resolution) else {
                 break;
             };
             cursor = next;
         }
-        // The first plausible value at or after the gap's end. `range` is the
-        // reason this is a BTreeMap: the closing value may be several slots
-        // beyond the grid step if the series is sparse.
-        let following = measured
+
+        // The first billable value at or after the run's end. `range` is the
+        // reason this is a BTreeMap: the closing value may sit several slots
+        // beyond — behind faulty slots, or beyond the period on a sparse
+        // series — and quality-blind adjacency is not the closing anchor.
+        let closing = measured
             .range(cursor.unix_timestamp()..)
             .map(|(_, iv)| *iv)
-            .find(|iv| iv.quality.is_billable())
-            .map(|iv| iv.value);
+            .find(|iv| iv.quality.is_billable());
+
+        // ...and the grid slot it occupies, so the interpolation fraction uses
+        // its real distance. The walk is strictly monotonic and bounded by the
+        // closing timestamp; an off-grid closing value is assigned the first
+        // slot at or after it.
+        let following = closing.and_then(|iv| {
+            let target = iv.from.unix_timestamp();
+            let mut walk = cursor;
+            let mut walk_idx = start_idx + run_len;
+            while walk.unix_timestamp() < target {
+                walk = advance(walk, resolution)?;
+                walk_idx += 1;
+            }
+            Some((walk_idx, iv.value))
+        });
+
         Self {
-            length,
+            run_len,
             preceding,
             following,
         }
     }
 
     /// The substitute value, the method that produced it, and how many measured
-    /// values it rests on.
+    /// values it rests on. `idx` is the grid slot being filled.
     fn synthesise(
         &self,
         requested: SubstituteMethod,
-        position: usize,
+        idx: usize,
         cursor: OffsetDateTime,
         reference: &PriorPeriodIndex,
         last_value: Option<Decimal>,
     ) -> (Decimal, SubstituteMethod, u32) {
         use SubstituteMethod as M;
+        let preceding = self.preceding.map(|(_, v)| v);
+        let following = self.following.map(|(_, v)| v);
         match requested {
             M::ZeroFill => (Decimal::ZERO, M::ZeroFill, 0),
 
-            M::LastValueCarryForward => match last_value.or(self.preceding).or(self.following) {
+            M::LastValueCarryForward => match last_value.or(preceding).or(following) {
                 Some(v) => (v, M::LastValueCarryForward, 1),
                 None => (Decimal::ZERO, M::ZeroFill, 0),
             },
 
             M::PriorPeriodAverage => match reference.average_for(cursor) {
                 Some((avg, n)) => (avg, M::PriorPeriodAverage, n),
-                None => match last_value.or(self.preceding).or(self.following) {
+                None => match last_value.or(preceding).or(following) {
                     Some(v) => (v, M::LastValueCarryForward, 1),
                     None => (Decimal::ZERO, M::ZeroFill, 0),
                 },
             },
 
             M::LinearInterpolation => match (self.preceding, self.following) {
-                (Some(p), Some(f)) => {
-                    // The gap holds `length` unknowns between two knowns, so the
-                    // unknowns sit at fractions 1/(length+1) … length/(length+1).
-                    // Using position/length instead would put the first
-                    // substitute exactly on the preceding value and never reach
-                    // the following one — a systematic downward bias on a rising
-                    // series and an upward one on a falling series.
-                    // `u64`, not `u32`: a `usize` narrowed to `u32` truncates
-                    // silently, and a truncated denominator is a wrong value
-                    // rather than a failure.
-                    let denom = Decimal::from(self.length as u64 + 1);
-                    let numer = Decimal::from(position as u64 + 1);
+                // The line runs from the preceding billable anchor to the
+                // following one, and this slot sits `idx − pi` steps along a
+                // span of `fi − pi` — its *true* offsets, which differ from
+                // the naive run-relative fractions whenever a faulty slot
+                // borders the run. Every missing slot between the same two
+                // anchors lands on the same straight line, however the runs
+                // between them are partitioned.
+                // `u64`, not `u32`: a `usize` narrowed to `u32` truncates
+                // silently, and a truncated denominator is a wrong value
+                // rather than a failure.
+                (Some((pi, p)), Some((fi, f))) if pi < idx && idx < fi => {
+                    let denom = Decimal::from((fi - pi) as u64);
+                    let numer = Decimal::from((idx - pi) as u64);
                     (p + (f - p) * numer / denom, M::LinearInterpolation, 2)
                 }
-                (Some(p), None) => (p, M::LastValueCarryForward, 1),
-                (None, Some(f)) => (f, M::LastValueCarryForward, 1),
+                (Some((_, p)), None) | (Some((_, p)), Some(_)) => (p, M::LastValueCarryForward, 1),
+                (None, Some((_, f))) => (f, M::LastValueCarryForward, 1),
                 (None, None) => (Decimal::ZERO, M::ZeroFill, 0),
             },
         }
@@ -635,7 +678,14 @@ impl PriorPeriodIndex {
     /// Mean of the matching slot over the [`REFERENCE_PERIOD_DAYS`] preceding
     /// `target`, and the number of samples it averaged.
     fn average_for(&self, target: OffsetDateTime) -> Option<(Decimal, u32)> {
-        let window_start = target - Duration::days(REFERENCE_PERIOD_DAYS);
+        // Seven Berlin **calendar** days, not a fixed 168 hours. The slots are
+        // matched on local (weekday, hour, minute), so the only candidate
+        // inside a one-week window is the same local slot seven days earlier —
+        // which is 169 UTC hours back across the autumn fall-back. A
+        // `Duration::days(7)` window excluded exactly that sample, silently
+        // degrading the configured method to carry-forward for the week after
+        // every October transition.
+        let window_start = crate::calendar::shift_back_days(target, REFERENCE_PERIOD_DAYS);
         let samples = self.slots.get(&slot_key(target))?;
         let matching: Vec<Decimal> = samples
             .iter()
@@ -942,6 +992,134 @@ mod tests {
             filled.intervals[0].value,
             dec!(10),
             "averaging in the older week would give 505"
+        );
+    }
+
+    /// The Vergleichstag must survive the fall-back week. The matching slot —
+    /// same Berlin (weekday, hour, minute), seven calendar days earlier — is
+    /// **169 UTC hours** back when the 25-hour day lies between, and a fixed
+    /// `Duration::days(7)` window excluded it, silently degrading the
+    /// configured method to carry-forward for a week every October.
+    #[test]
+    fn prior_period_average_survives_the_fall_back_week() {
+        // Gap: Wednesday 2026-10-28 12:00 Berlin (CET, 11:00 UTC).
+        // Reference: Wednesday 2026-10-21 12:00 Berlin (CEST, 10:00 UTC).
+        let gap_start = datetime!(2026-10-28 11:00 UTC);
+        let prior = vec![iv_at(datetime!(2026-10-21 10:00 UTC), dec!(7.5))];
+
+        let filled = fill_gaps(
+            &[],
+            &FillGapsConfig::new(
+                IntervalResolution::QuarterHour,
+                gap_start,
+                gap_start + Duration::minutes(15),
+            )
+            .prior_period(prior)
+            .short_gap_threshold(0),
+        );
+        assert_eq!(filled.intervals[0].value, dec!(7.5));
+        assert_eq!(
+            filled.substitutions[0].method,
+            SubstituteMethod::PriorPeriodAverage,
+            "the matching slot is one local week back and must be found, \
+             not silently replaced by carry-forward"
+        );
+        assert_eq!(filled.substitutions[0].reference_count, 1);
+    }
+
+    /// ...while the window still ends where it should: the same slot *eight*
+    /// days back is outside the week whatever the season.
+    #[test]
+    fn the_fall_back_window_does_not_overreach() {
+        let gap_start = datetime!(2026-10-29 11:00 UTC); // Thursday 12:00 CET
+        // The matching Thursday slot 14 days earlier — outside any one-week
+        // window, DST or not.
+        let prior = vec![iv_at(datetime!(2026-10-15 10:00 UTC), dec!(999))];
+        let filled = fill_gaps(
+            &[],
+            &FillGapsConfig::new(
+                IntervalResolution::QuarterHour,
+                gap_start,
+                gap_start + Duration::minutes(15),
+            )
+            .prior_period(prior)
+            .short_gap_threshold(0),
+        );
+        assert_ne!(
+            filled.substitutions[0].method,
+            SubstituteMethod::PriorPeriodAverage,
+            "a fortnight-old sample is not in the reference week"
+        );
+    }
+
+    // ── interpolation across faulty slots ────────────────────────────────────
+
+    /// A present-but-faulty slot terminates the missing run but is not the
+    /// closing anchor: the line runs to the next **billable** value at its
+    /// true distance. The old geometry measured the span to the faulty slot
+    /// and the value from the billable one — every interior value at the
+    /// wrong fraction.
+    #[test]
+    fn interpolation_spans_to_the_billable_closing_value() {
+        let mut faulty = iv(60, dec!(999));
+        faulty.quality = QualityFlag::Faulty;
+        let series = vec![iv(0, dec!(0)), faulty, iv(75, dec!(100))];
+
+        let filled = fill_gaps(&series, &cfg(0, 90).short_gap_threshold(10));
+        let values: Vec<Decimal> = filled.intervals.iter().map(|iv| iv.value).collect();
+        // Slots: 0 (billable), three missing, 999 (faulty, untouched), 100.
+        // The line runs 0 → 100 over five steps: 20, 40, 60 — not the 25,
+        // 50, 75 of a four-step span ending on the faulty slot.
+        assert_eq!(
+            values,
+            vec![dec!(0), dec!(20), dec!(40), dec!(60), dec!(999), dec!(100)]
+        );
+        assert_eq!(
+            filled.substituted_count(),
+            3,
+            "the faulty slot is passed through, never substituted"
+        );
+        assert!(
+            filled.intervals[4].quality == QualityFlag::Faulty,
+            "…and keeps its quality"
+        );
+    }
+
+    /// The mirror case: a faulty slot *before* the run. The preceding anchor
+    /// is the last billable value at its true distance, so the missing slots
+    /// sit at offsets 2⁄4 and 3⁄4 of the span — not 1⁄3 and 2⁄3 of a
+    /// shortened one.
+    #[test]
+    fn interpolation_anchors_on_the_billable_preceding_value() {
+        let mut faulty = iv(15, dec!(999));
+        faulty.quality = QualityFlag::Faulty;
+        let series = vec![iv(0, dec!(0)), faulty, iv(60, dec!(100))];
+
+        let filled = fill_gaps(&series, &cfg(0, 75).short_gap_threshold(10));
+        let values: Vec<Decimal> = filled.intervals.iter().map(|iv| iv.value).collect();
+        assert_eq!(
+            values,
+            vec![dec!(0), dec!(999), dec!(50), dec!(75), dec!(100)]
+        );
+        assert_eq!(filled.substituted_count(), 2);
+    }
+
+    /// Two missing runs separated by a faulty slot interpolate on **one**
+    /// straight line between the same two billable anchors — the run
+    /// partitioning must not bend the line.
+    #[test]
+    fn runs_split_by_a_faulty_slot_share_one_line() {
+        let mut faulty = iv(30, dec!(999));
+        faulty.quality = QualityFlag::Faulty;
+        let series = vec![iv(0, dec!(0)), faulty, iv(75, dec!(100))];
+
+        let filled = fill_gaps(&series, &cfg(0, 90).short_gap_threshold(10));
+        let values: Vec<Decimal> = filled.intervals.iter().map(|iv| iv.value).collect();
+        // Slots 1, 3, 4 are missing around the faulty slot 2; all three sit
+        // on the single 0 → 100 line over five steps.
+        assert_eq!(
+            values,
+            vec![dec!(0), dec!(20), dec!(999), dec!(60), dec!(80), dec!(100)]
         );
     }
 

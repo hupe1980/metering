@@ -1,7 +1,7 @@
 +++
 title = "Validation and quality"
 description = "The order-independent rule engine V01–V12, why the outlier test is a Hampel identifier, and the A/B/C/F grade layered over it."
-weight = 4
+weight = 5
 +++
 
 ## The rules

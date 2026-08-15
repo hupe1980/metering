@@ -1,7 +1,7 @@
 +++
 title = "Regulatory basis"
 description = "Every provision this library implements, quoted from the published text and dated — including the ones it deliberately does not claim."
-weight = 10
+weight = 11
 +++
 
 Every citation below was checked against the current published text. Where a
@@ -20,6 +20,10 @@ claim could not be verified, the library says so rather than asserting it.
 | Energy Sharing | § 42c EnWG — in force 1 June 2026; adjacent Bilanzierungsgebiete from 1 June 2028 |
 | Dynamische Tarife | § 41a Abs. 2 EnWG — a duty on large **suppliers**, not a metering mandate |
 | Gas m³ → kWh | § 33 MessEG; § 25 Nr. 4 and Nr. 7 MessEV; DVGW G 685, G 260 |
+| Gas-SLP (SigLinDe), Allokationstemperatur, Kundenwert | BDEW/VKU/GEODE Leitfaden *Abwicklung von Standardlastprofilen Gas* (KoV) — published in full, quoted verbatim |
+| Gastag 06:00–06:00 | GaBi Gas / Art. 3 Nr. 6 VO (EU) 312/2014; temperature averaging per the SLP-Gas Leitfaden |
+| MaLo-ID Bildungsvorschrift & Prüfziffer | BDEW Anwendungshilfe *Die neue Marktlokations-Identifikationsnummer* (v1.0, 28.04.2017) |
+| MeLo-ID / Zählpunktbezeichnung | VDE-AR-N 4400 / DVGW G 2000 — structure only; there is no check digit |
 | Warmwasser-Wärmemenge | HeizkostenV § 9 Abs. 2 |
 | Netzverluste | § 22 Abs. 1 EnWG |
 | Jahresmehr-/-mindermengen | GPKE Kap. 8.4 (BK6-24-174) |

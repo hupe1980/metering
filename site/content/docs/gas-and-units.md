@@ -1,7 +1,7 @@
 +++
 title = "Gas conversion and units"
-description = "m³ to kWh_Hs under MessEG and DVGW G 685, why the Betriebsvolumen matters, and unit normalisation that refuses to guess."
-weight = 7
+description = "m³ to kWh_Hs under MessEG and DVGW G 685, the SigLinDe gas SLP arithmetic, the 06:00 Gastag, and unit normalisation that refuses to guess."
+weight = 8
 +++
 
 ## The formula and why it is lawful
@@ -74,6 +74,59 @@ is `MTQ`.
 Each factor is kept as an exact rational rather than a decimal. 1 GJ is
 2500/9 kWh, so 3.6 GJ is exactly 1000 kWh with no residue — multiplying before
 dividing rounds once, at the end, instead of once per reading.
+
+## The gas SLP — SigLinDe, published in full
+
+Unlike the 2025 electricity profiles, whose value tables are licensed, the gas
+SLP procedure is published in full: the BDEW/VKU/GEODE Leitfaden *"Abwicklung
+von Standardlastprofilen Gas"* prints the profile function, the temperature
+weighting, the weekday factors and every coefficient set. `metering::gas_slp`
+implements that arithmetic:
+
+```text
+f_sigmoid(ϑ) = A / (1 + (B / (ϑ − ϑ₀))^C) + D          ϑ₀ = 40 °C
+f_linear(ϑ)  = max{ mH·ϑ + bH ;  mW·ϑ + bW }
+h(ϑ)         = f_sigmoid(ϑ) + f_linear(ϑ)
+
+Q(D) = KW · h(ϑ_D) · F_WT
+```
+
+```rust
+use metering::gas_slp::{SigLinDe, allocation_temperature};
+use metering::{gas_daily_quantity, kundenwert};
+use rust_decimal::dec;
+
+// The temperature entering h is a geometric series over four days — the
+// heat stored in buildings — and the division is exact (weights are eighths).
+let theta = allocation_temperature(dec!(5.0), dec!(2.5), dec!(2.5), dec!(5.0));
+assert_eq!(theta, dec!(4));
+
+// DE_HEF34 is the published single-family-home reference set, normalised so
+// h(8 °C) = 1.00000 — which the test suite reproduces from the printed row.
+let h = SigLinDe::DE_HEF34.h_value(theta);
+let q = gas_daily_quantity(dec!(60.3423), h, dec!(1));
+assert!(q > dec!(90));
+# let _ = kundenwert(dec!(1), dec!(1));
+```
+
+The **Kundenwert** — the customer's consumption on a day where `h = 1` — comes
+from a metered reference period as `KW = Q / Σ(h·F)`, weekday factors must sum
+to exactly 7.0000 for the standard week, and a gesetzlicher Feiertag takes the
+Sunday factor, nationwide by default and per-Land on request — all as the
+Leitfaden specifies. The older pure-sigmoid TUM profiles are the special case
+with zero linear parts.
+
+## The Gastag runs 06:00 to 06:00
+
+Gas is balanced on **gas days**, not calendar days: a Gastag runs from 06:00
+local to 06:00 the next morning. Summing a gas Lastgang over the calendar day
+books the 00:00–06:00 draw into the wrong Bilanzierungstag — six hours, every
+day. `calendar::gas_day_start_utc`, `gas_day_end_utc` and `local_gas_day` own
+the boundary.
+
+One consequence worth knowing: the clocks change at 02:00/03:00 local, *before*
+the 06:00 boundary — so the 23- or 25-hour Gastag is the one named after the
+**Saturday**, not the transition Sunday.
 
 ## Warm water under HeizkostenV § 9 Abs. 2
 

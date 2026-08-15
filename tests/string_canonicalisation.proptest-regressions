@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc b4357efffe9ea4662a33c8cd73766421fef9ed9162f4d592a02cb5abc57a1ecd # shrinks to id = MaloId { digits: [49, 48, 48, 48, 48, 48, 48, 48, 48, 48, 57] }, pos = 7, bump = 5

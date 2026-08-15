@@ -37,6 +37,26 @@ The transitions come from the IANA tz database via `time-tz`, so historical ones
 are right too: Germany's 1980 transition was on 6 April, not the last Sunday in
 March.
 
+## The Gastag is a different day
+
+Gas balances on the **Gastag** — 06:00 local to 06:00 the next morning — not
+on the calendar day. The calendar module owns that boundary too:
+
+```rust
+use metering::calendar;
+use time::macros::{date, datetime};
+
+// Winter: 06:00 CET is 05:00 UTC.
+assert_eq!(calendar::gas_day_start_utc(date!(2026 - 01 - 15)), datetime!(2026-01-15 5:00 UTC));
+
+// 05:30 local still belongs to the previous Gastag.
+assert_eq!(calendar::local_gas_day(datetime!(2026-07-15 3:30 UTC)), date!(2026 - 07 - 14));
+```
+
+The clocks change at 02:00/03:00 local — *before* the 06:00 boundary — so the
+23- or 25-hour Gastag is the one named after the **Saturday**, not the
+transition Sunday. The SLP-Gas Leitfaden calls this out explicitly.
+
 ## No fixed second count for a calendar period
 
 `IntervalResolution::fixed_seconds()` returns `None` for `Day`, `Month` and

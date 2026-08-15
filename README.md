@@ -7,9 +7,10 @@
 [![License](https://img.shields.io/crates/l/metering.svg)](#-license)
 
 **German energy metering domain library for Rust.** Europe/Berlin calendar
-arithmetic, Zählerstandsgang → Lastgang, gas m³→kWh_Hs, Ersatzwertbildung, a
-robust validation engine, EN 50160, §14a Modul 3 tariff registers, virtual
-meters (§42b EnWG) and Jahresprognose.
+arithmetic (including the 06:00 Gastag), Zählerstandsgang → Lastgang, gas
+m³→kWh_Hs and the SigLinDe gas SLP, Ersatzwertbildung, a robust validation
+engine, EN 50160, §14a Modul 3 tariff registers, virtual meters (§42b EnWG),
+check-digit-validated MaLo-IDs and Jahresprognose.
 
 > 🧊 **Zero I/O** · ⏱️ **no async** · 🕰️ **no clock** · 🔢 **exact decimal quantities**
 
@@ -108,12 +109,13 @@ it. It asserts its own invariants, so CI runs it as a test.
 
 | Area | What it does | Guide |
 |---|---|---|
-| **Calendar** | Berlin days, months, years; DST-correct interval counts; Bundesland holidays | [→](https://hupe1980.github.io/metering/docs/time-and-calendar/) |
+| **Calendar** | Berlin days, months, years **and the 06:00 Gastag**; DST-correct interval counts; Bundesland holidays | [→](https://hupe1980.github.io/metering/docs/time-and-calendar/) |
 | **Readings** | Zählerstandsgang → Lastgang, register rollover, meter exchange | [→](https://hupe1980.github.io/metering/docs/readings/) |
-| **Validation** | Order-independent rules V01–V12, Hampel outlier test, A/B/C/F grading | [→](https://hupe1980.github.io/metering/docs/validation/) |
+| **Identifiers** | `MaloId` with the BDEW check digit verified at the parse; `MeloId` | [→](https://hupe1980.github.io/metering/docs/identifiers/) |
+| **Validation** | Order-independent rules V01–V12 (V10 retired), Hampel outlier test, A/B/C/F grading | [→](https://hupe1980.github.io/metering/docs/validation/) |
 | **Ersatzwerte** | Four methods, calendar-aware grid, audit trail of what actually ran | [→](https://hupe1980.github.io/metering/docs/substitute-values/) |
 | **Tariff registers** | HT/NT and §14a Modul 3 in one mechanism | [→](https://hupe1980.github.io/metering/docs/tariff-registers/) |
-| **Gas & units** | m³→kWh_Hs, G 685 rounding, exact-rational unit normalisation | [→](https://hupe1980.github.io/metering/docs/gas-and-units/) |
+| **Gas & units** | m³→kWh_Hs, G 685 rounding, the SigLinDe gas SLP, exact-rational unit normalisation | [→](https://hupe1980.github.io/metering/docs/gas-and-units/) |
 | **Power quality** | EN 50160 as the statistical test it actually is | [→](https://hupe1980.github.io/metering/docs/power-quality/) |
 | **Virtual meters** | Sum, Residual, GGV allocation (§42b EnWG) | [→](https://hupe1980.github.io/metering/docs/virtual-meters/) |
 | **End to end** | The full MSB pipeline as a runnable example | [→](https://hupe1980.github.io/metering/docs/pipeline/) |

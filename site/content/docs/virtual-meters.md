@@ -1,7 +1,7 @@
 +++
 title = "Virtual meters"
 description = "§ 42b EnWG Gemeinschaftliche Gebäudeversorgung: constant and proportional PV allocation, and the two caps that apply."
-weight = 9
+weight = 10
 +++
 
 A virtual meter derives one series from others.

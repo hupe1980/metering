@@ -6,9 +6,8 @@
 //! - **§ 2 MsbG** — registrierende Lastgangmessung and intelligentes Messsystem.
 //! - **§ 41a Abs. 2 EnWG** — suppliers with more than 100 000 Letztverbraucher
 //!   must offer a dynamic tariff to customers who *have* an iMSys. Note this is
-//!   an obligation on the **supplier**, not a resolution mandate on the meter;
-//!   earlier releases read it as "iMSys require 15-minute resolution", which
-//!   the provision does not say.
+//!   an obligation on the **supplier**, not a resolution mandate on the
+//!   meter.
 //!
 //! ## What this classifies, and what it cannot
 //!
@@ -49,6 +48,20 @@ pub enum Messtyp {
 }
 
 impl Messtyp {
+    /// Every Messtyp, in declaration order.
+    pub const ALL: [Self; 3] = [Self::Slp, Self::Rlm, Self::IMsys];
+
+    /// Stable DB/wire label. Matches the `serde` tag and
+    /// [`FromStr`](std::str::FromStr) input.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Slp => "SLP",
+            Self::Rlm => "RLM",
+            Self::IMsys => "I_MSYS",
+        }
+    }
+
     /// `true` when the Messtyp supports Spitzenleistung (peak demand) billing.
     #[must_use]
     pub fn supports_spitzenleistung(&self) -> bool {
@@ -76,7 +89,8 @@ impl Messtyp {
 ///
 /// # Returns
 ///
-/// `None` when `intervals` is empty or every interval is zero-length.
+/// `None` when `intervals` is empty, every interval is zero-length, or the
+/// median is too long to be a resolution at all.
 #[must_use]
 pub fn detect_interval_length(intervals: &[MeterInterval]) -> Option<IntervalResolution> {
     if intervals.is_empty() {
@@ -98,7 +112,11 @@ pub fn detect_interval_length(intervals: &[MeterInterval]) -> Option<IntervalRes
         3300..=3900 => IntervalResolution::Hour,       // 3600 s ± 300 s
         // 23 h … 25 h — a Berlin calendar day at either DST transition.
         82_800..=90_000 => IntervalResolution::Day,
-        other => IntervalResolution::Custom(u32::try_from(other).unwrap_or(u32::MAX)),
+        // Anything else is a non-standard grid. It goes through
+        // `from_seconds`, which normalises: a median landing exactly on a
+        // named length comes back under that name rather than as a second
+        // spelling of it.
+        other => IntervalResolution::from_seconds(u32::try_from(other).ok()?)?,
     })
 }
 
@@ -109,11 +127,9 @@ pub fn detect_interval_length(intervals: &[MeterInterval]) -> Option<IntervalRes
 /// interval length looks like. Nothing else about the transport is decisive, so
 /// this enum has exactly the two answers that matter.
 ///
-/// It replaces a free-text `Option<&str>` that was matched with
-/// `contains("SMGW") || contains("CLS") || contains("IMSYS")`. Substring
-/// matching on a caller-supplied label is a latent misclassification: a source
-/// named `"LEGACY_NON_SMGW_IMPORT"` classified as iMSys, and a gateway feed
-/// labelled `"Gateway"` did not.
+/// A closed enum rather than a free-text label: substring-matching a
+/// caller-supplied string would classify `"LEGACY_NON_SMGW_IMPORT"` as iMSys
+/// and a feed labelled `"Gateway"` as not.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[cfg_attr(feature = "serde", serde(rename_all = "SCREAMING_SNAKE_CASE"))]
@@ -130,6 +146,21 @@ pub enum SeriesOrigin {
 impl SeriesOrigin {
     /// Every variant, in declaration order.
     pub const ALL: [Self; 2] = [Self::SmartMeterGateway, Self::Other];
+
+    /// Stable DB/wire label. Matches the `serde` tag and
+    /// [`FromStr`](std::str::FromStr) input.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::SmartMeterGateway => "SMART_METER_GATEWAY",
+            Self::Other => "OTHER",
+        }
+    }
+}
+
+crate::codes::string_codes! {
+    Messtyp;
+    SeriesOrigin;
 }
 
 /// Classify the metering type from the observed series and, optionally, how it

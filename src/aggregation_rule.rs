@@ -49,13 +49,6 @@
 //! - **BDEW "Anwendungshilfe Beispiele von Berechnungsformeln für das Solarpaket 1"** (25.01.2024 v1.0)
 //! - **MaBiS (BNetzA BK6-07-002)**, in the consolidated Lesefassung of
 //!   **BK6-24-174** — portfolio aggregation for Bilanzkreis settlement
-//!
-//! Earlier releases cited *§42a EEG* for the residual-load rule and
-//! *BK6-22-024* for MaBiS. Neither holds: §42a EnWG is *Mieterstromverträge*
-//! and there is no §42a EEG governing residual metering, while BK6-22-024 is
-//! the *Lieferantenwechsel in 24 Stunden* (LFW24) Festlegung. Residual load is
-//! arithmetic the market does not legislate — two metered series subtracted —
-//! so it now carries no citation at all.
 
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
@@ -68,9 +61,31 @@ use serde::{Deserialize, Serialize};
 /// **GGV rules output the tenant's net grid draw** (Bezug aus dem öffentlichen
 /// Netz nach PV-Abzug) — the metered energy the tenant draws from the grid after
 /// the allocated community PV has been subtracted. This matches the `Malo_i
-/// Verbrauch` formula in the BDEW Anwendungshilfe.
+/// Verbrauch` formula in the BDEW Anwendungshilfe. For the *allocated* amount,
+/// which is what a § 42b or § 42c settlement is actually built on, use
+/// [`compute_ggv_allocation`](crate::compute_ggv_allocation).
+///
+/// ## The `serde` shape
+///
+/// **Internally tagged** on a `kind` field carrying
+/// [`VirtualMeterKind::as_str`], so the discriminator is one spelling at one
+/// fixed path — indexable and queryable as a column value:
+///
+/// ```json
+/// { "kind": "GGV_CONSTANT_ALLOCATION", "plant_melo_id": "…", "fraction": "0.1" }
+/// ```
+///
+/// Internal tagging needs a self-describing format, so this type does **not**
+/// round-trip through bincode or postcard. A rule is configuration, stored once
+/// per delivery point in a queryable document; the hot types a binary format is
+/// chosen for ([`MeterInterval`](crate::MeterInterval),
+/// [`ObisCode`](crate::ObisCode)) are unaffected.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(
+    feature = "serde",
+    serde(tag = "kind", rename_all = "SCREAMING_SNAKE_CASE")
+)]
 pub enum AggregationRule {
     /// Sum of multiple MaLo time series — used for portfolio totals and
     /// Summenmessung (multiple parallel transformers, shared substations).
@@ -99,13 +114,17 @@ pub enum AggregationRule {
         subtract_malo_ids: Vec<String>,
     },
 
-    /// PV self-consumption allocation for a prosumer.
+    /// Net grid exchange at a prosumer's connection point.
     ///
-    /// `self_consumption[t] = min(generation[t], load[t])`
-    /// `grid_feed_in[t] = max(0, generation[t] - load[t])`
-    /// `grid_draw[t] = max(0, load[t] - generation[t])`
+    /// `result[t] = load[t] − generation[t]`, **signed**: positive is draw from
+    /// the grid, negative is feed-in. One series, not three — the rest follow
+    /// from it without further metering:
     ///
-    /// The virtual MaLo represents the **net grid connection point**.
+    /// ```text
+    /// grid_draw[t]        = max(0,  result[t])
+    /// grid_feed_in[t]     = max(0, -result[t])
+    /// self_consumption[t] = min(generation[t], load[t]) = load[t] − grid_draw[t]
+    /// ```
     PvSelfConsumption {
         /// MaLo for the total building load (from grid measurement point).
         grid_malo_id: String,
@@ -214,6 +233,20 @@ pub enum VirtualMeterKind {
 }
 
 impl VirtualMeterKind {
+    /// Stable DB/wire label. Matches the `serde` tag of both this type **and**
+    /// [`AggregationRule`]'s internal `kind` field, and
+    /// [`FromStr`](std::str::FromStr) input.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Sum => "SUM",
+            Self::Residual => "RESIDUAL",
+            Self::PvSelfConsumption => "PV_SELF_CONSUMPTION",
+            Self::GgvConstantAllocation => "GGV_CONSTANT_ALLOCATION",
+            Self::GgvProportionalAllocation => "GGV_PROPORTIONAL_ALLOCATION",
+        }
+    }
+
     /// Every kind, in declaration order.
     pub const ALL: [Self; 5] = [
         Self::Sum,
@@ -222,6 +255,10 @@ impl VirtualMeterKind {
         Self::GgvConstantAllocation,
         Self::GgvProportionalAllocation,
     ];
+}
+
+crate::codes::string_codes! {
+    VirtualMeterKind;
 }
 
 impl From<&AggregationRule> for VirtualMeterKind {

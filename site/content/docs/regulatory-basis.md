@@ -4,8 +4,10 @@ description = "Every provision this library implements, quoted from the publishe
 weight = 11
 +++
 
-Every citation below was checked against the current published text. Where a
-claim could not be verified, the library says so rather than asserting it.
+Every citation below is checked against the current published text — most
+recently in August 2026, against the EDI@Energy versions binding since
+1 April 2026. Where a claim cannot be verified, the library says so rather than
+asserting it.
 
 | Topic | Basis |
 |---|---|
@@ -20,15 +22,18 @@ claim could not be verified, the library says so rather than asserting it.
 | Energy Sharing | § 42c EnWG — in force 1 June 2026; adjacent Bilanzierungsgebiete from 1 June 2028 |
 | Dynamische Tarife | § 41a Abs. 2 EnWG — a duty on large **suppliers**, not a metering mandate |
 | Gas m³ → kWh | § 33 MessEG; § 25 Nr. 4 and Nr. 7 MessEV; DVGW G 685, G 260 |
-| Gas-SLP (SigLinDe), Allokationstemperatur, Kundenwert | BDEW/VKU/GEODE Leitfaden *Abwicklung von Standardlastprofilen Gas* (KoV) — published in full, quoted verbatim |
+| Gas-SLP (SigLinDe), Allokationstemperatur, Kundenwert | BDEW/VKU/GEODE Leitfaden *Abwicklung von Standardlastprofilen Gas*, KoV XV, Stand 27.03.2026, Anlage 6 — published in full, quoted verbatim |
+| Gas-SLP-Codes (15 Typen, inkl. `GHD`) | EDI@Energy *Codeliste TUM- und BDEW-SLP Gas* v1.1, §6.1–6.3 |
 | Gastag 06:00–06:00 | GaBi Gas / Art. 3 Nr. 6 VO (EU) 312/2014; temperature averaging per the SLP-Gas Leitfaden |
 | MaLo-ID Bildungsvorschrift & Prüfziffer | BDEW Anwendungshilfe *Die neue Marktlokations-Identifikationsnummer* (v1.0, 28.04.2017) |
 | MeLo-ID / Zählpunktbezeichnung | VDE-AR-N 4400 / DVGW G 2000 — structure only; there is no check digit |
 | Warmwasser-Wärmemenge | HeizkostenV § 9 Abs. 2 |
 | Netzverluste | § 22 Abs. 1 EnWG |
 | Jahresmehr-/-mindermengen | GPKE Kap. 8.4 (BK6-24-174) |
-| Zeitangaben, UTC vs. gesetzliche deutsche Zeit | EDI@Energy Allgemeine Festlegungen v6.1b, Kap. 3 |
-| OBIS-Wertegruppen | EDI@Energy Codeliste der OBIS-Kennzahlen und Medien; DLMS/COSEM Blue Book |
+| Zeitangaben, UTC vs. gesetzliche deutsche Zeit | EDI@Energy Allgemeine Festlegungen v6.1c, Kap. 3 (verbindlich ab 01.04.2026) |
+| OBIS-Wertegruppen | EDI@Energy *Codeliste der OBIS-Kennzahlen und Medien* v2.5c (verbindlich ab 01.04.2026), §2.1–2.3; DLMS/COSEM Blue Book |
+| Vorzeichen von Mengenangaben | Codeliste v2.5c §2.1 — positiv oder 0, Ausnahme Korrekturenergiemengen |
+| Bilanzierungsmonat Strom 00:00, Gas 06:00 | EDI@Energy Allgemeine Festlegungen v6.1c, Kap. 3.1 |
 | SLP-Typtage, Feiertagskalender | BDEW *Hinweise zu den aktualisierten SLP Strom*, 17.03.2025 |
 | Netzqualität | EN 50160 |
 
@@ -58,6 +63,10 @@ That matters for two provisions commonly still quoted:
 - **VDE-AR-N 4400 thresholds.** A paywalled Anwendungsregel whose text cannot be
   reproduced here, so every threshold is a parameter with a documented default.
 - **EN 50160 unbalance.** Needs phase angles this data does not carry.
+- **Leap seconds.** Allgemeine Festlegungen Kap. 3.9 permits a second-precision
+  timestamp to name one (`23:59:60`); `time::OffsetDateTime` has no such second,
+  so such a value fails at the parse rather than silently becoming `23:59:59`.
+  Interval boundaries are quarter-hours and never land there.
 
 ## A note on § 60 Abs. 6 MsbG
 

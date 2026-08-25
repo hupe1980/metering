@@ -13,13 +13,9 @@
 //! - and any Zählzeitdefinition a Netzbetreiber transmits over UTILTS, with as
 //!   many registers as it likes.
 //!
-//! Earlier releases modelled the first of those separately, as a `TariffWindow`
-//! with hour-granularity bounds and exactly two outcomes. That type is gone. It
-//! could not express Modul 3 — which **every Netzbetreiber has been obliged to
-//! offer since 1 April 2025**, and which has *three* tariff levels — and it
-//! could not express a band starting at half past the hour. Two mechanisms for
-//! one question also meant two places to fix when Feiertage turned out to
-//! matter, and only one of them got fixed.
+//! One mechanism rather than a dedicated two-register type: Modul 3 has
+//! **three** tariff levels and every Netzbetreiber has had to offer it since
+//! 1 April 2025, and Netzbetreiber bands routinely start on the half hour.
 //!
 //! ## Resolution is DST-correct and Feiertag-aware
 //!
@@ -105,6 +101,17 @@ impl DayGroup {
     /// Every variant, in declaration order.
     pub const ALL: [Self; 3] = [Self::Weekdays, Self::WeekdaysAndSaturday, Self::AllDays];
 
+    /// Stable DB/wire label. Matches the `serde` tag and
+    /// [`FromStr`](std::str::FromStr) input.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Weekdays => "WEEKDAYS",
+            Self::WeekdaysAndSaturday => "WEEKDAYS_AND_SATURDAY",
+            Self::AllDays => "ALL_DAYS",
+        }
+    }
+
     /// `true` when `weekday` is inside this group, ignoring holidays.
     #[must_use]
     pub const fn contains(self, weekday: Weekday) -> bool {
@@ -114,6 +121,10 @@ impl DayGroup {
             Self::AllDays => true,
         }
     }
+}
+
+crate::codes::string_codes! {
+    DayGroup;
 }
 
 // ── ZaehlzeitFenster ──────────────────────────────────────────────────────────
@@ -291,8 +302,7 @@ impl Zaehlzeitdefinition {
 
     /// A § 14a EnWG Modul 3 definition: [`HT`], [`NT`] and [`ST`] for the rest.
     ///
-    /// Since **1 April 2025** every Netzbetreiber must offer Modul 3, and its
-    /// three levels are why this crate no longer has a two-register type. The
+    /// Since **1 April 2025** every Netzbetreiber must offer Modul 3. The
     /// bands themselves are the Netzbetreiber's to set; both are given as
     /// `(from_minute, to_minute)` in Berlin local time and may cross midnight.
     ///

@@ -16,14 +16,14 @@
 //! | [`reading`] | `MeterReading` — the Zählerstand, and the ZSG → Lastgang conversion |
 //! | [`obis`] | Typed `ObisCode`, one canonical string per channel |
 //! | [`ids`] | Typed `MaloId` (check-digit validated) and `MeloId` |
-//! | [`calendar`] | Europe/Berlin days, months, years **and the 06:00 Gastag** — DST-correct |
+//! | [`calendar`] | Europe/Berlin days, months, years **and the 06:00 Gastag** — DST-correct; `DayBoundary` |
 //! | [`holiday`] | Bundesland statutory holidays; SLP day typing |
 //! | [`resolution`] | `IntervalResolution` — fixed vs calendar lengths |
 //! | [`conversion`] | Gas m³ → kWh_Hs, unit normalisation, HeizkostenV warm water |
 //! | [`aggregation`] | Billing period: Arbeitsmenge, Spitzenleistung, coverage |
 //! | [`zaehlzeit`] | Tariff registers — HT/NT and § 14a Modul 3 |
 //! | [`mod@resample`] | Down-sampling to Berlin calendar buckets |
-//! | [`validation`] | The rule engine — V01–V09, V11, V12 — order-independent |
+//! | [`validation`] | The rule engine — V01–V09, V11, V12 — order-independent, and it reports which rules ran |
 //! | [`quality`] | Hampel filter, and an A/B/C/F grade over the findings |
 //! | [`substitute`] | Ersatzwertbildung — 4 methods, with an audit trail |
 //! | [`forecast`] | Jahresprognose with a 95 % prediction interval |
@@ -97,14 +97,30 @@
 //! [`holiday`] resolve local windows and dates through the same tz database.
 //!
 //! Interval timestamps themselves are always **UTC**, which is the market's own
-//! split. EDI@Energy *Allgemeine Festlegungen* v6.1b, Kap. 3: *"Die Angabe von
-//! Zeiten in einer EDIFACT Nachricht erfolgt in koordinierter Weltzeit (UTC) …
-//! Alle in den Prozessen genannten Zeitpunkte … nutzen die gesetzliche deutsche
-//! Zeit."*
+//! split. EDI@Energy *Allgemeine Festlegungen zu den EDIFACT- und
+//! XML-Nachrichten* v6.1c (01.10.2025, binding from 01.04.2026), Kap. 3:
+//! *"Die Angabe von Zeiten in einer EDIFACT Nachricht erfolgt in koordinierter
+//! Weltzeit (Coordinated Universal Time, UTC). … Alle in den Prozessen
+//! genannten Zeitpunkte (inkl. der sich unter Berücksichtigung von Fristen
+//! ergebenden Zeitpunkte) nutzen die gesetzliche deutsche Zeit."*
 //!
 //! Because a calendar period has no fixed second count,
 //! [`IntervalResolution::fixed_seconds`] returns `None` for `Day`, `Month` and
 //! `Year` rather than an approximation — see [`calendar::intervals_in_day`].
+//!
+//! **A day is cut in one of two places.** Electricity settles on the Liefertag,
+//! which begins at 00:00 local; gas settles on the **Gastag**, which begins at
+//! 06:00. [`DayBoundary`] carries that choice through
+//! [`ResampleConfig::on`] and [`FillGapsConfig::on`], so a daily, monthly or
+//! yearly gas figure is a whole number of Gastage rather than a calendar total
+//! shifted six hours. The length is unaffected — both are "one day" — which is
+//! why the boundary is a separate parameter and not a resolution.
+//!
+//! Where a local wall-clock time has to become an instant, the two awkward
+//! cases resolve once and consistently: the repeated autumn hour takes the
+//! **earlier** pass, so periods tile; the skipped spring hour is pushed
+//! **forward by the gap**, so 02:30 on the transition Sunday becomes 03:30 —
+//! the convention `java.time`, `chrono` and Python's `zoneinfo` share.
 //!
 //! # One value, one string
 //!
@@ -113,11 +129,32 @@
 //! spellings produces two database keys, two map entries and two "distinct" rows
 //! that mean the same thing, and nothing anywhere reports an error.
 //!
+//! **Every coded enum carries the whole contract**: `ALL`, `CODES`, `as_str`,
+//! [`Display`], [`FromStr`], and a `serde` tag that *is* the `as_str` code.
+//! That last equality is what lets a consumer generate a database `CHECK`
+//! constraint from `CODES` and know the two cannot drift;
+//! `tests/code_contract.rs` asserts all six properties for every one of them.
+//!
 //! - Unit enums ([`Sparte`], [`QualityFlag`], [`MeasurementUnit`]): `as_str`,
 //!   [`Display`], [`FromStr`] and the `serde` tag are the same code.
+//! - A **code** and a **description** are different things, and the types with
+//!   both keep them apart: [`Holiday::as_str`] is `BUSS_UND_BETTAG` and
+//!   [`Holiday::name`] is *"Buß- und Bettag"*; [`RegisterUnit::as_str`] is
+//!   `KILO_WATT_HOUR` and [`RegisterUnit::symbol`] is `kWh`.
+//! - Parsing accepts a few **input aliases** — `WÄRME` for [`Sparte::Waerme`],
+//!   `DE-BY` for [`Bundesland::By`], `ÜNB` for [`MarktRolle::Uenb`] — which are
+//!   never written back. An alias is not a code and is deliberately absent from
+//!   `CODES`.
+//!
+//! [`Holiday::as_str`]: holiday::Holiday::as_str
+//! [`Holiday::name`]: holiday::Holiday::name
+//! [`RegisterUnit::as_str`]: obis::RegisterUnit::as_str
+//! [`RegisterUnit::symbol`]: obis::RegisterUnit::symbol
 //! - [`ObisCode`]: `1-0:1.8.0`. The `*F` group is omitted when F is 255 ("not
 //!   applicable", IEC 62056-6-1) — the spelling MSCONS carries and people type.
-//! - [`IntervalResolution`]: the ISO 8601 duration, `PT15M` / `P1D`.
+//! - [`IntervalResolution`]: the ISO 8601 duration, `PT15M` / `P1D`. Its
+//!   `Custom` payload is opaque ([`CustomSeconds`]), so a length with a name
+//!   cannot also be spelled as a custom one.
 //! - [`MaloId`]: the eleven digits, with the **check digit verified** at the
 //!   parse; [`MeloId`]: the 33-character Zählpunktbezeichnung, uppercased.
 //!
@@ -153,10 +190,6 @@
 //! is a breaking change and will be released as one. `tests/serde_representation.rs`
 //! pins every tag literally so the commitment is mechanical rather than a promise.
 //!
-//! You do not need to define your own storage codes to insulate yourself from
-//! renames here; if you would rather anyway, that is a deliberate choice and not
-//! a hedge against an unstated policy.
-//!
 //! Each unit enum's tag is identical to its `as_str` code, and the two types
 //! with a canonical string ([`ObisCode`], [`IntervalResolution`]) serialise *as*
 //! that string, so `serde`, [`std::fmt::Display`] and [`std::str::FromStr`]
@@ -164,31 +197,47 @@
 //! is an IEC 62056 identifier and `IntervalResolution` an ISO 8601 duration —
 //! both external standards, which no refactor in this crate can rename.
 //!
+//! # A clean report is not the same as a clean series
+//!
+//! Four of the eleven validation rules are **opt-in**: they need a number this
+//! library refuses to invent — a grid spacing, an outlier threshold, a
+//! reference instant, a plant capacity — and leaving the corresponding
+//! [`ValidationConfig`] field `None` turns the rule off. A
+//! [`ValidationResult`] with no issues therefore means *"the rules that ran
+//! found nothing"*, which is weaker than "nothing is wrong".
+//!
+//! So the crate says which ran: [`ValidationConfig::disabled_rules`] before a
+//! run, [`ValidationResult::evaluated`] after one, and
+//! [`ValidationRuleId::enabling_field`] names the setting that would arm a rule.
+//!
+//! ```rust
+//! use metering::{QualityConfig, Sparte, ValidationRuleId};
+//!
+//! // A "now" and a nameplate capacity are not properties of a commodity.
+//! let cfg = QualityConfig::for_sparte(Sparte::Strom);
+//! assert_eq!(cfg.validation.disabled_rules().to_string(), "V08, V12");
+//! assert_eq!(
+//!     ValidationRuleId::ImplausiblePower.enabling_field(),
+//!     Some("max_plant_power_kw"),
+//! );
+//! ```
+//!
 //! # Enum exhaustiveness
 //!
 //! **Domain enums here are exhaustive; only error enums are
-//! `#[non_exhaustive]`.** This is a deliberate choice, not an oversight.
+//! `#[non_exhaustive]`.**
 //!
-//! `#[non_exhaustive]` buys the *library* the freedom to add a variant without
-//! a major version, and charges the *consumer* a wildcard arm for it. That
-//! wildcard is where the cost lands: when a new [`Messtyp`],
-//! [`SubstituteMethod`] or [`QualityFlag`] appears, a consumer mapping this
-//! crate's vocabulary onto their own storage codes wants their build to break,
-//! so a human decides what the new variant means. With a wildcard they instead
-//! get a silent fallback — a reading filed under the wrong Messtyp, a
-//! substitute value attributed to the wrong method. For a crate whose output
-//! ends up on an invoice, a compile error at upgrade time is the cheaper
-//! failure by a wide margin.
+//! `#[non_exhaustive]` charges the consumer a wildcard arm, and that is where
+//! the cost lands: a consumer mapping a new [`Messtyp`] or [`SubstituteMethod`]
+//! onto their own storage codes wants their build to break so a human decides
+//! what it means, not a silent fallback filing a reading under the wrong one.
+//! For output that ends up on an invoice, a compile error at upgrade time is
+//! the cheaper failure. An unfamiliar *error* needs no such protection — a
+//! wildcard still reports a failure — so [`VirtualMeterError`] is marked.
 //!
-//! Error enums are the opposite case, and [`VirtualMeterError`] is marked
-//! accordingly: a consumer that wildcards an unfamiliar error still does the
-//! right thing — it reports a failure — so there is nothing to protect.
-//!
-//! The consequence is that **adding a variant to a domain enum is a breaking
-//! change here**, and will be released as one. Adding a variant to an error enum
-//! is not. Exhaustive `match` over `Sparte::ALL`, `QualityFlag::ALL`,
-//! `MeasurementUnit::ALL` or `LoadProfile::ALL` is a supported pattern, and each
-//! `ALL` is covered by a test that fails if it falls out of step with `CODES`.
+//! So **adding a variant to a domain enum is a breaking change here** and is
+//! released as one, and exhaustive `match` over any `ALL` is a supported
+//! pattern.
 //!
 //! # Quick start — billing period
 //!
@@ -260,6 +309,9 @@
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 
+#[macro_use]
+mod codes;
+
 pub mod aggregation;
 pub mod aggregation_rule;
 pub mod calendar;
@@ -294,7 +346,10 @@ pub mod zaehlzeit;
 
 pub use aggregation::{AggregationConfig, BillingPeriod, aggregate};
 pub use aggregation_rule::{AggregationRule, VirtualMeterKind};
-pub use calendar::{DayKind, day_length, day_start_utc, intervals_in_day, local_day};
+pub use calendar::{
+    DayBoundary, DayKind, day_length, day_start_utc, gas_day_start_utc, intervals_in_day,
+    local_day, local_gas_day,
+};
 pub use classification::{Messtyp, SeriesOrigin, classify_messtyp, detect_interval_length};
 pub use conversion::{
     G685FinalRounding, G685Rounding, GasConversionParams, WarmWaterAdjustments, gas_m3_to_kwh_hs,
@@ -312,7 +367,7 @@ pub use interval::{MeasurementUnit, MeterInterval, QualityFlag, Sparte, UnitScal
 pub use lifecycle::{
     MeterExchangeEvent, MeterLifecycleEvent, MeterLifecycleEventType, MeterStatus,
 };
-pub use load_profile::{DynamicSlpProfile, Dynamization, LoadProfile, SlpDayType};
+pub use load_profile::{DynamicSlpProfile, Dynamization, LoadProfile, SlpDayType, SlpValueTable};
 pub use losses::{NetworkLosses, network_losses};
 pub use measurement_point::{EnergyFlow, MarktRolle, MeasurementPoint};
 pub use measurement_series::{
@@ -321,24 +376,34 @@ pub use measurement_series::{
 pub use obis::{ObisCode, RegisterUnit};
 pub use power_quality::{
     En50160Limits, En50160Report, LimitOutcome, PowerQualityInterval, assess_en50160,
+    exceedance_pct, voltage_percentile,
 };
 pub use quality::{
     K_MAD, QualityConfig, QualityGrade, QualityReport, hampel_filter, hampel_filter_with_floor,
     score_intervals,
 };
 pub use reading::{
-    Anomaly, AnomalyKind, Lastgang, LastgangConfig, MeterReading, Rollover, to_lastgang,
+    Anomaly, AnomalyKind, Lastgang, LastgangConfig, MeterReading, ResultChannel, Rollover,
+    consumption_between, detect_reading_cadence, to_lastgang,
 };
 pub use resample::{ResampleConfig, ResampledBucket, resample};
-pub use resolution::IntervalResolution;
-pub use rollout::{RolloutObligation, classify_rollout_obligation};
-pub use sharing::{Bilanzierungsmethode, Capability, Delivery, SharingReadiness, Zaehlertyp};
+pub use resolution::{CustomSeconds, IntervalResolution};
+pub use rollout::{
+    QuotaScope, ROLLOUT_MILESTONES, RolloutMilestone, RolloutObligation,
+    classify_rollout_obligation, next_milestone,
+};
+pub use sharing::{
+    Bilanzierungsmethode, Capability, Delivery, DeliveryEvidenceInput, EligibilityBasis, Finding,
+    MeteringCapabilityInput, SharingReadiness, Zaehlertyp, assess_capability, assess_delivery,
+};
 pub use substitute::{
     FillGapsConfig, FilledSeries, SubstituteEntry, SubstituteMethod, SubstitutionReason, fill_gaps,
 };
 pub use validation::{
-    ValidationConfig, ValidationIssue, ValidationResult, ValidationRuleId, ValidationSeverity,
-    validate_intervals,
+    RuleSet, ValidationConfig, ValidationIssue, ValidationResult, ValidationRuleId,
+    ValidationSeverity, validate_intervals,
 };
-pub use virtual_meter::{VirtualMeterError, compute_virtual_meter};
+pub use virtual_meter::{
+    GgvInterval, VirtualMeterError, compute_ggv_allocation, compute_virtual_meter,
+};
 pub use zaehlzeit::{DayGroup, ZaehlzeitFenster, Zaehlzeitdefinition};

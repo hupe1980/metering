@@ -7,10 +7,8 @@
 //! It is used for Abschlag sizing, for the SLP Jahresprognose, and for
 //! estimating year-end Mehr-/Mindermengen.
 //!
-//! **Gap filling lives in [`crate::substitute`].** This module used to carry a
-//! second Ersatzwertbildung engine with its own method enum, its own fallback
-//! order and — as it turned out — its own interpolation arithmetic, which
-//! disagreed with the first by one interval. There is now one engine.
+//! **Gap filling lives in [`crate::substitute`].** Fill the series first, then
+//! project from it.
 //!
 //! ## What this does not do
 //!
@@ -85,10 +83,9 @@ impl AnnualForecast {
     ///            + Y  · σ²     (the remaining days vary around it)
     /// ```
     ///
-    /// The first term dominates for a short window — with `Y = 365` and
-    /// `n = 14` it is twenty-six times the second — and it was previously
-    /// omitted entirely, which reported an interval roughly five times too
-    /// narrow.
+    /// The first term dominates for a short window: with `Y = 365` and
+    /// `n = 14` it is twenty-six times the second, so omitting it would report
+    /// an interval roughly five times too narrow.
     ///
     /// What it still does not model: daily sums from a load profile are
     /// **not** independent and not identically distributed. Consumption is
@@ -135,12 +132,6 @@ pub const MIN_OBSERVATION_DAYS: i64 = 7;
 ///
 /// `None` when `intervals` is empty or spans fewer than
 /// [`MIN_OBSERVATION_DAYS`].
-///
-/// The result carries no market-location id. It used to take one as a `&str`
-/// and copy it into the output without reading it — a data-carrying parameter
-/// on a pure computation, and the only thing in this crate that made a
-/// projection non-comparable between two delivery points. The caller knows
-/// which MaLo it asked about.
 ///
 /// ## Example
 ///
@@ -252,7 +243,7 @@ fn prediction_half_width(
 
     let y = f64::from(year_days);
     // Y²σ²/n + Yσ² — the estimation term first, which dominates for short
-    // windows and was previously missing.
+    // windows.
     let total_variance = variance * (y * y / n + y);
     let factor = seasonal_factor.to_f64()?;
     let half = 1.96 * total_variance.sqrt() * factor.abs();

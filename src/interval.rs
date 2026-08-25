@@ -99,31 +99,14 @@ impl Sparte {
 
     /// Every variant, in declaration order.
     pub const ALL: [Self; 4] = [Self::Strom, Self::Gas, Self::Waerme, Self::Wasser];
-
-    /// The accepted [`FromStr`] codes, in the same order as [`ALL`](Self::ALL).
-    pub const CODES: &'static [&'static str] = &["STROM", "GAS", "WAERME", "WASSER"];
 }
 
-impl fmt::Display for Sparte {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-impl FromStr for Sparte {
-    type Err = ParseError;
-
-    /// Parses the [`as_str`](Self::as_str) codes, case-insensitively and
-    /// ignoring surrounding whitespace.
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.trim().to_uppercase().as_str() {
-            "STROM" => Ok(Self::Strom),
-            "GAS" => Ok(Self::Gas),
-            "WAERME" => Ok(Self::Waerme),
-            "WASSER" => Ok(Self::Wasser),
-            _ => Err(ParseError::one_of("Sparte", s, Self::CODES)),
-        }
-    }
+crate::codes::string_codes! {
+    // German callers type the umlaut. `WÄRME` is accepted on the way in;
+    // `WAERME` stays the one spelling that comes out, because a code that has
+    // to survive a database column, a CLI argument and a URL path segment is
+    // not the place for a character with three plausible encodings.
+    Sparte, aliases = [("WÄRME", Self::Waerme)];
 }
 
 /// Unit a meter reading is expressed in.
@@ -159,9 +142,6 @@ impl MeasurementUnit {
 
     /// Every variant, in declaration order.
     pub const ALL: [Self; 2] = [Self::KiloWattHour, Self::CubicMetre];
-
-    /// The canonical codes [`Display`](fmt::Display) writes.
-    pub const CODES: &'static [&'static str] = &["KWH", "M3"];
 
     /// Parse a unit string that is already canonical.
     ///
@@ -218,8 +198,16 @@ impl MeasurementUnit {
 
 impl fmt::Display for MeasurementUnit {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
+        f.pad(self.as_str())
     }
+}
+
+impl MeasurementUnit {
+    /// The canonical codes [`Display`](fmt::Display) writes.
+    ///
+    /// Deliberately narrower than what [`FromStr`] accepts: `m³`, `kWh_th` and
+    /// the UN/ECE Rec 20 codes all read, and exactly two spellings write.
+    pub const CODES: &'static [&'static str] = &["KWH", "M3"];
 }
 
 impl FromStr for MeasurementUnit {
@@ -365,8 +353,7 @@ impl QualityFlag {
     /// single flag, and the only defensible choice is the worst contributor —
     /// a daily total containing one substitute value is not a measured daily
     /// total. The ranking is public so that every aggregation in and outside
-    /// this crate reaches the same verdict; it was previously reimplemented
-    /// three times, and the copies were free to disagree.
+    /// this crate reaches the same verdict.
     ///
     /// The order is by how far the value is from a measurement, not by
     /// billability: `Preliminary` outranks `Estimated` because it is explicitly
@@ -432,50 +419,14 @@ impl QualityFlag {
         Self::Faulty,
         Self::Unknown,
     ];
-
-    /// The accepted [`FromStr`] codes, in the same order as [`ALL`](Self::ALL).
-    pub const CODES: &'static [&'static str] = &[
-        "MEASURED",
-        "ESTIMATED",
-        "SUBSTITUTED",
-        "CALCULATED",
-        "CORRECTED",
-        "PRELIMINARY",
-        "FAULTY",
-        "UNKNOWN",
-    ];
 }
 
-impl fmt::Display for QualityFlag {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-impl FromStr for QualityFlag {
-    type Err = ParseError;
-
-    /// Parses the [`as_str`](Self::as_str) codes, case-insensitively and
-    /// ignoring surrounding whitespace.
-    ///
-    /// Deliberately **not** lenient about unknown input: an unrecognised status
-    /// is not [`Unknown`](Self::Unknown), which is a statement about the
-    /// measurement, but a parse failure, which is a statement about the message.
-    /// Silently mapping one to the other would turn a malformed MSCONS field
-    /// into an unbillable reading with no error anywhere.
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.trim().to_uppercase().as_str() {
-            "MEASURED" => Ok(Self::Measured),
-            "ESTIMATED" => Ok(Self::Estimated),
-            "SUBSTITUTED" => Ok(Self::Substituted),
-            "CALCULATED" => Ok(Self::Calculated),
-            "CORRECTED" => Ok(Self::Corrected),
-            "PRELIMINARY" => Ok(Self::Preliminary),
-            "FAULTY" => Ok(Self::Faulty),
-            "UNKNOWN" => Ok(Self::Unknown),
-            _ => Err(ParseError::one_of("QualityFlag", s, Self::CODES)),
-        }
-    }
+crate::codes::string_codes! {
+    // Deliberately no aliases: an unrecognised status is not `UNKNOWN`, which
+    // is a statement about the measurement, but a parse failure, which is a
+    // statement about the message. Mapping one to the other silently would
+    // turn a malformed MSCONS field into an unbillable reading with no error.
+    QualityFlag;
 }
 
 /// A single metered interval — the energy or volume *in* a period.
@@ -919,7 +870,7 @@ mod code_round_trip_tests {
         assert_eq!(iv.is_import_energy(), Some(true));
         assert_eq!(iv.is_export_energy(), Some(false));
 
-        // The string that used to be accepted unchecked now fails at the parse.
+        // An unparseable code fails at the boundary, not later.
         assert!("not an obis code".parse::<ObisCode>().is_err());
     }
 }

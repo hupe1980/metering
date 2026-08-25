@@ -4,6 +4,291 @@ All notable changes to `metering` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the crate follows
 semver, with the `serde` representation explicitly in scope (see the crate docs).
 
+## [0.19.0] — 2026-08-25
+
+An audit of the invariants the crate states about itself, and of the two places
+its DST correctness stopped short — followed by a round of consumer feedback
+that found a rule which could not fire, a channel that could be mislabelled, and
+twenty-eight enums whose wire form existed only through `serde`. Four defects were found where the code and
+its own documentation disagreed, and one where a `serde` impl existed only at
+compile time. The Gastag, added in 0.18.0 as a set of calendar functions,
+becomes a boundary the daily calculations actually carry. Every removal is a
+hard cut; no deprecated shims.
+
+### Added
+
+- **Every coded enum carries the whole contract**: `ALL`, `CODES`, `as_str`,
+  `Display`, `FromStr`, and a `serde` tag that *is* the `as_str` code. The rule
+  was already stated in the crate docs and held for six enums out of
+  thirty-four; the other twenty-eight had a `serde` tag — so a wire form
+  existed and consumers were storing it — with no way to reach that string
+  without `serde`. `Debug` was the only handle left, and a rename upstream
+  would have gone on writing rows, spelled differently, with nothing failing.
+  `AnomalyKind` is the case that prompted it: it is the audit record for a span
+  that could not be differenced, and a § 146 Abs. 4 AO trail built on `Debug`
+  is a trail that can silently go missing.
+
+  `CODES` is now *computed* from `ALL` in a `const` block, so the two cannot
+  drift and a `CHECK` constraint generated from it cannot drift from what the
+  crate writes. `tests/code_contract.rs` asserts all six properties for all
+  thirty-four enums, and adding one without adding it there is the only escape.
+
+  A **code** and a **description** stay separate where a type has both:
+  `Holiday::as_str()` is `BUSS_UND_BETTAG` and `name()` is *"Buß- und Bettag"*;
+  `RegisterUnit::as_str()` is `KILO_WATT_HOUR` and `symbol()` is `kWh`;
+  `SubstituteMethod::as_str()` is `ZERO_FILL` and `description()` is the German
+  prose an invoice annex prints.
+- **`RuleSet`, `ValidationConfig::enabled_rules` / `disabled_rules`,
+  `ValidationResult::evaluated` / `skipped`, `ValidationRuleId::enabling_field`,
+  `QualityReport::evaluated` / `covers_every_rule` / `skipped_rules`.** Four of
+  the eleven rules are opt-in — they need a grid spacing, an outlier threshold,
+  a reference instant or a plant capacity, none of which this library will
+  invent — and nothing said which were inert. A clean `ValidationResult` read
+  the same whether a rule had run and found nothing or had never run at all.
+
+  Concretely: `QualityConfig::for_sparte`, the documented way to configure per
+  commodity, sets no `max_plant_power_kw`, so **V12 could not fire on that
+  path** while a service built on it could describe V12 as an active
+  Error-severity rule in its docs, its API responses and its operator guide.
+  Declining to invent a nameplate capacity was right; leaving the inertness
+  invisible was not. `disabled_rules()` answers before a run, `evaluated`
+  after one, and the difference between the two is exactly "the data stopped
+  it" rather than "the config did".
+- **`compute_ggv_allocation` and `GgvInterval`.** `compute_virtual_meter`
+  returns a GGV tenant's net grid draw; a § 42b or § 42c settlement is built on
+  the **allocated** energy, and the only way to get it was
+  `max(0, consumption − net)` — which meant re-reading and re-projecting the
+  tenant's own consumption series purely to subtract it back out, and
+  reproducing the `Pos()` cap in the caller where a change to it would never
+  reach them. `GgvInterval` carries `consumption`, `generation`, `share`
+  (before the cap), `allocated`, `net_grid_draw` and `quality`, with
+  `capped()` and `surplus_to_grid()` derived from them. `consumption ==
+  allocated + net_grid_draw` holds exactly in every interval, and
+  `compute_virtual_meter` now *projects* from this result rather than
+  recomputing, so the cap has one implementation.
+- **`ObisCode::as_lastgang` / `as_zaehlerstand` / `as_vorschub`** — the Messart
+  conversion a ZSG → Lastgang pipeline needs. `None` off the electricity axis
+  (value group C is a Messgröße for gas, not a direction) and `None` for a
+  tariff register, because the Codeliste v2.5c defines the Lastgang only as
+  `1-b:1.29.0` and inventing `1-0:1.29.1` would silently collapse HT and NT
+  onto one channel.
+- **`reading::detect_reading_cadence`** — the median spacing of a
+  Zählerstandsgang's timestamps. `detect_interval_length` medians each
+  interval's *duration*, and a `MeterReading` is a point with no duration, so
+  it could not answer "how often is this meter read?" — which is exactly the
+  number `LastgangConfig::with_capacity_kw` needs.
+- **`ResultChannel`** and `LastgangConfig::on_channel` — see the fix below.
+- **`ValidationConfig::at_reference_instant`**, the builder for V08's `now`,
+  matching `with_plant_capacity_kw` for V12.
+- **`Rollover::duration`**, and re-exports for `consumption_between`,
+  `detect_reading_cadence`, `ResultChannel` and `SlpValueTable`.
+- **`calendar::DayBoundary`** — `Midnight` or `Gastag`, with the full period
+  API on it (`day_start_utc`, `day_end_utc`, `local_day`, `day_length`,
+  `intervals_in_day`, and the month and year equivalents). A Gastag is not a
+  different *length* of day, it is the same day cut six hours later, so the
+  choice is a boundary rather than a resolution — which is why it is not a new
+  `IntervalResolution` variant, whose canonical string is an ISO 8601 duration
+  and has nothing to say about phase.
+- **`ResampleConfig::on` / `ResampleConfig::to_gas_daily`** and
+  **`FillGapsConfig::on`** — the boundary carried into the two places a daily
+  grid is actually built. It carries up to months and years too: a gas month
+  runs 06:00 on the first to 06:00 on the first of the next, so a monthly gas
+  total is a whole number of Gastage rather than a calendar month shifted.
+- **`CustomSeconds`** — the opaque payload of `IntervalResolution::Custom`; see
+  the breaking change below.
+- **`QualityGrade: FromStr`**, `QualityGrade::CODES`, and the full
+  `ALL` / `as_str` / `Display` / `FromStr` / `CODES` treatment for
+  `MeterStatus` and `MeterLifecycleEventType`, which had none of it. A grade or
+  a status written to a report column now reads back as itself, like every
+  other code in the crate.
+- **`MeterLifecycleEventType::breaks_register_continuity`** and
+  **`MeterStatus::is_in_service`**.
+- **`load_profile::SlpValueTable`** — a name for the 12 × 3 profile table.
+- Re-exports at the crate root for the entry points that were reachable only
+  through their modules: `assess_capability`, `assess_delivery`, `Finding`,
+  `EligibilityBasis`, `MeteringCapabilityInput`, `DeliveryEvidenceInput`,
+  `next_milestone`, `ROLLOUT_MILESTONES`, `RolloutMilestone`, `QuotaScope`,
+  `voltage_percentile`, `exceedance_pct`, `gas_day_start_utc`, `local_gas_day`.
+  `sharing` exported its enums and not the functions that produce them.
+
+### Fixed
+
+- **V07 now examines every fall-back day the series spans**, not only the one
+  it starts on. The rule keyed off `local_day(first.from)`, so it fired for a
+  single-day query and for nothing else: a month of MSCONS covering 25 October,
+  an annual export, a MaBiS Summenzeitreihe — the deliveries where a collapsed
+  repeated hour is least visible by eye — all passed it silently.
+- **V01 reports any uncovered span, not only a whole missing interval.** A
+  series of exactly-900-second intervals sitting off the grid
+  (`00:00–00:15`, `00:20–00:35`, …) validated completely clean: V01 required a
+  full `expected_interval_secs` before firing and V06 only measures each
+  interval's own length, so five minutes of energy went unaccounted for in
+  every slot with nothing to report it. A hole shorter than the grid says so in
+  its message rather than claiming "0 intervals missing".
+- **A skipped local time now resolves forward.** Turning a Berlin wall-clock
+  time into an instant fell back to reinterpreting the naive time as UTC when
+  the clocks had skipped it, which landed *before* the gap — `shift_back_days`
+  asked for 02:30 on the spring Sunday and returned 01:30 local, while the doc
+  claimed it returned "the instant the clock jumps". It is pushed forward by
+  the length of the gap now (02:30 → 03:30), the convention `java.time`,
+  `chrono` and Python's `zoneinfo` share, and the resolution happens in one
+  place for `day_start_utc`, `gas_day_start_utc`, `shift_back_days` and
+  `shift_back_one_year` alike.
+- **`DynamicSlpProfile` can be serialised.** Its `values` field is a
+  `BTreeMap` keyed by `(u8, SlpDayType)`, and a JSON object key has to be a
+  string — so the derived impl compiled and then failed at run time with *"key
+  must be a string"* on the format the licensed BDEW tables actually arrive in.
+  The `serde` form is a list of `{ month, day_type, values }` records; the
+  in-memory type is unchanged.
+- **`LoadProfile::parse` trims.** Every other parser in the crate tolerates
+  surrounding whitespace; this one rejected `" H0 "`, so a code arriving from a
+  CSV cell or a fixed-width field was a parse failure rather than an H0.
+- **`fill_gaps` labels substitutes with the earliest interval's OBIS code**,
+  not `intervals[0]`'s. The input need not be sorted, and a label that depends
+  on the caller's ordering is not a label.
+- **`compute_virtual_meter`'s `Sum` takes the furthest contributor's end**,
+  not the last one listed, so the result's interval length no longer depends on
+  the order the ids appear in the rule.
+- **A feed-in Zählerstandsgang is no longer relabelled as import.**
+  `LastgangConfig::strom()` stamped a fixed `ObisCode::STROM_BEZUG_LASTGANG` on
+  every interval it derived, so differencing a `1-0:2.8.0` series produced
+  intervals labelled `1-0:1.29.0` — the values right, the channel a lie, and
+  nothing downstream able to see it. `ResultChannel::Derived` relabels each
+  interval from the register it actually came from, and is what `strom()` uses.
+
+### Fixed (regulatory)
+
+- **The `GHD` gas profile exists, and 0.18.0 was wrong to delete it.** That
+  release removed `GasGHD` on the finding that *"no gas SLP is named GHD"* and
+  made `parse("GHD")` a hard error — for a code the market uses. The EDI@Energy
+  *Codeliste TUM- und BDEW-SLP Gas* v1.1 §6.3 lists
+  *"Summenlastprofil Gewerbe, Handel, Dienstleistung"* under the TUM codes
+  `HD3` / `HD4`, and the BDEW/VKU/GEODE Leitfaden publishes its SigLinDe row
+  alongside the other fourteen: `GHD` is the *Stützpunkt* whose coefficients
+  and weekday factors are a weighted mean over the eleven sector profiles, for
+  a delivery point that fits none of them. `LoadProfile::GasGHD` is back, with
+  `is_gas_aggregate()` to tell it from the sector types, and the gas profile
+  count is **fifteen**.
+- **`SigLinDe::DE_HEF34` no longer claims an EDI code.** Its doc read
+  *"Ausprägung `+` (EDI code `1D4`)"*; `1D4` matches no code shape in the
+  Codeliste, and the trailing `34` in the profile name is the SigLinDe
+  **variant** (`33` and `34` differ in how much of the demand the linear part
+  carries), not a Klasse/Ausprägung code. The coefficients themselves are
+  unchanged and remain verified against the printed row by
+  `h(8 °C) = 1.00000`.
+- **Citations updated to the versions in force.** EDI@Energy *Codeliste der
+  OBIS-Kennzahlen und Medien* **v2.5c** (was v2.4b) and *Allgemeine
+  Festlegungen* **v6.1c** (was v6.1b), both binding since 01.04.2026; the
+  BDEW/VKU/GEODE SLP-Gas Leitfaden **KoV XV, Stand 27.03.2026** (was
+  28.10.2025). Every quoted passage was re-checked against the current text
+  rather than carried forward.
+- **`ValidationConfig::negative_energy_is_error` gains its primary source.**
+  Codeliste v2.5c §2.1: *"Die Energieflussrichtung wird mittels der
+  OBIS-Kennzahl definiert. Mit Ausnahme der Übermittlung von
+  Korrekturenergiemengen (hier können die Werte auch negativ sein), sind die
+  Mengenangaben nur mit positiven Werten oder 0 anzugeben."* The former
+  `bidirectional()` rationale — "a bidirectional register" — was not the
+  market's; direction lives in value group C, not in the sign.
+- **`tests/regulatory_showcase.rs` pins the four day-start codings** the
+  Allgemeine Festlegungen Kap. 3.1 prints — Strom `2300`/`2200`, Gas
+  `0500`/`0400` — and the Bilanzierungsmonat worked example, which is the
+  primary source for `DayBoundary`'s month behaviour.
+
+### Changed (breaking)
+
+- **`AggregationRule` is internally tagged** — `{"kind":
+  "GGV_CONSTANT_ALLOCATION", "plant_melo_id": …}` — on
+  `VirtualMeterKind`'s own spelling. The derived form was externally tagged
+  with the Rust variant names, so one discriminator had two spellings
+  (`GgvConstantAllocation` against `GGV_CONSTANT_ALLOCATION`) *and* two
+  positions: a JSON key in one place, a JSON value in the other. Storing a rule
+  as `jsonb` then meant a separate `rule_type` column, because a key cannot be
+  indexed or queried as a value, and a recursive JSON path into the payload,
+  because its depth depended on the variant.
+
+  Stated plainly because it is a real trade: internal tagging needs a
+  self-describing format, so `AggregationRule` will not round-trip through
+  bincode or postcard. A rule is configuration, stored once per delivery point
+  in a queryable document; the hot types a binary format is chosen for
+  (`MeterInterval`, `ObisCode`) are untouched and stay format-agnostic.
+- **`ValidationRuleId`'s `serde` tag is the `Vnn` code.** It serialised as
+  `"GAP_DETECTED"` while `Display` wrote `"V01"` — one rule, two stored forms,
+  neither able to read the other back. `code()` is renamed `as_str()` for
+  consistency with every other coded enum; the string it returns is unchanged.
+- **`Rollover` carries `from` and `to`**, not a single `at`. It and `Anomaly`
+  describe the same shape — *what happened between two readings* — and are
+  routinely logged into one audit table, where a row whose span was `from ==
+  to` because the type only held one instant is not a span.
+- **`LastgangConfig::result_obis: Option<ObisCode>` is now
+  `result_channel: ResultChannel`**, with `Unchanged`, `Derived` and
+  `Fixed(code)`. `labelled(code)` still sets `Fixed`.
+- **`LastgangConfig::with_capacity_kw` takes an `IntervalResolution`**, not raw
+  seconds — pair it with `detect_reading_cadence`. A **calendar** resolution
+  derives the cap from the *longest* that period can be (25 hours for a day,
+  366 days for a year): a ceiling must not reject a legitimate fall-back day,
+  which a flat 24 would have done on every daily-read meter in the country.
+- **`ProvenanceEventType` is `Copy` and `Hash`**, like every other coded enum.
+- **`Sparte`, `Bundesland`, `MarktRolle` and `LoadProfile` accept input
+  aliases** — `WÄRME`, `DE-BY`, `ÜNB`, and the pre-0.18 `EF`/`MF`. An alias is
+  never written back and is deliberately absent from `CODES`.
+  `MarktRolle::as_str()` is ASCII `UENB`; `abbreviation()` keeps the BDEW
+  spelling `ÜNB`.
+- **`IntervalResolution::Custom` carries an opaque `CustomSeconds`.**
+  `Custom(900)` was constructible beside `QuarterHour`: two distinct values
+  meaning one thing — two database keys for one 15-minute grid — and only one
+  of them survived a round trip, since `Custom(900)` writes `"PT900S"` and
+  `"PT900S"` parses back as `QuarterHour`. `CustomSeconds::new` refuses `0`,
+  `900`, `1800` and `3600`, so `IntervalResolution::from_seconds` is the one
+  way in and it normalises. The property tests could not see the hole because
+  their strategy already went through `from_seconds`; they now assert it
+  directly. `Custom(n)` in a pattern becomes `Custom(c) => c.get()`, and
+  `Custom(7200)` in an expression becomes
+  `IntervalResolution::from_seconds(7200).unwrap()`.
+- **`MeterExchangeEvent::exchange_date` is a method, not a field.** It restated
+  what `exchange_at` already determines and was free to contradict it —
+  23:30 UTC on 14 June is already 15 June in Berlin. It is derived through
+  `calendar::local_day` now.
+- **`normalize_to_kwh` no longer accepts `"kvar"`.** Integrating a reactive
+  power over an hour gives kvarh, not kWh; a function named `normalize_to_kwh`
+  returning it put a kvarh figure in a kWh column with nothing to catch it.
+  `"kW"` is unchanged.
+- **`MeasurementPoint`, `MeterLifecycleEvent` and `MeterExchangeEvent` derive
+  `PartialEq` / `Eq`.** Additive in practice, listed here because it adds
+  bounds to the types' generic parameters — they have none, so nothing breaks.
+- **`ResampleConfig` and `FillGapsConfig` gained a `day_boundary` field.**
+  Struct-literal construction needs it; the constructors and builders default
+  it to `Midnight`, which is the previous behaviour.
+
+### Considered and declined
+
+- **A `PlantCapacity` newtype shared by `LastgangConfig` and
+  `ValidationConfig`.** The two *are* the same physical fact at two points in
+  the pipeline — one prevents a bad value from being differenced into
+  existence, the other flags one that arrived already formed — but a newtype
+  over `Decimal` labels that relationship without enforcing anything: both
+  already take kW, and there is nothing to mix them up with. What was missing
+  was the second half of the ceiling, the interval it applies over, and that is
+  now typed (`with_capacity_kw` takes an `IntervalResolution`). The two are
+  cross-documented and a test asserts they agree on the same physical case.
+- **A `capped: bool` field on `GgvInterval`.** It restates `share > allocated`,
+  two numbers already in the struct, and a field that restates what is beside
+  it is a field that can contradict it — the rule this release applied to
+  `MeterExchangeEvent::exchange_date`. It is a method.
+
+### Documentation
+
+- `aggregate` no longer claims to sort its input. It never did, and does not
+  need to: every quantity it computes is order-independent. A test now asserts
+  that rather than the doc asserting it.
+- `AggregationRule::PvSelfConsumption` documented three output series while the
+  engine returned one signed net series. The doc states the one it returns and
+  gives the three derivations that follow from it.
+- The site's design page gains a **"No second copy of a fact"** section, which
+  is the rule behind the derived register unit, the derived exchange date, the
+  computed `worst_quality` and the audit trail that records what ran.
+- The validation, calendar, gas, readings and Ersatzwerte pages are updated for
+  the changes above, and every new snippet is mirrored in `tests/doc_samples.rs`.
+
 ## [0.18.0] — 2026-08-15
 
 Two gaps closed and two identifiers typed. The crate validated OBIS codes to
@@ -41,13 +326,17 @@ daily profile. Every removal remains a hard cut; no deprecated shims.
 
 ### Changed (breaking)
 
-- **The gas `LoadProfile` codes are now the real ones.** `GasEF`/`GasMF`/
-  `GasGHD` (codes `EF`, `MF`, `GHD`) were not BDEW gas profile codes; `GHD`
-  does not exist at all. The gas variants are now the fourteen published
-  TUM/FfE types — `HEF`, `HMF`, `HKO` and the eleven Gewerbe profiles `GKO`,
-  `GHA`, `GMK`, `GBD`, `GGA`, `GBH`, `GWA`, `GGB`, `GBA`, `GPD`, `GMF`.
-  `parse` accepts `EF`/`MF` as lenient aliases; `GHD` is a hard error because
-  there is no profile it could honestly map onto.
+- **The gas `LoadProfile` codes are now the real ones.** `GasEF`/`GasMF`
+  (codes `EF`, `MF`) were not BDEW gas profile codes. The gas variants are now
+  the published TUM/FfE types — `HEF`, `HMF`, `HKO` and the eleven Gewerbe
+  profiles `GKO`, `GHA`, `GMK`, `GBD`, `GGA`, `GBH`, `GWA`, `GGB`, `GBA`,
+  `GPD`, `GMF`. `parse` accepts `EF`/`MF` as lenient aliases.
+
+  > ⚠️ **Corrected in 0.19.0.** This release also deleted `GasGHD` and made
+  > `parse("GHD")` a hard error, on the finding that `GHD` "does not exist at
+  > all". That was wrong — it is the Summenlastprofil Gewerbe, Handel,
+  > Dienstleistung, TUM codes `HD3`/`HD4` — and 0.19.0 restores it. Anything
+  > written against 0.18.0 that mapped `GHD` to an error should be revisited.
 - **`LoadProfile` serde tags now equal the `as_str` codes** for every variant.
   The derived representation wrote the Rust variant names, so `GasEF`
   serialised as `"GasEF"` (not `"EF"`) and `Custom` as `"Custom"` (not

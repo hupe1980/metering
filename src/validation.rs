@@ -16,14 +16,11 @@
 //! | Implausible power | V12 | Average power above the plant's physical capacity |
 //! | Unordered series | V11 | Input was not ascending by `from` — usually a broken merge |
 //!
-//! **V10 does not exist.** It used to be a "register rollover" rule that
-//! compared consecutive `value` and flagged a drop of more than 50 000 kWh.
-//! A [`MeterInterval`] carries the energy *in* one interval, not a cumulative
-//! Zählerstand, so the comparison was meaningless: for it to fire, one
-//! quarter-hour would have had to carry 50 MWh — 200 MW of average load. A
-//! rollover is a property of a meter register and is detected where register
-//! readings live, not here. The number is left unused rather than recycled, so
-//! a stored `V10` row cannot be silently reinterpreted as something else.
+//! **V10 is deliberately unused.** A rollover is a property of a *register*,
+//! and a [`MeterInterval`] carries the energy in one interval rather than a
+//! cumulative Zählerstand — so it is detected in [`crate::reading`], where
+//! readings live. The number stays unused rather than being recycled, so a
+//! stored `V10` cannot be reinterpreted as something else.
 //!
 //! ## Timestamps are UTC
 //!
@@ -61,30 +58,53 @@ pub enum ValidationSeverity {
     Error,
 }
 
+impl ValidationSeverity {
+    /// Every severity, least to most serious.
+    pub const ALL: [Self; 3] = [Self::Info, Self::Warning, Self::Error];
+
+    /// Stable DB/wire label. Matches the `serde` tag and `FromStr` input.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Info => "INFO",
+            Self::Warning => "WARNING",
+            Self::Error => "ERROR",
+        }
+    }
+}
+
 // ── ValidationRuleId ─────────────────────────────────────────────────────────
 
 /// Identifies which validation rule triggered an issue.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[cfg_attr(feature = "serde", serde(rename_all = "SCREAMING_SNAKE_CASE"))]
 pub enum ValidationRuleId {
     /// V01 — an expected interval is missing.
+    #[cfg_attr(feature = "serde", serde(rename = "V01"))]
     GapDetected,
     /// V02 — two intervals cover the same instant.
+    #[cfg_attr(feature = "serde", serde(rename = "V02"))]
     OverlapDetected,
     /// V03 — consumption value is negative (impossible for Bezug-only meters).
+    #[cfg_attr(feature = "serde", serde(rename = "V03"))]
     NegativeEnergy,
     /// V04 — the value is a statistical outlier against its own neighbourhood.
+    #[cfg_attr(feature = "serde", serde(rename = "V04"))]
     StatisticalOutlier,
     /// V05 — consecutive zero values suggest a stuck / frozen meter.
+    #[cfg_attr(feature = "serde", serde(rename = "V05"))]
     SuspiciousZeroRun,
     /// V06 — interval length differs from the expected granularity.
+    #[cfg_attr(feature = "serde", serde(rename = "V06"))]
     InconsistentIntervalLength,
     /// V07 — the DST fall-back hour was collapsed (local time leaked in).
+    #[cfg_attr(feature = "serde", serde(rename = "V07"))]
     DstAmbiguity,
     /// V08 — interval starts after the reference instant.
+    #[cfg_attr(feature = "serde", serde(rename = "V08"))]
     FutureTimestamp,
     /// V09 — quality flag is non-billable (`Faulty` or `Unknown`).
+    #[cfg_attr(feature = "serde", serde(rename = "V09"))]
     NonBillableQuality,
     /// V11 — the series was not sorted ascending by `from`.
     ///
@@ -92,6 +112,7 @@ pub enum ValidationRuleId {
     /// order regardless, so their findings stay correct; this says the *input*
     /// was out of order, which is itself a defect worth surfacing — an MSCONS
     /// series arriving shuffled usually means a broken merge upstream.
+    #[cfg_attr(feature = "serde", serde(rename = "V11"))]
     UnorderedSeries,
     /// V12 — average power over the interval exceeds the plant's capacity.
     ///
@@ -99,6 +120,7 @@ pub enum ValidationRuleId {
     /// value against its neighbours, this compares it against a physical
     /// ceiling the metered plant cannot exceed. A value above it is not
     /// unusual, it is impossible — hence `Error` rather than `Warning`.
+    #[cfg_attr(feature = "serde", serde(rename = "V12"))]
     ImplausiblePower,
 }
 
@@ -118,9 +140,53 @@ impl ValidationRuleId {
         Self::ImplausiblePower,
     ];
 
-    /// The `Vnn` code, as it appears in logs and stored findings.
+    /// The [`ValidationConfig`] field this rule needs before it can fire, or
+    /// `None` for a rule that is always on.
+    ///
+    /// Lets a caller name the missing setting without knowing the rule table:
+    /// *"V12 is off; set `ValidationConfig::max_plant_power_kw`"*.
+    ///
+    /// ```rust
+    /// use metering::{ValidationConfig, ValidationRuleId};
+    ///
+    /// let cfg = ValidationConfig::default();
+    /// for rule in cfg.disabled_rules() {
+    ///     let field = rule.enabling_field().unwrap_or("(always on)");
+    ///     println!("{rule} is off — set ValidationConfig::{field}");
+    /// }
+    /// assert_eq!(
+    ///     ValidationRuleId::ImplausiblePower.enabling_field(),
+    ///     Some("max_plant_power_kw"),
+    /// );
+    /// ```
     #[must_use]
-    pub const fn code(self) -> &'static str {
+    pub const fn enabling_field(self) -> Option<&'static str> {
+        match self {
+            Self::GapDetected | Self::InconsistentIntervalLength => Some("expected_interval_secs"),
+            Self::StatisticalOutlier => Some("outlier_sigma"),
+            Self::FutureTimestamp => Some("now"),
+            Self::ImplausiblePower => Some("max_plant_power_kw"),
+            Self::OverlapDetected
+            | Self::NegativeEnergy
+            | Self::SuspiciousZeroRun
+            | Self::DstAmbiguity
+            | Self::NonBillableQuality
+            | Self::UnorderedSeries => None,
+        }
+    }
+
+    /// This rule's bit position in a [`RuleSet`] — its index in
+    /// [`ALL`](Self::ALL).
+    const fn bit(self) -> u16 {
+        1 << (self as u16)
+    }
+
+    /// The `Vnn` code — the one spelling, shared by `Display`, [`FromStr`] and
+    /// the `serde` tag.
+    ///
+    /// [`FromStr`]: std::str::FromStr
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::GapDetected => "V01",
             Self::OverlapDetected => "V02",
@@ -137,9 +203,168 @@ impl ValidationRuleId {
     }
 }
 
-impl std::fmt::Display for ValidationRuleId {
+crate::codes::string_codes! {
+    ValidationRuleId;
+    ValidationSeverity;
+}
+
+// ── RuleSet ──────────────────────────────────────────────────────────────────
+
+/// A set of [`ValidationRuleId`]s — which rules a configuration arms, and which
+/// a run actually evaluated.
+///
+/// Four of the eleven rules are **opt-in**: they need a number this library
+/// refuses to invent, and leaving the corresponding [`ValidationConfig`] field
+/// `None` turns the rule off. A clean [`ValidationResult`] therefore means *"the
+/// rules that ran found nothing"*, which is weaker than "nothing is wrong" —
+/// so [`ValidationConfig::disabled_rules`] answers before a run,
+/// [`ValidationResult::evaluated`] after one, and the two differ exactly when
+/// the **data** rather than the config stopped a rule.
+///
+/// A bitset: no duplicates, `contains` is a mask, no allocation. It serialises
+/// as a list of codes, never as an integer.
+///
+/// ```rust
+/// use metering::{RuleSet, ValidationConfig, ValidationRuleId as R};
+///
+/// // Nothing is configured beyond the defaults, so three rules are inert.
+/// let cfg = ValidationConfig::default();
+/// assert!(cfg.disabled_rules().contains(R::ImplausiblePower));
+/// assert!(cfg.disabled_rules().contains(R::FutureTimestamp));
+/// assert!(cfg.enabled_rules().contains(R::GapDetected));
+///
+/// // Supplying the ceiling turns V12 on.
+/// let armed = cfg.with_plant_capacity_kw(rust_decimal::dec!(30));
+/// assert!(armed.enabled_rules().contains(R::ImplausiblePower));
+/// assert!(!armed.disabled_rules().contains(R::ImplausiblePower));
+/// # assert_eq!(RuleSet::ALL.len(), 11);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct RuleSet(u16);
+
+impl RuleSet {
+    /// The empty set.
+    pub const EMPTY: Self = Self(0);
+
+    /// Every rule.
+    pub const ALL: Self = {
+        let mut bits = 0u16;
+        let mut i = 0;
+        while i < ValidationRuleId::ALL.len() {
+            bits |= ValidationRuleId::ALL[i].bit();
+            i += 1;
+        }
+        Self(bits)
+    };
+
+    /// `true` when `rule` is in the set.
+    #[must_use]
+    pub const fn contains(self, rule: ValidationRuleId) -> bool {
+        self.0 & rule.bit() != 0
+    }
+
+    /// This set plus `rule`.
+    #[must_use]
+    pub const fn with(self, rule: ValidationRuleId) -> Self {
+        Self(self.0 | rule.bit())
+    }
+
+    /// This set minus `rule`.
+    #[must_use]
+    pub const fn without(self, rule: ValidationRuleId) -> Self {
+        Self(self.0 & !rule.bit())
+    }
+
+    /// Every rule **not** in this set.
+    #[must_use]
+    pub const fn complement(self) -> Self {
+        Self(Self::ALL.0 & !self.0)
+    }
+
+    /// The rules in both sets.
+    #[must_use]
+    pub const fn intersection(self, other: Self) -> Self {
+        Self(self.0 & other.0)
+    }
+
+    /// The rules in either set.
+    #[must_use]
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    /// How many rules are in the set.
+    #[must_use]
+    pub const fn len(self) -> usize {
+        self.0.count_ones() as usize
+    }
+
+    /// `true` when the set is empty.
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    /// The rules in the set, in [`ValidationRuleId::ALL`] order.
+    pub fn iter(self) -> impl Iterator<Item = ValidationRuleId> {
+        ValidationRuleId::ALL
+            .into_iter()
+            .filter(move |r| self.contains(*r))
+    }
+}
+
+impl FromIterator<ValidationRuleId> for RuleSet {
+    fn from_iter<I: IntoIterator<Item = ValidationRuleId>>(iter: I) -> Self {
+        iter.into_iter().fold(Self::EMPTY, Self::with)
+    }
+}
+
+impl IntoIterator for RuleSet {
+    type Item = ValidationRuleId;
+    type IntoIter = std::vec::IntoIter<ValidationRuleId>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter().collect::<Vec<_>>().into_iter()
+    }
+}
+
+impl std::fmt::Display for RuleSet {
+    /// The codes, comma-separated — `"V01, V02, V03"` — or `"none"`.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.code())
+        if self.is_empty() {
+            return f.write_str("none");
+        }
+        let mut first = true;
+        for rule in self.iter() {
+            if !first {
+                f.write_str(", ")?;
+            }
+            f.write_str(rule.as_str())?;
+            first = false;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "serde")]
+mod rule_set_serde {
+    use super::{RuleSet, ValidationRuleId};
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    impl Serialize for RuleSet {
+        /// A list of codes — `["V01","V02"]` — never the integer, which would
+        /// silently change meaning if a variant were ever reordered.
+        fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            serializer.collect_seq(self.iter().map(ValidationRuleId::as_str))
+        }
+    }
+
+    impl<'de> Deserialize<'de> for RuleSet {
+        fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            Ok(Vec::<ValidationRuleId>::deserialize(deserializer)?
+                .into_iter()
+                .collect())
+        }
     }
 }
 
@@ -248,7 +473,7 @@ pub struct ValidationConfig {
     /// test into "deviates by more than `min_sigma`".
     ///
     /// Default: `0.0`, which suits electricity. See
-    /// [`QualityConfig::for_sparte`](crate::QualityConfig::for_sparte) for the
+    /// [`QualityConfig::for_sparte`](crate::QualityConfig::for_sparte)(crate::QualityConfig::for_sparte) for the
     /// media-specific values.
     pub outlier_min_sigma: f64,
 
@@ -259,8 +484,17 @@ pub struct ValidationConfig {
 
     /// Treat negative energy as an Error (V03).
     ///
-    /// Set to `false` for a bidirectional register, where a net-metered value
-    /// legitimately goes below zero. Default: `true`.
+    /// The default is the market's own rule. EDI@Energy *Codeliste der
+    /// OBIS-Kennzahlen und Medien* v2.5c, §2.1: *"Die Energieflussrichtung wird
+    /// mittels der OBIS-Kennzahl definiert. Mit Ausnahme der Übermittlung von
+    /// Korrekturenergiemengen (hier können die Werte auch negativ sein), sind
+    /// die Mengenangaben nur mit positiven Werten oder 0 anzugeben."* Direction
+    /// lives in value group C — `1-b:1.x.y` against `1-b:2.x.y` — not in the
+    /// sign, so a negative quantity on a MaKo channel is a defect.
+    ///
+    /// Set to `false` for the two cases where a signed series is correct: a
+    /// Korrekturenergiemenge, and a derived series such as the residual load
+    /// [`crate::virtual_meter`] computes. Default: `true`.
     pub negative_energy_is_error: bool,
 
     /// Reference instant for V08. `None` disables the check.
@@ -312,8 +546,9 @@ impl ValidationConfig {
         }
     }
 
-    /// Configuration for a bidirectional register, where negative values are
-    /// legitimate.
+    /// Configuration for a series where a negative value is legitimate — a
+    /// Korrekturenergiemenge, or a derived signed series. See
+    /// [`negative_energy_is_error`](ValidationConfig::negative_energy_is_error).
     #[must_use]
     pub fn bidirectional() -> Self {
         Self {
@@ -332,10 +567,27 @@ impl ValidationConfig {
         self
     }
 
-    /// Set the physical capacity ceiling (kW) for V12.
+    /// Set the physical capacity ceiling (kW) for V12, arming the rule.
+    ///
+    /// The same physical fact as
+    /// [`LastgangConfig::with_capacity_kw`](crate::reading::LastgangConfig::with_capacity_kw),
+    /// expressed at the other end of the pipeline: that one *prevents* a bad
+    /// value from being differenced into existence, this one *flags* one that
+    /// arrived already formed.
     #[must_use]
     pub fn with_plant_capacity_kw(mut self, kw: Decimal) -> Self {
         self.max_plant_power_kw = Some(kw);
+        self
+    }
+
+    /// Set the reference instant for V08, arming the rule.
+    ///
+    /// A parameter rather than a clock read — see the crate-level
+    /// **Determinism** section. Callers holding a clock pass
+    /// `OffsetDateTime::now_utc()`.
+    #[must_use]
+    pub fn at_reference_instant(mut self, now: OffsetDateTime) -> Self {
+        self.now = Some(now);
         self
     }
 
@@ -346,6 +598,59 @@ impl ValidationConfig {
         self.period = Some((from, to));
         self
     }
+
+    /// The rules this configuration permits to fire.
+    ///
+    /// Config-level only. Whether a rule then *ran* on a particular series is
+    /// [`ValidationResult::evaluated`], which can be smaller.
+    #[must_use]
+    pub fn enabled_rules(&self) -> RuleSet {
+        use ValidationRuleId as R;
+        let mut set = RuleSet::EMPTY
+            .with(R::OverlapDetected)
+            .with(R::SuspiciousZeroRun)
+            .with(R::DstAmbiguity)
+            .with(R::NonBillableQuality)
+            .with(R::UnorderedSeries);
+        if self.negative_energy_is_error {
+            set = set.with(R::NegativeEnergy);
+        }
+        if self.expected_interval_secs.is_some_and(|s| s > 0) {
+            set = set.with(R::GapDetected).with(R::InconsistentIntervalLength);
+        }
+        if self.outlier_sigma.is_some_and(|t| t.is_finite() && t > 0.0) && self.outlier_window > 0 {
+            set = set.with(R::StatisticalOutlier);
+        }
+        if self.now.is_some() {
+            set = set.with(R::FutureTimestamp);
+        }
+        if self.max_plant_power_kw.is_some() {
+            set = set.with(R::ImplausiblePower);
+        }
+        set
+    }
+
+    /// The rules this configuration leaves **inert** — the complement of
+    /// [`enabled_rules`](Self::enabled_rules).
+    ///
+    /// Log it at startup or assert on it in a test; each rule's
+    /// [`enabling_field`](ValidationRuleId::enabling_field) names the setting
+    /// that would switch it on.
+    ///
+    /// ```rust
+    /// use metering::{QualityConfig, Sparte, ValidationRuleId};
+    ///
+    /// // A "now" and a nameplate capacity are not properties of a commodity,
+    /// // so the per-commodity defaults leave V08 and V12 off.
+    /// let cfg = QualityConfig::for_sparte(Sparte::Strom);
+    /// let off = cfg.validation.disabled_rules();
+    /// assert!(off.contains(ValidationRuleId::ImplausiblePower));
+    /// assert_eq!(off.to_string(), "V08, V12");
+    /// ```
+    #[must_use]
+    pub fn disabled_rules(&self) -> RuleSet {
+        self.enabled_rules().complement()
+    }
 }
 
 // ── Validation result ─────────────────────────────────────────────────────────
@@ -355,9 +660,24 @@ impl ValidationConfig {
 pub struct ValidationResult {
     /// All issues found, ordered by interval index.
     pub issues: Vec<ValidationIssue>,
+
+    /// The rules that were actually evaluated on this call.
+    ///
+    /// **A clean result means "these rules found nothing", not "nothing is
+    /// wrong".** A rule missing from [`ValidationConfig::enabled_rules`] was
+    /// switched off by the config; one missing only here was stopped by the
+    /// data — V04 needs more points than its window is wide.
+    /// [`skipped`](Self::skipped) is the complement.
+    pub evaluated: RuleSet,
 }
 
 impl ValidationResult {
+    /// The rules that did **not** run, for whatever reason.
+    #[must_use]
+    pub fn skipped(&self) -> RuleSet {
+        self.evaluated.complement()
+    }
+
     /// `true` when there are no validation issues of any severity.
     #[must_use]
     pub fn is_clean(&self) -> bool {
@@ -429,6 +749,7 @@ pub fn validate_intervals(
     config: &ValidationConfig,
 ) -> ValidationResult {
     let mut issues: Vec<ValidationIssue> = Vec::new();
+    let enabled = config.enabled_rules();
 
     if intervals.is_empty() {
         // An empty series still fails a declared period: nothing arrived at all.
@@ -438,7 +759,13 @@ pub fn validate_intervals(
         {
             issues.push(gap_issue(from, to, secs, None));
         }
-        return ValidationResult { issues };
+        // Nothing else can have run: every other rule needs an interval to
+        // look at. Reporting `enabled` here would claim ten clean rules over
+        // an empty series.
+        return ValidationResult {
+            issues,
+            evaluated: enabled.intersection(RuleSet::EMPTY.with(ValidationRuleId::GapDetected)),
+        };
     }
 
     // Evaluate the adjacency rules in timestamp order while still reporting the
@@ -479,9 +806,16 @@ pub fn validate_intervals(
 
     // Deterministic output: by interval index, then by rule, so two runs over
     // the same data produce byte-identical reports.
-    issues.sort_by_key(|i| (i.interval_index.unwrap_or(usize::MAX), i.rule_id.code()));
+    issues.sort_by_key(|i| (i.interval_index.unwrap_or(usize::MAX), i.rule_id.as_str()));
 
-    ValidationResult { issues }
+    // What actually ran: everything the config armed, less the one rule whose
+    // window the data was too short for.
+    let mut evaluated = enabled;
+    if !outlier_window_fits(intervals.len(), config) {
+        evaluated = evaluated.without(ValidationRuleId::StatisticalOutlier);
+    }
+
+    ValidationResult { issues, evaluated }
 }
 
 // ── per-interval rules (V03, V05, V06, V08, V09, V12) ────────────────────────
@@ -648,6 +982,17 @@ fn expected_length_secs(iv: &MeterInterval, expected_secs: u32) -> i64 {
 /// series is unreachable. And a global mean has no notion of the daily shape,
 /// so on any profile with a real day/night swing the quiet hours are compared
 /// against a threshold set by the busy ones.
+/// Whether a series of `len` intervals is long enough for the V04 window.
+///
+/// A window needs more points than it has room for, or every point is its own
+/// median and nothing can deviate. This is the one rule the *data* can switch
+/// off rather than the configuration, which is why
+/// [`ValidationResult::evaluated`] can be smaller than
+/// [`ValidationConfig::enabled_rules`].
+fn outlier_window_fits(len: usize, config: &ValidationConfig) -> bool {
+    config.outlier_window > 0 && len > config.outlier_window * 2
+}
+
 fn outlier_rule(
     intervals: &[MeterInterval],
     order: &[usize],
@@ -657,9 +1002,7 @@ fn outlier_rule(
         return Vec::new();
     };
     let k = config.outlier_window;
-    // A window needs more points than it has room for, or every point is its
-    // own median and nothing can deviate.
-    if k == 0 || order.len() <= k * 2 {
+    if !outlier_window_fits(order.len(), config) {
         return Vec::new();
     }
 
@@ -699,10 +1042,22 @@ fn gap_issue(
 ) -> ValidationIssue {
     let gap_secs = (to - from).whole_seconds();
     let count = gap_secs / i64::from(expected_secs);
+    // A hole shorter than one interval is not "n intervals missing" — it is a
+    // series that does not sit on the grid at all, which is a different defect
+    // and needs saying differently. It is still an Error: the energy in that
+    // hole is missing either way.
+    let message = if count >= 1 {
+        format!("gap of {count} interval(s) between {from} and {to} — Ersatzwerte required")
+    } else {
+        format!(
+            "{gap_secs} s uncovered between {from} and {to} — shorter than the \
+             {expected_secs} s grid, so the series is off-grid rather than merely short"
+        )
+    };
     let mut issue = ValidationIssue::new(
         ValidationRuleId::GapDetected,
         ValidationSeverity::Error,
-        format!("gap of {count} interval(s) between {from} and {to} — Ersatzwerte required"),
+        message,
     )
     .anchored_at(from);
     issue.interval_index = index;
@@ -749,12 +1104,15 @@ fn gap_rules(
     let Some(expected_secs) = config.expected_interval_secs.filter(|s| *s > 0) else {
         return issues;
     };
-    let step = i64::from(expected_secs);
 
-    // Interior gaps.
+    // Interior gaps. **Any** uncovered second is reported, not only a whole
+    // missing interval: a series whose intervals are the right length but sit
+    // off the grid — 00:00–00:15 then 00:20–00:35 — leaves five minutes
+    // uncovered that V06 cannot see, because every interval is exactly 900 s.
+    // Requiring a full `step` let that pass as clean.
     for window in order.windows(2) {
         let (a, b) = (&intervals[window[0]], &intervals[window[1]]);
-        if (b.from - a.to).whole_seconds() >= step {
+        if b.from > a.to {
             issues.push(gap_issue(a.to, b.from, expected_secs, Some(window[1])));
         }
     }
@@ -764,7 +1122,7 @@ fn gap_rules(
     if let Some((period_from, period_to)) = config.period {
         let first = &intervals[order[0]];
         let last = &intervals[*order.last().expect("non-empty")];
-        if (first.from - period_from).whole_seconds() >= step {
+        if first.from > period_from {
             issues.push(gap_issue(
                 period_from,
                 first.from,
@@ -772,7 +1130,7 @@ fn gap_rules(
                 Some(order[0]),
             ));
         }
-        if (period_to - last.to).whole_seconds() >= step {
+        if period_to > last.to {
             issues.push(gap_issue(last.to, period_to, expected_secs, None));
         }
     }
@@ -804,19 +1162,39 @@ fn gap_rules(
 ///
 /// The rule only judges a series that demonstrably **spans** that window, so a
 /// truncated query window is short rather than corrupt.
+///
+/// Every Berlin calendar day the series spans is examined, not only the first —
+/// a month of MSCONS, an annual export or a MaBiS Summenzeitreihe can each hold
+/// a fall-back day anywhere inside it. The transition comes from the tz
+/// database, which has not always put it on the last Sunday in October.
 fn detect_dst_ambiguity(intervals: &[&MeterInterval]) -> Vec<ValidationIssue> {
     let (Some(first), Some(last)) = (intervals.first(), intervals.last()) else {
         return Vec::new();
     };
 
-    // The repeated hour belongs to the local day the series starts on.
-    let local_day = crate::calendar::local_day(first.from);
-    if crate::calendar::day_kind(local_day) != crate::calendar::DayKind::LongDay {
-        return Vec::new();
+    let mut issues = Vec::new();
+    let end = crate::calendar::local_day(last.to);
+    let mut day = crate::calendar::local_day(first.from);
+    while day <= end {
+        if crate::calendar::day_kind(day) == crate::calendar::DayKind::LongDay
+            && let Some(issue) = collapsed_repeated_hour(intervals, day)
+        {
+            issues.push(issue);
+        }
+        let Some(next) = day.next_day() else { break };
+        day = next;
     }
-    let Some(transition) = crate::calendar::dst_transition_utc(local_day) else {
-        return Vec::new();
-    };
+    issues
+}
+
+/// The V07 finding for one fall-back day, when that day's repeated hour is
+/// demonstrably collapsed.
+fn collapsed_repeated_hour(
+    intervals: &[&MeterInterval],
+    local_day: time::Date,
+) -> Option<ValidationIssue> {
+    let (first, last) = (intervals.first()?, intervals.last()?);
+    let transition = crate::calendar::dst_transition_utc(local_day)?;
 
     let window_start = transition - Duration::hours(1);
     let window_end = transition + Duration::hours(1);
@@ -824,7 +1202,7 @@ fn detect_dst_ambiguity(intervals: &[&MeterInterval]) -> Vec<ValidationIssue> {
     // Only judge a series that covers the window at both ends; anything else is
     // a truncated read, not a collapsed hour.
     if first.from > window_start || last.to < window_end {
-        return Vec::new();
+        return None;
     }
 
     // How much of the two-hour UTC window the series actually covers. A correct
@@ -840,10 +1218,10 @@ fn detect_dst_ambiguity(intervals: &[&MeterInterval]) -> Vec<ValidationIssue> {
 
     const TWO_HOURS: i64 = 2 * 3600;
     if covered >= TWO_HOURS {
-        return Vec::new();
+        return None;
     }
 
-    vec![
+    Some(
         ValidationIssue::new(
             ValidationRuleId::DstAmbiguity,
             ValidationSeverity::Error,
@@ -855,7 +1233,7 @@ fn detect_dst_ambiguity(intervals: &[&MeterInterval]) -> Vec<ValidationIssue> {
             ),
         )
         .anchored_at(window_start),
-    ]
+    )
 }
 
 #[cfg(test)]
@@ -912,7 +1290,7 @@ mod v07_tests {
         );
     }
 
-    /// The false positive this rule used to produce. A gap at **midday** on a
+    /// The false positive this rule must not produce: a gap at **midday** on a
     /// fall-back day is a V01 gap and nothing more — the repeated hour is
     /// intact, and saying otherwise sends the reader to the wrong place.
     #[test]
@@ -971,6 +1349,57 @@ mod v07_tests {
         assert_eq!(report.by_rule(ValidationRuleId::DstAmbiguity).count(), 1);
     }
 
+    /// The failure the day walk fixes: a collapsed hour inside a **multi-day**
+    /// delivery. Keying off the day the series starts on meant a month of
+    /// MSCONS, an annual export and every MaBiS Summenzeitreihe escaped V07
+    /// entirely — the very deliveries where the loss is invisible by eye.
+    #[test]
+    fn a_collapsed_hour_is_found_anywhere_in_the_series() {
+        // 24 Oct (96 quarter-hours) + 25 Oct (100), with the second pass of the
+        // repeated hour dropped.
+        let mut span = qh(datetime!(2026-10-23 22:00 UTC), 96 + 100);
+        span.retain(|iv| {
+            !(iv.from >= datetime!(2026-10-25 1:00 UTC) && iv.from < datetime!(2026-10-25 2:00 UTC))
+        });
+        let issues = detect(&span);
+        assert_eq!(
+            issues.len(),
+            1,
+            "expected V07 on the interior day: {issues:?}"
+        );
+        assert_eq!(issues[0].rule_id, ValidationRuleId::DstAmbiguity);
+        assert!(
+            issues[0].message.contains("2026-10-25"),
+            "{}",
+            issues[0].message
+        );
+
+        // ...and through the public entry point.
+        let report = validate_intervals(&span, &ValidationConfig::default());
+        assert_eq!(report.by_rule(ValidationRuleId::DstAmbiguity).count(), 1);
+
+        // An intact multi-day span raises nothing.
+        assert!(detect(&qh(datetime!(2026-10-23 22:00 UTC), 96 + 100)).is_empty());
+    }
+
+    /// Two fall-back days in one series are two findings.
+    #[test]
+    fn each_fall_back_day_is_judged_on_its_own() {
+        let drop_repeat = |ivs: &mut Vec<MeterInterval>, from: OffsetDateTime| {
+            ivs.retain(|iv| !(iv.from >= from && iv.from < from + Duration::hours(1)));
+        };
+        // 2026-10-25 and 2027-10-31 in one (sparse but contiguous) series would
+        // be a year of data; assemble the two days plus the day between them
+        // instead, which is what the walk actually needs to reach both.
+        let mut a = qh(datetime!(2026-10-24 22:00 UTC), 100);
+        drop_repeat(&mut a, datetime!(2026-10-25 1:00 UTC));
+        assert_eq!(detect(&a).len(), 1);
+
+        let mut b = qh(datetime!(2027-10-30 22:00 UTC), 100);
+        drop_repeat(&mut b, datetime!(2027-10-31 1:00 UTC));
+        assert_eq!(detect(&b).len(), 1);
+    }
+
     /// The rule keys off the calendar, not a hard-coded date.
     #[test]
     fn the_rule_follows_the_tz_database() {
@@ -988,5 +1417,322 @@ mod v07_tests {
             !(iv.from >= datetime!(2027-10-31 1:00 UTC) && iv.from < datetime!(2027-10-31 2:00 UTC))
         });
         assert_eq!(detect(&day).len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod gap_grid_tests {
+    use super::*;
+    use crate::interval::QualityFlag;
+    use rust_decimal::dec;
+    use time::macros::datetime;
+
+    fn iv(from: OffsetDateTime, to: OffsetDateTime) -> MeterInterval {
+        MeterInterval {
+            from,
+            to,
+            value: dec!(1),
+            quality: QualityFlag::Measured,
+            obis_code: None,
+        }
+    }
+
+    /// A hole shorter than one interval is still a hole. V06 cannot see it —
+    /// every interval is the right length — so without this a series sitting
+    /// off the grid validates clean while five minutes of energy per slot goes
+    /// unaccounted for.
+    #[test]
+    fn a_sub_interval_hole_is_still_a_gap() {
+        let series = vec![
+            iv(
+                datetime!(2026-06-01 0:00 UTC),
+                datetime!(2026-06-01 0:15 UTC),
+            ),
+            iv(
+                datetime!(2026-06-01 0:20 UTC),
+                datetime!(2026-06-01 0:35 UTC),
+            ),
+        ];
+        let report = validate_intervals(&series, &ValidationConfig::default());
+        let gaps: Vec<_> = report.by_rule(ValidationRuleId::GapDetected).collect();
+        assert_eq!(gaps.len(), 1, "{:?}", report.issues);
+        assert_eq!(gaps[0].severity, ValidationSeverity::Error);
+        assert!(gaps[0].message.contains("300 s"), "{}", gaps[0].message);
+        assert!(gaps[0].message.contains("off-grid"), "{}", gaps[0].message);
+        // ...while every interval is exactly the expected length, so V06 stays
+        // silent — the two rules answer different questions.
+        assert_eq!(
+            report
+                .by_rule(ValidationRuleId::InconsistentIntervalLength)
+                .count(),
+            0
+        );
+    }
+
+    /// The head and tail of a declared period are held to the same standard.
+    #[test]
+    fn a_sub_interval_hole_at_the_edges_is_reported_too() {
+        let series = vec![iv(
+            datetime!(2026-06-01 0:05 UTC),
+            datetime!(2026-06-01 0:20 UTC),
+        )];
+        let cfg = ValidationConfig::default().over_period(
+            datetime!(2026-06-01 0:00 UTC),
+            datetime!(2026-06-01 0:25 UTC),
+        );
+        let report = validate_intervals(&series, &cfg);
+        assert_eq!(
+            report.by_rule(ValidationRuleId::GapDetected).count(),
+            2,
+            "five minutes short at each end: {:?}",
+            report.issues
+        );
+    }
+
+    /// A contiguous series is still clean — the looser test must not turn
+    /// every boundary into a finding.
+    #[test]
+    fn a_contiguous_series_remains_clean() {
+        let series: Vec<_> = (0..96)
+            .map(|i| {
+                let from = datetime!(2026-06-01 0:00 UTC) + Duration::minutes(15 * i);
+                iv(from, from + Duration::minutes(15))
+            })
+            .collect();
+        let cfg = ValidationConfig::default().over_period(
+            datetime!(2026-06-01 0:00 UTC),
+            datetime!(2026-06-02 0:00 UTC),
+        );
+        assert!(
+            validate_intervals(&series, &cfg).is_clean(),
+            "{:?}",
+            validate_intervals(&series, &cfg).issues
+        );
+    }
+}
+
+#[cfg(test)]
+mod rule_set_tests {
+    use super::*;
+    use crate::interval::QualityFlag;
+    use rust_decimal::dec;
+    use time::macros::datetime;
+
+    fn day(n: i64) -> Vec<MeterInterval> {
+        (0..n)
+            .map(|i| {
+                let from = datetime!(2026-06-01 0:00 UTC) + Duration::minutes(15 * i);
+                MeterInterval {
+                    from,
+                    to: from + Duration::minutes(15),
+                    value: dec!(2),
+                    quality: QualityFlag::Measured,
+                    obis_code: None,
+                }
+            })
+            .collect()
+    }
+
+    /// The failure this exists to surface: the per-commodity configuration
+    /// cannot fire V12, so a service that assumed otherwise would describe an
+    /// Error-severity rule it never evaluated.
+    #[test]
+    fn the_per_commodity_defaults_leave_v12_inert_and_say_so() {
+        let cfg = crate::QualityConfig::for_sparte(crate::Sparte::Strom);
+        let off = cfg.validation.disabled_rules();
+
+        assert!(
+            off.contains(ValidationRuleId::ImplausiblePower),
+            "for_sparte supplies no plant capacity, so V12 cannot fire"
+        );
+        assert!(
+            off.contains(ValidationRuleId::FutureTimestamp),
+            "nor a `now`"
+        );
+        assert_eq!(off.to_string(), "V08, V12");
+        assert_eq!(off.len(), 2);
+
+        // ...and each names the field that would arm it.
+        assert_eq!(
+            ValidationRuleId::ImplausiblePower.enabling_field(),
+            Some("max_plant_power_kw")
+        );
+        assert_eq!(
+            ValidationRuleId::FutureTimestamp.enabling_field(),
+            Some("now")
+        );
+        assert_eq!(ValidationRuleId::OverlapDetected.enabling_field(), None);
+
+        // Supplying the ceiling arms it, and the report then says it ran.
+        let armed = cfg.validation.clone().with_plant_capacity_kw(dec!(30));
+        assert!(
+            armed
+                .enabled_rules()
+                .contains(ValidationRuleId::ImplausiblePower)
+        );
+        let report = validate_intervals(&day(96), &armed);
+        assert!(
+            report
+                .evaluated
+                .contains(ValidationRuleId::ImplausiblePower)
+        );
+        assert!(report.is_clean(), "{:?}", report.issues);
+    }
+
+    /// Every field that can turn a rule off is accounted for, and no rule is
+    /// claimed as enabled without the number it needs.
+    #[test]
+    fn every_optional_field_maps_to_the_rules_it_arms() {
+        use ValidationRuleId as R;
+        let full = ValidationConfig::default()
+            .with_plant_capacity_kw(dec!(30))
+            .at_reference_instant(datetime!(2026-06-02 0:00 UTC));
+        assert_eq!(full.enabled_rules(), RuleSet::ALL);
+        assert!(full.disabled_rules().is_empty());
+
+        for (mutate, expected) in [
+            (
+                Box::new(|c: ValidationConfig| ValidationConfig {
+                    expected_interval_secs: None,
+                    ..c
+                }) as Box<dyn Fn(ValidationConfig) -> ValidationConfig>,
+                vec![R::GapDetected, R::InconsistentIntervalLength],
+            ),
+            (
+                Box::new(|c: ValidationConfig| c.without_outlier_detection()),
+                vec![R::StatisticalOutlier],
+            ),
+            (
+                Box::new(|c: ValidationConfig| ValidationConfig { now: None, ..c }),
+                vec![R::FutureTimestamp],
+            ),
+            (
+                Box::new(|c: ValidationConfig| ValidationConfig {
+                    max_plant_power_kw: None,
+                    ..c
+                }),
+                vec![R::ImplausiblePower],
+            ),
+            (
+                Box::new(|c: ValidationConfig| ValidationConfig {
+                    negative_energy_is_error: false,
+                    ..c
+                }),
+                vec![R::NegativeEnergy],
+            ),
+        ] {
+            let off = mutate(full.clone()).disabled_rules();
+            assert_eq!(
+                off,
+                expected.iter().copied().collect::<RuleSet>(),
+                "expected exactly {expected:?} to go inert"
+            );
+        }
+    }
+
+    /// The config permits a rule; the data can still stop it. V04 needs more
+    /// points than its window is wide, so `evaluated` is the smaller set and
+    /// the difference tells the caller which of the two was responsible.
+    #[test]
+    fn the_data_can_disable_a_rule_the_config_armed() {
+        let cfg = ValidationConfig::default(); // outlier_window = 12
+        assert!(
+            cfg.enabled_rules()
+                .contains(ValidationRuleId::StatisticalOutlier)
+        );
+
+        let short = validate_intervals(&day(20), &cfg);
+        assert!(
+            !short
+                .evaluated
+                .contains(ValidationRuleId::StatisticalOutlier),
+            "20 intervals cannot fill a 25-point window"
+        );
+        assert!(
+            short
+                .skipped()
+                .contains(ValidationRuleId::StatisticalOutlier)
+        );
+
+        let long = validate_intervals(&day(96), &cfg);
+        assert!(
+            long.evaluated
+                .contains(ValidationRuleId::StatisticalOutlier)
+        );
+
+        // The config said yes both times — so the *data* is what differed.
+        assert!(
+            cfg.enabled_rules()
+                .contains(ValidationRuleId::StatisticalOutlier)
+        );
+    }
+
+    /// An empty series evaluates at most V01: there is no interval for any
+    /// other rule to look at, and claiming ten clean rules over nothing would
+    /// be the same lie in a different place.
+    #[test]
+    fn an_empty_series_evaluates_almost_nothing() {
+        let cfg = ValidationConfig::default().over_period(
+            datetime!(2026-06-01 0:00 UTC),
+            datetime!(2026-06-02 0:00 UTC),
+        );
+        let report = validate_intervals(&[], &cfg);
+        assert_eq!(
+            report.evaluated,
+            RuleSet::EMPTY.with(ValidationRuleId::GapDetected)
+        );
+        assert!(report.has_errors());
+
+        // Without a grid there is not even that.
+        let blind = ValidationConfig {
+            expected_interval_secs: None,
+            ..ValidationConfig::default()
+        };
+        assert!(validate_intervals(&[], &blind).evaluated.is_empty());
+    }
+
+    #[test]
+    fn rule_set_is_a_set() {
+        use ValidationRuleId as R;
+        let s = RuleSet::EMPTY.with(R::GapDetected).with(R::GapDetected);
+        assert_eq!(s.len(), 1, "a set holds a rule once");
+        assert!(s.contains(R::GapDetected) && !s.contains(R::OverlapDetected));
+        assert_eq!(s.without(R::GapDetected), RuleSet::EMPTY);
+        assert_eq!(RuleSet::ALL.len(), ValidationRuleId::ALL.len());
+        assert_eq!(RuleSet::ALL.complement(), RuleSet::EMPTY);
+        assert_eq!(RuleSet::EMPTY.complement(), RuleSet::ALL);
+        assert_eq!(RuleSet::EMPTY.to_string(), "none");
+        assert_eq!(
+            RuleSet::ALL.to_string(),
+            "V01, V02, V03, V04, V05, V06, V07, V08, V09, V11, V12"
+        );
+        // Iteration is in ALL order, and collects back to the same set.
+        assert_eq!(RuleSet::ALL.iter().collect::<RuleSet>(), RuleSet::ALL);
+        assert_eq!(
+            RuleSet::ALL.iter().collect::<Vec<_>>(),
+            ValidationRuleId::ALL.to_vec()
+        );
+        assert_eq!(s.union(RuleSet::ALL), RuleSet::ALL);
+        assert_eq!(s.intersection(RuleSet::EMPTY), RuleSet::EMPTY);
+    }
+
+    /// A grade summarises the rules that ran, and says which those were.
+    #[test]
+    fn a_grade_reports_what_it_speaks_for() {
+        let full = crate::QualityConfig {
+            validation: ValidationConfig::default()
+                .with_plant_capacity_kw(dec!(1000))
+                .at_reference_instant(datetime!(2026-06-02 0:00 UTC)),
+            ..crate::QualityConfig::default()
+        };
+        let report = crate::score_intervals(&day(96), &full);
+        assert_eq!(report.grade, crate::QualityGrade::A);
+        assert!(report.covers_every_rule(), "{}", report.skipped_rules());
+
+        // The per-commodity defaults grade A on nine rules, and say so.
+        let partial = crate::score_intervals(&day(96), &crate::QualityConfig::default());
+        assert_eq!(partial.grade, crate::QualityGrade::A);
+        assert!(!partial.covers_every_rule());
+        assert_eq!(partial.skipped_rules().to_string(), "V08, V12");
     }
 }

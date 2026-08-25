@@ -8,7 +8,7 @@ weight = 5
 
 | Rule | ID | Severity | What it catches |
 |---|---|---|---|
-| Gap | V01 | Error | A missing interval, head and tail included |
+| Gap | V01 | Error | Any uncovered span — a missing interval, or a series off the grid |
 | Overlap | V02 | Error | Two intervals covering the same instant |
 | Negative energy | V03 | Error | A value below zero on a single-direction meter |
 | Statistical outlier | V04 | Warning | A value far from its neighbours, by a robust Hampel test |
@@ -18,14 +18,61 @@ weight = 5
 | Future timestamp | V08 | Warning | An interval starting after the reference instant |
 | Non-billable quality | V09 | Error | `Faulty` or `Unknown` |
 | Unordered series | V11 | Warning | Input was not ascending by `from` |
+
+A rule's id is its `Vnn` code everywhere — `Display`, `as_str` and the `serde`
+tag all say `V01` — so a stored finding reads back through the vocabulary it was
+written with.
 | Implausible power | V12 | Error | Average power above the plant's physical capacity |
 
-**V10 is retired, not recycled.** It was a "register rollover" rule comparing
-consecutive interval values for a drop over 50 000 kWh — but a `MeterInterval`
-carries interval energy, not a cumulative Zählerstand, so for it to fire a single
-quarter-hour would have had to carry 50 MWh (200 MW of average load). Rollover
+**V10 is deliberately unused.** A rollover is a property of a *register*, and a
+`MeterInterval` carries interval energy rather than a cumulative Zählerstand, so
 detection lives in [`reading`](@/docs/readings.md). The number stays unused so a
 stored `V10` finding cannot be reinterpreted.
+
+## A clean report is not a clean series
+
+Four of the eleven rules are **opt-in**. They need a number this library refuses
+to invent, and leaving the field `None` turns the rule off:
+
+| Field | Rules it disables when `None` |
+|---|---|
+| `expected_interval_secs` | V01 `GapDetected`, V06 `InconsistentIntervalLength` |
+| `outlier_sigma` | V04 `StatisticalOutlier` |
+| `now` | V08 `FutureTimestamp` |
+| `max_plant_power_kw` | V12 `ImplausiblePower` |
+
+This matters in practice: **`QualityConfig::for_sparte` — the per-commodity
+configuration — sets no `max_plant_power_kw`**, because a nameplate capacity is
+a property of a device, not of a commodity. V12 therefore does not fire on that
+path unless a caller supplies one, and a service that assumed otherwise would
+describe an Error-severity rule it never evaluated.
+
+```rust
+use metering::{QualityConfig, Sparte, ValidationRuleId, ValidationConfig, validate_intervals};
+
+// Before a run: what the configuration permits.
+let cfg = QualityConfig::for_sparte(Sparte::Strom);
+assert_eq!(cfg.validation.disabled_rules().to_string(), "V08, V12");
+
+// Each inert rule names the field that would arm it.
+for rule in cfg.validation.disabled_rules() {
+    let field = rule.enabling_field().unwrap_or("(always on)");
+    println!("{rule} is off — set ValidationConfig::{field}");
+}
+
+// After a run: what actually ran on this series.
+let report = validate_intervals(&[], &ValidationConfig::default());
+assert!(report.skipped().contains(ValidationRuleId::ImplausiblePower));
+```
+
+`enabled_rules()` is the config's answer and `ValidationResult::evaluated` is
+the run's, and the two differ exactly when the **data** — not the config — was
+what stopped a rule: V04 needs more points than its window is wide, so a
+20-interval series evaluates ten rules where a 96-interval one evaluates eleven.
+
+`QualityReport` carries the same set, because a grade condenses whatever ran and
+cannot speak for a rule that did not. `covers_every_rule()` says whether an `A`
+speaks for all eleven.
 
 ## Order independence
 
@@ -57,7 +104,21 @@ assert!(validate_intervals(&delivered, &cfg).has_errors());
 A month whose last week never arrived validates clean without a declared period.
 That is the failure mode that matters most at billing time.
 
-## V07 looks at the repeated hour, not the day
+## V01 reports **any** uncovered span
+
+Not only a whole missing interval. A series of exactly-900-second intervals that
+does not sit on the grid —
+
+```text
+00:00–00:15   00:20–00:35   00:40–00:55  …
+```
+
+— leaves five minutes unaccounted for in every slot, which V06 cannot see
+because every interval is the right length. Any positive hole is an Error; one
+shorter than the grid says so in its message rather than reporting "0 intervals
+missing".
+
+## V07 looks at the repeated hour, on every day the series covers
 
 When CEST ends, local 02:00–03:00 happens **twice** — once at UTC+2, once at
 UTC+1 — and the two passes occupy a two-hour UTC window either side of the
@@ -72,6 +133,12 @@ it sent the reader looking in the wrong place.
 
 A gap at midday is now a V01 gap and nothing else. A genuinely collapsed hour is
 caught even on a day that is otherwise complete.
+
+**Every fall-back day the series spans is examined, not only the first** — a
+month of MSCONS, an annual export or a MaBiS Summenzeitreihe can hold one
+anywhere inside it, and those are the deliveries where a missing hour is
+invisible by eye. The transition comes from the tz database, which has not
+always put it on the last Sunday in October.
 
 `calendar::dst_transition_utc(day)` exposes the anchor if you need to bucket the
 repeated hour yourself.
@@ -111,8 +178,6 @@ letter, for callers who must decide "bill or review" and cannot read a list.
 The B/C line is **severity**, not a count: twenty spike warnings still bill, one
 gap does not.
 
-The grader does not compute its own statistics. It used to — there were three
-scorers with three copies of gap detection, zero-run counting and coverage, each
-subtly different from the validation engine's — and a series could grade `A`
-while validation reported errors on it. There is now one implementation of each
-rule, and a test asserts the two can never disagree.
+The grader computes no statistics of its own: every rule has one
+implementation, in the validation engine, and a test asserts the grade and the
+findings can never disagree.

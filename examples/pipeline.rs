@@ -62,7 +62,7 @@ fn main() {
         &readings,
         &LastgangConfig::strom()
             .with_register_digits(6)
-            .with_capacity_kw(Decimal::from(30), 900),
+            .with_capacity_kw(Decimal::from(30), IntervalResolution::QuarterHour),
     );
     println!(
         "2. Lastgang:  {} intervals, {} rollover(s) reconstructed, {} anomaly/-ies refused",

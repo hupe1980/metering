@@ -173,6 +173,8 @@ fn reading_rollover_section() {
     let wrapped = to_lastgang(&zsg, &cfg);
     assert_eq!(wrapped.intervals[0].value, dec!(3.0));
     assert_eq!(wrapped.rollovers.len(), 1);
+    assert_eq!(wrapped.rollovers[0].from, datetime!(2026-06-01 0:00 UTC));
+    assert_eq!(wrapped.rollovers[0].to, datetime!(2026-06-01 0:15 UTC));
 }
 
 /// Docs — the published eneregio G 685 worked example.
@@ -484,4 +486,262 @@ fn gastag_section() {
     let saturday = calendar::gas_day_end_utc(date!(2026 - 10 - 24))
         - calendar::gas_day_start_utc(date!(2026 - 10 - 24));
     assert_eq!(saturday.whole_hours(), 25);
+}
+
+/// Docs — "The boundary travels with the calculation".
+#[test]
+fn day_boundary_section() {
+    use metering::calendar::DayBoundary;
+    use metering::{FillGapsConfig, ResampleConfig};
+
+    let cfg = ResampleConfig::to_gas_daily();
+    assert_eq!(cfg.day_boundary, DayBoundary::Gastag);
+
+    let fill = FillGapsConfig::new(
+        IntervalResolution::Day,
+        calendar::gas_day_start_utc(date!(2026 - 10 - 23)),
+        calendar::gas_day_start_utc(date!(2026 - 10 - 27)),
+    )
+    .on(DayBoundary::Gastag);
+    assert_eq!(fill.day_boundary, DayBoundary::Gastag);
+
+    // A gas month is a whole number of Gastage.
+    assert_eq!(
+        DayBoundary::Gastag.month_start_utc(date!(2026 - 02 - 14)),
+        calendar::gas_day_start_utc(date!(2026 - 02 - 01))
+    );
+}
+
+/// Docs — "A local time that does not exist, and one that happens twice".
+#[test]
+fn skipped_local_time_section() {
+    let back = calendar::shift_back_days(datetime!(2026-03-30 0:30 UTC), 1);
+    assert_eq!(back, datetime!(2026-03-29 1:30 UTC));
+    assert_eq!(calendar::to_berlin(back).hour(), 3);
+}
+
+/// Docs — "one value per second count".
+#[test]
+fn custom_resolution_section() {
+    use metering::CustomSeconds;
+
+    assert_eq!(CustomSeconds::new(900), None, "900 s is the QuarterHour");
+    assert_eq!(
+        IntervalResolution::from_seconds(900),
+        Some(IntervalResolution::QuarterHour)
+    );
+    // A custom length always writes seconds — one canonical spelling — while
+    // the parser still accepts the hour form.
+    let two_hours = IntervalResolution::from_seconds(7200).unwrap();
+    assert_eq!(two_hours.to_string(), "PT7200S");
+    assert_eq!("PT2H".parse::<IntervalResolution>(), Ok(two_hours));
+    assert_eq!(
+        two_hours.to_string().parse::<IntervalResolution>(),
+        Ok(two_hours)
+    );
+}
+
+/// Docs — "V01 reports any uncovered span".
+#[test]
+fn off_grid_gap_section() {
+    use metering::{ValidationConfig, ValidationRuleId, validate_intervals};
+
+    let series = vec![
+        MeterInterval {
+            from: datetime!(2026-06-01 0:00 UTC),
+            to: datetime!(2026-06-01 0:15 UTC),
+            value: dec!(2.0),
+            quality: QualityFlag::Measured,
+            obis_code: None,
+        },
+        MeterInterval {
+            from: datetime!(2026-06-01 0:20 UTC),
+            to: datetime!(2026-06-01 0:35 UTC),
+            value: dec!(2.0),
+            quality: QualityFlag::Measured,
+            obis_code: None,
+        },
+    ];
+    let report = validate_intervals(&series, &ValidationConfig::default());
+    assert_eq!(report.by_rule(ValidationRuleId::GapDetected).count(), 1);
+    assert!(report.has_errors());
+}
+
+/// Docs — "on every fall-back day the series spans".
+#[test]
+fn multi_day_v07_section() {
+    use metering::{ValidationConfig, ValidationRuleId, validate_intervals};
+
+    let mut span: Vec<MeterInterval> = (0..96 + 100)
+        .map(|i| {
+            let from = datetime!(2026-10-23 22:00 UTC) + time::Duration::minutes(15 * i);
+            MeterInterval {
+                from,
+                to: from + time::Duration::minutes(15),
+                value: dec!(1),
+                quality: QualityFlag::Measured,
+                obis_code: None,
+            }
+        })
+        .collect();
+    span.retain(|iv| {
+        !(iv.from >= datetime!(2026-10-25 1:00 UTC) && iv.from < datetime!(2026-10-25 2:00 UTC))
+    });
+
+    let report = validate_intervals(&span, &ValidationConfig::default());
+    assert_eq!(report.by_rule(ValidationRuleId::DstAmbiguity).count(), 1);
+}
+
+/// Docs — "The Gastag runs 06:00 to 06:00": the boundary on a whole grid.
+#[test]
+fn gas_day_resample_section() {
+    use metering::{ResampleConfig, resample};
+    use time::Duration;
+
+    let start = calendar::gas_day_start_utc(date!(2026 - 01 - 15));
+    let series: Vec<MeterInterval> = (0..48)
+        .map(|i| MeterInterval {
+            from: start + Duration::hours(i),
+            to: start + Duration::hours(i + 1),
+            value: dec!(1),
+            quality: QualityFlag::Measured,
+            obis_code: None,
+        })
+        .collect();
+
+    let gas_days = resample(&series, &ResampleConfig::to_gas_daily());
+    assert_eq!(gas_days.len(), 2);
+    assert_eq!(gas_days[0].total, dec!(24));
+    assert_eq!(gas_days[0].is_complete(), Some(true));
+
+    let calendar_days = resample(
+        &series,
+        &ResampleConfig::new(IntervalResolution::Hour, IntervalResolution::Day),
+    );
+    assert_eq!(calendar_days.len(), 3);
+    assert!(calendar_days[0].has_missing_data());
+}
+
+/// README — "...and gas does not start its day at midnight".
+#[test]
+fn readme_gas_day_section() {
+    use metering::{ResampleConfig, resample};
+    use time::Duration;
+
+    let start = calendar::gas_day_start_utc(date!(2026 - 01 - 15));
+    let series: Vec<MeterInterval> = (0..48)
+        .map(|i| MeterInterval {
+            from: start + Duration::hours(i),
+            to: start + Duration::hours(i + 1),
+            value: dec!(1),
+            quality: QualityFlag::Measured,
+            obis_code: None,
+        })
+        .collect();
+
+    let gas_days = resample(&series, &ResampleConfig::to_gas_daily());
+    assert_eq!(gas_days.len(), 2);
+    assert_eq!(gas_days[0].is_complete(), Some(true));
+
+    let calendar_days = resample(
+        &series,
+        &ResampleConfig::new(IntervalResolution::Hour, IntervalResolution::Day),
+    );
+    assert_eq!(calendar_days.len(), 3);
+}
+
+/// Docs — "Fifteen profiles, and the one this crate wrongly deleted".
+#[test]
+fn gas_ghd_section() {
+    use metering::LoadProfile;
+
+    let ghd = LoadProfile::parse("GHD").expect("a real profile");
+    assert!(ghd.is_gas() && ghd.is_commercial());
+    assert!(ghd.is_gas_aggregate(), "the only aggregate of the fifteen");
+    assert_eq!(LoadProfile::ALL.iter().filter(|p| p.is_gas()).count(), 15);
+}
+
+/// Docs — "The allocated amount, not just the net".
+#[test]
+fn ggv_allocation_section() {
+    use metering::{AggregationRule, compute_ggv_allocation};
+    use std::collections::HashMap;
+
+    let iv = |kwh| {
+        vec![MeterInterval {
+            from: datetime!(2026-06-01 12:00 UTC),
+            to: datetime!(2026-06-01 12:15 UTC),
+            value: kwh,
+            quality: QualityFlag::Measured,
+            obis_code: None,
+        }]
+    };
+    let mut sources = HashMap::new();
+    sources.insert("PLANT".to_owned(), iv(dec!(10)));
+    sources.insert("T1".to_owned(), iv(dec!(1)));
+
+    let rule = AggregationRule::GgvConstantAllocation {
+        plant_melo_id: "PLANT".to_owned(),
+        tenant_melo_id: "T1".to_owned(),
+        fraction: dec!(0.5),
+    };
+    let out = compute_ggv_allocation(&rule, &sources).unwrap();
+
+    assert_eq!(out[0].share, dec!(5.0));
+    assert_eq!(out[0].allocated, dec!(1));
+    assert_eq!(out[0].net_grid_draw, dec!(0));
+    assert!(out[0].capped());
+    assert_eq!(out[0].surplus_to_grid(), dec!(4.0));
+}
+
+/// Docs — "A clean report is not the same as a clean series".
+#[test]
+fn disabled_rules_section() {
+    use metering::{QualityConfig, ValidationRuleId};
+
+    let cfg = QualityConfig::for_sparte(Sparte::Strom);
+    assert_eq!(cfg.validation.disabled_rules().to_string(), "V08, V12");
+    assert_eq!(
+        ValidationRuleId::ImplausiblePower.enabling_field(),
+        Some("max_plant_power_kw")
+    );
+}
+
+/// Docs — "The derived series is a different channel".
+#[test]
+fn messart_conversion_section() {
+    let bezug: ObisCode = "1-0:1.8.0".parse().unwrap();
+    let einspeisung: ObisCode = "1-0:2.8.0".parse().unwrap();
+
+    assert_eq!(bezug.as_lastgang(), Some(ObisCode::STROM_BEZUG_LASTGANG));
+    assert_eq!(
+        einspeisung.as_lastgang(),
+        Some(ObisCode::STROM_EINSPEISUNG_LASTGANG)
+    );
+    assert_eq!(bezug.as_lastgang().unwrap().as_zaehlerstand(), Some(bezug));
+    assert_eq!("1-0:1.8.1".parse::<ObisCode>().unwrap().as_lastgang(), None);
+    assert_eq!(ObisCode::GAS_VOLUME_M3.as_lastgang(), None);
+}
+
+/// Docs — "Cadence comes from the readings".
+#[test]
+fn reading_cadence_section() {
+    use metering::reading::{LastgangConfig, MeterReading, detect_reading_cadence};
+    use rust_decimal::Decimal;
+    use time::Duration;
+
+    let zsg: Vec<MeterReading> = (0..8)
+        .map(|i| {
+            MeterReading::measured(
+                datetime!(2026-06-01 0:00 UTC) + Duration::minutes(15 * i),
+                dec!(1000) + Decimal::from(i),
+            )
+        })
+        .collect();
+
+    let cadence = detect_reading_cadence(&zsg).unwrap();
+    assert_eq!(cadence, IntervalResolution::QuarterHour);
+
+    let cfg = LastgangConfig::strom().with_capacity_kw(dec!(30), cadence);
+    assert_eq!(cfg.max_delta, Some(dec!(7.5)));
 }

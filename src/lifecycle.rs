@@ -40,6 +40,28 @@ pub enum MeterStatus {
     Deployed,
 }
 
+impl MeterStatus {
+    /// Every variant, in declaration order.
+    pub const ALL: [Self; 4] = [Self::Active, Self::Removed, Self::Pending, Self::Deployed];
+
+    /// Stable DB/wire label. Matches the `serde` tag and [`FromStr`](std::str::FromStr) input.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "ACTIVE",
+            Self::Removed => "REMOVED",
+            Self::Pending => "PENDING",
+            Self::Deployed => "DEPLOYED",
+        }
+    }
+
+    /// `true` when the meter can currently produce readings.
+    #[must_use]
+    pub const fn is_in_service(self) -> bool {
+        matches!(self, Self::Active)
+    }
+}
+
 /// Type of lifecycle event affecting a physical meter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
@@ -57,10 +79,48 @@ pub enum MeterLifecycleEventType {
     Recalibrated,
 }
 
+impl MeterLifecycleEventType {
+    /// Every variant, in declaration order.
+    pub const ALL: [Self; 5] = [
+        Self::Installed,
+        Self::Replaced,
+        Self::Removed,
+        Self::Updated,
+        Self::Recalibrated,
+    ];
+
+    /// Stable DB/wire label. Matches the `serde` tag and [`FromStr`](std::str::FromStr) input.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Installed => "INSTALLED",
+            Self::Replaced => "REPLACED",
+            Self::Removed => "REMOVED",
+            Self::Updated => "UPDATED",
+            Self::Recalibrated => "RECALIBRATED",
+        }
+    }
+
+    /// `true` when the event changes which physical register is counting, so a
+    /// reading either side of it cannot be differenced against the other.
+    ///
+    /// [`MeterExchangeEvent`] is the type that pairs the two readings across
+    /// such a break.
+    #[must_use]
+    pub const fn breaks_register_continuity(self) -> bool {
+        matches!(self, Self::Installed | Self::Replaced | Self::Removed)
+    }
+}
+
+crate::codes::string_codes! {
+    MeterStatus;
+    MeterLifecycleEventType;
+}
+
 /// A lifecycle event for a physical meter.
 ///
 /// Stored as an immutable audit log — never updated, only appended.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct MeterLifecycleEvent {
     /// Unique event identifier.
@@ -111,7 +171,7 @@ pub struct MeterLifecycleEvent {
 /// consumption_after  = period_end_reading − new_first_reading
 /// total_period       = consumption_before + consumption_after
 /// ```
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct MeterExchangeEvent {
     /// Unique exchange identifier.
@@ -127,9 +187,13 @@ pub struct MeterExchangeEvent {
     /// First reading of the new meter (kWh).
     pub new_first_reading: Decimal,
     /// Date and time of the exchange (UTC).
+    ///
+    /// The Berlin calendar day a billing period aligns on is derived from it —
+    /// [`exchange_date`](Self::exchange_date) — rather than stored beside it. A
+    /// second copy of one fact is a second thing to keep in step, and the
+    /// timestamp is the one that decides: 23:30 UTC on 14 June is already
+    /// 15 June in Berlin, and a hand-filled date field said otherwise.
     pub exchange_at: OffsetDateTime,
-    /// Calendar date of the exchange (for billing period alignment).
-    pub exchange_date: Date,
     /// BDEW PID that triggered this exchange (typically 23003).
     pub triggered_by_pid: Option<u32>,
     /// INSRPT process ID that reported this exchange.
@@ -139,6 +203,17 @@ pub struct MeterExchangeEvent {
 }
 
 impl MeterExchangeEvent {
+    /// The **Berlin calendar day** the exchange falls on, for billing-period
+    /// alignment.
+    ///
+    /// Derived from [`exchange_at`](Self::exchange_at) through
+    /// [`crate::calendar::local_day`], so it is right across both DST
+    /// transitions and cannot drift out of step with the instant.
+    #[must_use]
+    pub fn exchange_date(&self) -> Date {
+        crate::calendar::local_day(self.exchange_at)
+    }
+
     /// The old meter's final reading, as a [`MeterReading`] at the exchange
     /// instant.
     #[must_use]
@@ -160,13 +235,10 @@ impl MeterExchangeEvent {
     /// Returns the [`Anomaly`] when no honest difference exists — see
     /// [`consumption_between`].
     ///
-    /// These three methods used to return a bare `Decimal` and clamp a
-    /// backwards step to zero, under the name *"rollover protection"*. It was
-    /// the opposite: a Jahresabrechnung whose old register had **wrapped**
-    /// during the period billed **0 kWh** for the whole pre-exchange span, and
-    /// nothing anywhere reported it. Reconstructing the wrap is what
-    /// [`LastgangConfig::register_digits`] is for, and refusing to guess is
-    /// what the `Result` is for.
+    /// The `Result` matters: clamping a backwards step to zero would bill
+    /// **0 kWh** for the whole pre-exchange span of a Jahresabrechnung whose
+    /// old register had wrapped, silently. Reconstructing the wrap is what
+    /// [`LastgangConfig::register_digits`] is for.
     pub fn consumption_old_meter(
         &self,
         period_start: &MeterReading,
@@ -224,7 +296,6 @@ mod tests {
             new_meter_serial: "NEW-5678".to_owned(),
             new_first_reading: dec!(0), // new meter starts at 0
             exchange_at: datetime!(2026-06-15 8:00 UTC),
-            exchange_date: date!(2026 - 06 - 15),
             triggered_by_pid: Some(23003),
             insrpt_process_id: None,
             performed_by: Some("MSB-9900357000004".to_owned()),
@@ -306,5 +377,62 @@ mod tests {
             ex.total_consumption(&start(dec!(12000)), &end(dec!(-5)), &cfg)
                 .is_err()
         );
+    }
+
+    /// The exchange day is derived from the instant, not stored beside it —
+    /// 22:30 UTC on 14 June is already 15 June in Berlin, and a hand-filled
+    /// date field is free to disagree.
+    #[test]
+    fn the_exchange_day_is_derived_from_the_instant() {
+        let mut ex = make_exchange();
+        assert_eq!(ex.exchange_date(), date!(2026 - 06 - 15));
+
+        ex.exchange_at = datetime!(2026-06-14 22:30 UTC); // 00:30 CEST on the 15th
+        assert_eq!(
+            ex.exchange_date(),
+            date!(2026 - 06 - 15),
+            "the Berlin calendar day, not the UTC one"
+        );
+        assert_eq!(ex.exchange_at.date(), date!(2026 - 06 - 14));
+    }
+
+    /// The lifecycle enums carry the same code vocabulary as every other
+    /// domain enum here, so a stored status reads back as itself.
+    #[test]
+    fn lifecycle_codes_round_trip() {
+        assert_eq!(MeterStatus::ALL.len(), MeterStatus::CODES.len());
+        for (v, code) in MeterStatus::ALL.iter().zip(MeterStatus::CODES) {
+            assert_eq!(v.as_str(), *code);
+            assert_eq!(v.to_string(), *code);
+            assert_eq!(&v.to_string().parse::<MeterStatus>().unwrap(), v);
+        }
+        assert_eq!(
+            MeterLifecycleEventType::ALL.len(),
+            MeterLifecycleEventType::CODES.len()
+        );
+        for (v, code) in MeterLifecycleEventType::ALL
+            .iter()
+            .zip(MeterLifecycleEventType::CODES)
+        {
+            assert_eq!(v.as_str(), *code);
+            assert_eq!(
+                &v.to_string().parse::<MeterLifecycleEventType>().unwrap(),
+                v
+            );
+        }
+
+        assert_eq!(
+            " active ".parse::<MeterStatus>().unwrap(),
+            MeterStatus::Active
+        );
+        assert!("GARBAGE".parse::<MeterStatus>().is_err());
+        assert!(MeterStatus::Active.is_in_service());
+        assert!(!MeterStatus::Removed.is_in_service());
+
+        // Only the three events that swap the physical register break the
+        // difference a Lastgang is built from.
+        assert!(MeterLifecycleEventType::Replaced.breaks_register_continuity());
+        assert!(!MeterLifecycleEventType::Updated.breaks_register_continuity());
+        assert!(!MeterLifecycleEventType::Recalibrated.breaks_register_continuity());
     }
 }

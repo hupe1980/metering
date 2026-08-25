@@ -27,9 +27,7 @@
 //!
 //! ## § 60 Abs. 6 MsbG is a deletion duty, not a retention mandate
 //!
-//! This is worth stating plainly because earlier releases of this crate had it
-//! backwards, describing the provision as *"3-year retention with full
-//! provenance for billing data"*. It says the opposite:
+//! It is commonly read as its opposite, so it is worth quoting:
 //!
 //! > Der Messstellenbetreiber muss personenbezogene Messwerte … **löschen oder
 //! > … anonymisieren**, sobald für seine Aufgabenwahrnehmung eine Speicherung
@@ -139,11 +137,8 @@ pub enum MeasurementSource {
     VirtualMeter {
         /// Which rule produced it.
         ///
-        /// A [`VirtualMeterKind`] rather than the free-text `rule_type: String`
-        /// this used to be: the string was written from
-        /// `AggregationRule::rule_type()` and read back by nothing, so a typo
-        /// in a hand-built record was undetectable and a renamed rule variant
-        /// left stale values behind.
+        /// A [`VirtualMeterKind`] rather than free text, so a typo in a
+        /// hand-built record is a compile error rather than a stale value.
         rule: VirtualMeterKind,
         /// Source MaLo / MeLo IDs that contributed to this series.
         source_ids: Vec<String>,
@@ -200,7 +195,7 @@ pub struct ProvenanceEntry {
 }
 
 /// Type of provenance event.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[cfg_attr(feature = "serde", serde(rename_all = "SCREAMING_SNAKE_CASE"))]
 pub enum ProvenanceEventType {
@@ -216,6 +211,36 @@ pub enum ProvenanceEventType {
     Archived,
     /// GDPR erasure request applied.
     Anonymised,
+}
+
+impl ProvenanceEventType {
+    /// Every event type, in declaration order.
+    pub const ALL: [Self; 6] = [
+        Self::Ingested,
+        Self::QualityAssessed,
+        Self::SubstituteGenerated,
+        Self::Corrected,
+        Self::Archived,
+        Self::Anonymised,
+    ];
+
+    /// Stable DB/wire label. Matches the `serde` tag and
+    /// [`FromStr`](std::str::FromStr) input.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Ingested => "INGESTED",
+            Self::QualityAssessed => "QUALITY_ASSESSED",
+            Self::SubstituteGenerated => "SUBSTITUTE_GENERATED",
+            Self::Corrected => "CORRECTED",
+            Self::Archived => "ARCHIVED",
+            Self::Anonymised => "ANONYMISED",
+        }
+    }
+}
+
+crate::codes::string_codes! {
+    ProvenanceEventType;
 }
 
 // ── MeasurementSeries ─────────────────────────────────────────────────────────

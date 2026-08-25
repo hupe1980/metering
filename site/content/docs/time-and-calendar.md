@@ -57,6 +57,43 @@ The clocks change at 02:00/03:00 local — *before* the 06:00 boundary — so th
 23- or 25-hour Gastag is the one named after the **Saturday**, not the
 transition Sunday. The SLP-Gas Leitfaden calls this out explicitly.
 
+### The boundary travels with the calculation
+
+A Gastag is not a shorter or longer day than a Liefertag — it is the same day
+cut six hours later. That makes the choice a *boundary*, not a resolution, and
+`DayBoundary` carries it into the two places a daily grid is actually built:
+
+```rust
+use metering::calendar::{self, DayBoundary};
+use metering::{FillGapsConfig, IntervalResolution, ResampleConfig};
+use time::macros::date;
+
+// Daily gas totals per Gastag rather than per calendar day.
+let cfg = ResampleConfig::to_gas_daily();
+assert_eq!(cfg.day_boundary, DayBoundary::Gastag);
+
+// ...and a gap fill that walks 06:00-to-06:00 slots.
+let fill = FillGapsConfig::new(
+    IntervalResolution::Day,
+    calendar::gas_day_start_utc(date!(2026 - 10 - 23)),
+    calendar::gas_day_start_utc(date!(2026 - 10 - 27)),
+)
+.on(DayBoundary::Gastag);
+assert_eq!(fill.day_boundary, DayBoundary::Gastag);
+
+// ...and the boundary carries up to the month.
+assert_eq!(
+    DayBoundary::Gastag.month_start_utc(date!(2026 - 02 - 14)),
+    calendar::gas_day_start_utc(date!(2026 - 02 - 01)),
+);
+```
+
+It carries all the way up: a gas month runs 06:00 on the first to 06:00 on the
+first of the next, so a monthly gas total is a whole number of Gastage rather
+than a calendar month shifted. Summing a gas Lastgang over the calendar day
+instead books the 00:00–06:00 draw into the wrong Bilanzierungstag — six hours,
+every day, on every delivery point.
+
 ## No fixed second count for a calendar period
 
 `IntervalResolution::fixed_seconds()` returns `None` for `Day`, `Month` and
@@ -65,6 +102,50 @@ and the two it is wrong on are exactly the ones that matter.
 
 `nominal_seconds()` exists for buffer sizing and ordering, and its documentation
 says in as many words never to use it for interval counts.
+
+The fixed resolutions have the opposite property: **exactly one value per second
+count**. `IntervalResolution::Custom` carries an opaque `CustomSeconds` that
+refuses 0, 900, 1800 and 3600, so `Custom(900)` cannot be built alongside
+`QuarterHour`. The two would otherwise have been distinct values meaning one
+thing — two database keys for one 15-minute grid, and only one of them
+surviving a round trip, since `Custom(900)` writes `PT900S` and `PT900S` reads
+back as `QuarterHour`. `from_seconds` is the one constructor and it normalises.
+
+```rust
+use metering::{CustomSeconds, IntervalResolution};
+
+assert_eq!(CustomSeconds::new(900), None, "900 s is the QuarterHour");
+assert_eq!(IntervalResolution::from_seconds(900), Some(IntervalResolution::QuarterHour));
+
+// A custom length always writes seconds; the parser still takes the hour form.
+let two_hours = IntervalResolution::from_seconds(7200).unwrap();
+assert_eq!(two_hours.to_string(), "PT7200S");
+assert_eq!("PT2H".parse::<IntervalResolution>(), Ok(two_hours));
+```
+
+## A local time that does not exist, and one that happens twice
+
+Turning a Berlin wall-clock time into an instant has two awkward cases, and both
+are decided in one place:
+
+- the repeated autumn hour resolves to the **earlier** pass, so consecutive
+  periods tile without overlap;
+- the skipped spring hour is pushed **forward by the gap**, so 02:30 on the
+  transition Sunday becomes 03:30 — the convention `java.time`, `chrono` and
+  Python's `zoneinfo` share.
+
+```rust
+use metering::calendar;
+use time::macros::datetime;
+
+// Monday 02:30 CEST, one day back: Sunday 02:30 does not exist, so 03:30 does.
+let back = calendar::shift_back_days(datetime!(2026-03-30 0:30 UTC), 1);
+assert_eq!(back, datetime!(2026-03-29 1:30 UTC));
+assert_eq!(calendar::to_berlin(back).hour(), 3);
+```
+
+This matters wherever a window is anchored on a local time: the Vergleichstag
+window of `substitute`, and the year-earlier window of `forecast`.
 
 ## Counting days, not durations
 

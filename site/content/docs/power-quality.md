@@ -53,8 +53,7 @@ excluded from the verdict rather than counted as a pass.
 
 `voltage_out_of_range`, `frequency_out_of_range` and friends remain, and are
 useful for spotting a sample worth looking at. They are documented as
-indicators. They are not an EN 50160 verdict, and this crate used to label them
-as one.
+indicators, not as an EN 50160 verdict.
 
 ## Not assessed, deliberately
 

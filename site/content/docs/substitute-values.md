@@ -38,6 +38,10 @@ matching slot one week earlier is 169 UTC hours back across the autumn
 fall-back, and a fixed-duration window would silently drop the reference and
 degrade the method to carry-forward for a week every October.
 
+A daily, monthly or yearly grid is cut at midnight by default and at the 06:00
+Gastag on request — `FillGapsConfig::on(DayBoundary::Gastag)` — so filling a gas
+SLP series produces Gastage rather than Liefertage.
+
 ```rust
 use metering::{FillGapsConfig, IntervalResolution, SubstituteMethod, fill_gaps};
 # use metering::{MeterInterval, QualityFlag};

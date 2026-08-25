@@ -10,15 +10,11 @@
 //!    condenses its findings into one letter, for the case where a caller has
 //!    to decide "bill this or route it to review" and cannot read a list.
 //!
-//! ## Why it does not compute its own statistics
+//! ## It computes no statistics of its own
 //!
-//! It used to. There were three scorers — one over `&[MeterInterval]`, one over
-//! `&[f64]`, and one over `&[f64]` plus a parallel array of nanosecond epochs —
-//! each with its own copy of gap detection, zero-run counting, interval
-//! consistency and coverage, and each subtly different from the validation
-//! engine's copy of the same four rules. A series could be graded `A` while
-//! validation reported errors on it. There is now one implementation of each
-//! rule, in [`crate::validation`], and this module reads its output.
+//! Every rule has one implementation, in [`crate::validation`], and this module
+//! reads its output. A second copy of gap detection or coverage here could
+//! grade a series `A` while validation reported errors on it.
 //!
 //! ## The Hampel filter
 //!
@@ -48,7 +44,8 @@
 
 use crate::interval::{MeterInterval, Sparte};
 use crate::validation::{
-    ValidationConfig, ValidationIssue, ValidationRuleId, ValidationSeverity, validate_intervals,
+    RuleSet, ValidationConfig, ValidationIssue, ValidationRuleId, ValidationSeverity,
+    validate_intervals,
 };
 
 #[cfg(feature = "serde")]
@@ -182,10 +179,8 @@ impl QualityGrade {
     }
 }
 
-impl std::fmt::Display for QualityGrade {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
+crate::codes::string_codes! {
+    QualityGrade;
 }
 
 // ── QualityConfig ─────────────────────────────────────────────────────────────
@@ -292,9 +287,36 @@ pub struct QualityReport {
     /// The findings themselves, so a caller can act on a grade rather than
     /// merely record it.
     pub issues: Vec<ValidationIssue>,
+    /// The validation rules this grade is a summary **of**.
+    ///
+    /// A grade condenses whatever ran; it cannot speak for a rule that did
+    /// not. An `A` on a series where V01 never ran means "no gaps were looked
+    /// for", which is a different statement from "no gaps". See
+    /// [`ValidationResult::evaluated`](crate::ValidationResult::evaluated) and
+    /// [`covers_every_rule`](Self::covers_every_rule).
+    pub evaluated: RuleSet,
 }
 
 impl QualityReport {
+    /// `true` when every rule in the crate was evaluated, so the grade speaks
+    /// for all of them.
+    ///
+    /// `false` is not a defect — [`without_outlier_detection`] is a deliberate
+    /// choice, and a plant capacity is a device property the library will not
+    /// invent — but it is a fact worth logging beside an `A`.
+    ///
+    /// [`without_outlier_detection`]: crate::ValidationConfig::without_outlier_detection
+    #[must_use]
+    pub fn covers_every_rule(&self) -> bool {
+        self.evaluated == RuleSet::ALL
+    }
+
+    /// The rules this grade does **not** speak for.
+    #[must_use]
+    pub fn skipped_rules(&self) -> RuleSet {
+        self.evaluated.complement()
+    }
+
     /// `true` when the grade blocks automated billing.
     #[must_use]
     pub fn blocks_billing(&self) -> bool {
@@ -329,6 +351,16 @@ impl QualityReport {
 /// An empty series grades `F`: there is nothing to bill and nothing to
 /// substitute from.
 ///
+/// ## The grade speaks only for the rules that ran
+///
+/// [`QualityReport::evaluated`] carries them. Four rules are opt-in — they need
+/// a grid spacing, an outlier threshold, a reference instant or a plant
+/// capacity — and [`QualityConfig::for_sparte`] supplies the first two and not
+/// the last two, because a "now" and a nameplate capacity are not properties of
+/// a commodity. So an `A` from `for_sparte` means *"clean on nine rules"*, and
+/// [`QualityReport::covers_every_rule`] says so without the caller having to
+/// know which nine.
+///
 /// # Example
 ///
 /// ```rust
@@ -351,6 +383,7 @@ impl QualityReport {
 #[must_use]
 pub fn score_intervals(samples: &[MeterInterval], cfg: &QualityConfig) -> QualityReport {
     let result = validate_intervals(samples, &cfg.validation);
+    let evaluated = result.evaluated;
     let issues = result.issues;
 
     if samples.is_empty() {
@@ -370,6 +403,7 @@ pub fn score_intervals(samples: &[MeterInterval], cfg: &QualityConfig) -> Qualit
                 .count(),
             intervals_consistent: true,
             issues,
+            evaluated,
         };
     }
 
@@ -408,6 +442,7 @@ pub fn score_intervals(samples: &[MeterInterval], cfg: &QualityConfig) -> Qualit
         blocking_findings,
         intervals_consistent,
         issues,
+        evaluated,
     }
 }
 
@@ -785,6 +820,9 @@ mod grading_tests {
             assert_eq!(g.blocks_billing(), g == QualityGrade::F);
             assert!(!g.as_str().is_empty());
             assert_eq!(g.to_string(), g.as_str());
+            assert_eq!(g.to_string().parse::<QualityGrade>().unwrap(), g);
         }
+        assert_eq!(" b ".parse::<QualityGrade>().unwrap(), QualityGrade::B);
+        assert!("E".parse::<QualityGrade>().is_err());
     }
 }

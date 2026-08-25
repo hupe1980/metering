@@ -42,11 +42,12 @@
 //!   whitespace, and maps them onto the same value.
 //!
 //! The reduced form is not a preference: the EDI@Energy *Codeliste der
-//! OBIS-Kennzahlen und Medien* (v2.4b) states for both electricity and thermal
-//! energy that **"A B C D E werden im deutschen Energiemarkt verwendet"**, and
-//! again that "Wertegruppe F wird für die Kommunikation im deutschen Gasmarkt
-//! nicht verwendet". Every code in that list is printed without a suffix —
-//! `1-b:1.8.e`, `1-b:1.29.0`, `1-1:1.6.0`. Emitting `*255` appended a value
+//! OBIS-Kennzahlen und Medien* v2.5c (01.10.2025, binding from 01.04.2026)
+//! marks both the electricity and the thermal-energy value-group diagram
+//! **"A B C D E werden im deutschen Energiemarkt verwendet"**, and §2.3 states
+//! again that *"Wertegruppe F wird für die Kommunikation im deutschen Gasmarkt
+//! nicht verwendet"*. Every code in that list is printed without a suffix —
+//! `1-b:1.8.e`, `1-b:1.29.0`, `1-b:1.6.0`. Emitting `*255` appended a value
 //! group the German market does not use.
 //!
 //! So `s.parse::<ObisCode>()?.to_string() == s` holds for every canonical `s`,
@@ -97,9 +98,12 @@ pub struct ObisCode {
     /// Medium: 1 = electricity, 5 = cooling, 6 = heat, 7 = gas, 8 = cold water,
     /// 9 = hot water, 4 = Heizkostenverteiler.
     pub a: u8,
-    /// Kanal: 0–65 for electricity (assigned by the MSB and identity-relevant),
-    /// 66 only for Blindmehrarbeit; 0–64 for gas, where B = 10 / 20 select the
-    /// Bilanzierungs- vs. Abrechnungsbrennwert on a thermal Lastgang.
+    /// Kanal. For electricity: *"Die Vergabe des Kanals erfolgt durch den MSB
+    /// (Wertebereich 0 bis 65) und ist für die Identifizierung relevant"*, plus
+    /// 66, which the Codeliste admits only for Blindmehrarbeit und
+    /// Blindmehrleistung im Lieferschein. For gas the valid range is 0–64 and
+    /// the group is irrelevant except on a thermal Lastgang, where B = 10
+    /// selects the Bilanzierungs- and B = 20 the Abrechnungsbrennwert.
     pub b: u8,
     /// Messgröße, and its meaning depends on [`a`](Self::a). For electricity:
     /// 1 = ∑Li Wirkleistung **+** (Bezug), 2 = ∑Li Wirkleistung **−**
@@ -549,8 +553,8 @@ impl ObisCode {
     /// `1-0:1.9.0`, the Lastgang `1-0:1.29.0` and the Maximum `1-0:1.6.0` are
     /// all import.
     ///
-    /// Requiring D = 8 — as this did before 0.16 — reported the Lastgang, the
-    /// single most common code in MSCONS interval data, as *not* import.
+    /// Requiring D = 8 here would report the Lastgang — the commonest code in
+    /// MSCONS interval data — as neither import nor export.
     #[must_use]
     pub fn is_import(&self) -> bool {
         self.a == 1 && self.c == 1
@@ -719,6 +723,101 @@ impl ObisCode {
         }
     }
 
+    /// The **Lastgang** channel of this register — the same measurement as a
+    /// series of energies per equidistant interval (D = 29).
+    ///
+    /// This is the relabelling a Zählerstandsgang → Lastgang conversion owes
+    /// its output. `1-0:1.8.0` differenced into intervals is `1-0:1.29.0`, and
+    /// carrying the Zählerstand code through instead makes every downstream
+    /// register projection treat interval energies as cumulative readings.
+    ///
+    /// `None` off the electricity axis, and for a register the market defines
+    /// no Lastgang for:
+    ///
+    /// - **Not medium 1.** For gas, value group C encodes Messgröße, Quelle,
+    ///   Richtung *and* Qualifikation together and a profile is C = 99, so
+    ///   D = 29 means nothing there — a distinction a medium-blind caller gets
+    ///   wrong.
+    /// - **Not an active or reactive Messgröße** (C = 1…8).
+    /// - **Not the total register.** The Codeliste v2.5c §3.1 lists the
+    ///   Zählerstand as `1-b:1.8.e` — tariff-differentiated — and the Lastgang
+    ///   only as `1-b:1.29.0`. There is no tariff-differentiated Lastgang, so
+    ///   an HT register has no Lastgang code and this refuses to invent one
+    ///   rather than silently collapsing HT and NT onto the same channel.
+    ///   Split a total Lastgang across registers with
+    ///   [`Zaehlzeitdefinition`](crate::Zaehlzeitdefinition) instead.
+    ///
+    /// ```rust
+    /// use metering::ObisCode;
+    ///
+    /// let bezug: ObisCode = "1-0:1.8.0".parse()?;
+    /// assert_eq!(bezug.as_lastgang(), Some(ObisCode::STROM_BEZUG_LASTGANG));
+    ///
+    /// // Direction is preserved — the failure a hard-coded constant makes.
+    /// let einspeisung: ObisCode = "1-0:2.8.0".parse()?;
+    /// assert_eq!(
+    ///     einspeisung.as_lastgang(),
+    ///     Some(ObisCode::STROM_EINSPEISUNG_LASTGANG),
+    /// );
+    ///
+    /// // ...and it round-trips.
+    /// assert_eq!(bezug.as_lastgang().unwrap().as_zaehlerstand(), Some(bezug));
+    ///
+    /// // No Lastgang exists for a tariff register or off the electricity axis.
+    /// assert_eq!("1-0:1.8.1".parse::<ObisCode>()?.as_lastgang(), None);
+    /// assert_eq!(ObisCode::GAS_VOLUME_M3.as_lastgang(), None);
+    /// # Ok::<(), metering::ParseError>(())
+    /// ```
+    #[must_use]
+    pub const fn as_lastgang(&self) -> Option<Self> {
+        if !self.is_convertible_messart() || self.e != 0 {
+            return None;
+        }
+        Some(Self { d: 29, ..*self })
+    }
+
+    /// The **Zählerstand** channel of this register — the cumulative reading
+    /// the Lastgang was differenced out of (D = 8, *Zeitintegral 1*).
+    ///
+    /// The inverse of [`as_lastgang`](Self::as_lastgang), and defined for a
+    /// tariff register too: the Codeliste lists `1-b:1.8.e` across the tariff
+    /// range and `1-b:1.8.63` for the Fehlerregister.
+    ///
+    /// `None` under the same medium and Messgröße conditions as
+    /// [`as_lastgang`](Self::as_lastgang).
+    #[must_use]
+    pub const fn as_zaehlerstand(&self) -> Option<Self> {
+        if !self.is_convertible_messart() {
+            return None;
+        }
+        Some(Self { d: 8, ..*self })
+    }
+
+    /// The **Vorschub** channel of this register — the energy over an arbitrary
+    /// period, i.e. the difference of two Zählerstände (D = 9, *Zeitintegral
+    /// 2*).
+    ///
+    /// This is the honest label for what
+    /// [`consumption_between`](crate::reading::consumption_between) computes: a
+    /// Jahresablesung differenced against the previous one is a Vorschub, not a
+    /// Lastgang, because the period is not part of an equidistant grid.
+    ///
+    /// `None` under the same conditions as [`as_lastgang`](Self::as_lastgang),
+    /// except that a Vorschub, like a Zählerstand, exists per tariff.
+    #[must_use]
+    pub const fn as_vorschub(&self) -> Option<Self> {
+        if !self.is_convertible_messart() {
+            return None;
+        }
+        Some(Self { d: 9, ..*self })
+    }
+
+    /// Whether the Messart conversions above are defined for this code:
+    /// electricity, and an active or reactive Messgröße.
+    const fn is_convertible_messart(&self) -> bool {
+        self.a == 1 && matches!(self.c, 1..=8)
+    }
+
     /// `true` when value group F is [`STORAGE_UNUSED`] — the ordinary case, and
     /// the one where [`Display`](fmt::Display) omits the `*F` suffix.
     ///
@@ -814,6 +913,23 @@ impl RegisterUnit {
         Self::KiloWattHourThermal,
     ];
 
+    /// Stable DB/wire label. Matches the `serde` tag and `FromStr` input.
+    ///
+    /// [`symbol`](Self::symbol) is the display form (`kWh`, `m³`); this is the
+    /// code. They differ deliberately — a symbol carrying a superscript is not
+    /// something to put in a database `CHECK` constraint.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::KiloWattHour => "KILO_WATT_HOUR",
+            Self::KiloVarHour => "KILO_VAR_HOUR",
+            Self::KiloWatt => "KILO_WATT",
+            Self::KiloVar => "KILO_VAR",
+            Self::CubicMetre => "CUBIC_METRE",
+            Self::KiloWattHourThermal => "KILO_WATT_HOUR_THERMAL",
+        }
+    }
+
     /// The unit symbol, as printed on a meter display.
     #[must_use]
     pub const fn symbol(self) -> &'static str {
@@ -836,6 +952,10 @@ impl RegisterUnit {
     pub const fn is_cumulative(self) -> bool {
         !matches!(self, Self::KiloWatt | Self::KiloVar)
     }
+}
+
+crate::codes::string_codes! {
+    RegisterUnit;
 }
 
 /// A stack buffer sized for the longest code [`ObisCode`] can write, so
@@ -1070,11 +1190,10 @@ mod tests {
 }
 
 /// Value-group semantics, against the EDI@Energy *Codeliste der OBIS-Kennzahlen
-/// und Medien* v2.4b (§2.1, §2.2, §3.1).
+/// und Medien* v2.5c (§2.1, §2.2, §2.3, §3.1).
 ///
-/// Every case here passed silently before 0.16 because nothing exercised it —
-/// the predicates were written from the IEC group names rather than from the
-/// German market's assignment of them.
+/// The predicates read the German market's assignment of the value groups, not
+/// the bare IEC group names, and each case below pins one of them.
 #[cfg(test)]
 mod mako_semantics_tests {
     use super::*;
@@ -1259,7 +1378,7 @@ mod canonical_string_tests {
         }
     }
 
-    /// The failure the reporter hit: two spellings, one merge key.
+    /// Two spellings, one merge key.
     #[test]
     fn both_spellings_are_one_value_and_one_string() {
         let typed: ObisCode = "1-0:1.8.0".parse().unwrap();

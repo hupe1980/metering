@@ -13,7 +13,7 @@
 //! | `QuarterHour` | 900 s | fixed |
 //! | `HalfHour` | 1800 s | fixed |
 //! | `Hour` | 3600 s | fixed |
-//! | `Custom(n)` | n s | fixed |
+//! | `Custom(n)` | n s (never 0, 900, 1800 or 3600) | fixed |
 //! | `Day` | 23 h, 24 h **or 25 h** | calendar |
 //! | `Month` | 28–31 days ±1 h | calendar |
 //! | `Year` | 365 or 366 days | calendar |
@@ -62,8 +62,72 @@ pub enum IntervalResolution {
     Month,
     /// One Berlin calendar year — 365 or 366 days.
     Year,
-    /// Custom interval length in seconds (for non-standard cases).
-    Custom(u32),
+    /// A non-standard fixed length, in seconds.
+    ///
+    /// The payload is opaque on purpose — see [`CustomSeconds`]. Build one with
+    /// [`from_seconds`](Self::from_seconds), which is also what [`FromStr`]
+    /// uses, so a duration that already has a name comes back under that name.
+    Custom(CustomSeconds),
+}
+
+/// The second count of an [`IntervalResolution::Custom`] interval.
+///
+/// Opaque so that a `Custom` can never alias a named variant. `Custom(900)`
+/// and [`QuarterHour`](IntervalResolution::QuarterHour) would otherwise be two
+/// distinct values meaning one thing — two database keys, two map entries, and
+/// a broken round trip, because `Custom(900)` writes `"PT900S"` and `"PT900S"`
+/// parses back to `QuarterHour`. [`new`](Self::new) refuses every count that
+/// already has a name, and zero along with them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct CustomSeconds(u32);
+
+impl CustomSeconds {
+    /// A custom length of `secs` seconds.
+    ///
+    /// `None` for `0` — a zero-length interval is not a resolution — and for
+    /// `900`, `1800` and `3600`, which are
+    /// [`QuarterHour`](IntervalResolution::QuarterHour),
+    /// [`HalfHour`](IntervalResolution::HalfHour) and
+    /// [`Hour`](IntervalResolution::Hour).
+    #[must_use]
+    pub const fn new(secs: u32) -> Option<Self> {
+        match secs {
+            0 | 900 | 1800 | 3600 => None,
+            n => Some(Self(n)),
+        }
+    }
+
+    /// The second count. Always positive, and never one of the named lengths.
+    #[must_use]
+    pub const fn get(self) -> u32 {
+        self.0
+    }
+}
+
+impl std::fmt::Display for CustomSeconds {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl From<CustomSeconds> for u32 {
+    fn from(c: CustomSeconds) -> u32 {
+        c.0
+    }
+}
+
+impl TryFrom<u32> for CustomSeconds {
+    type Error = ParseError;
+
+    fn try_from(secs: u32) -> Result<Self, Self::Error> {
+        Self::new(secs).ok_or_else(|| {
+            ParseError::format(
+                "CustomSeconds",
+                &secs.to_string(),
+                "a positive second count that is not 900, 1800 or 3600",
+            )
+        })
+    }
 }
 
 impl IntervalResolution {
@@ -79,16 +143,17 @@ impl IntervalResolution {
     /// 86 400 gets 96 on every day of the year, which raises a false alarm on the
     /// 23-hour spring day and — worse — hides a genuine four-interval gap on the
     /// 25-hour autumn one.
-    /// `Custom(0)` is also `None`: a zero-length interval is not a resolution,
-    /// and returning `Some(0)` would hand every caller a division by zero.
+    ///
+    /// Every other variant answers `Some`, and never `Some(0)`: a
+    /// [`CustomSeconds`] cannot hold zero, so no caller is handed a division by
+    /// zero.
     #[must_use]
     pub const fn fixed_seconds(self) -> Option<u32> {
         match self {
             Self::QuarterHour => Some(900),
             Self::HalfHour => Some(1800),
             Self::Hour => Some(3600),
-            Self::Custom(0) => None,
-            Self::Custom(s) => Some(s),
+            Self::Custom(s) => Some(s.get()),
             Self::Day | Self::Month | Self::Year => None,
         }
     }
@@ -116,7 +181,7 @@ impl IntervalResolution {
     }
 
     /// `true` when the length is the same on every date — everything but
-    /// `Day`, `Month`, `Year` and the degenerate `Custom(0)`.
+    /// `Day`, `Month` and `Year`.
     #[must_use]
     pub const fn is_fixed(self) -> bool {
         self.fixed_seconds().is_some()
@@ -155,7 +220,7 @@ impl IntervalResolution {
             Self::Day => "P1D".to_owned(),
             Self::Month => "P1M".to_owned(),
             Self::Year => "P1Y".to_owned(),
-            Self::Custom(s) => format!("PT{s}S"),
+            Self::Custom(s) => format!("PT{}S", s.get()),
         }
     }
 
@@ -169,11 +234,15 @@ impl IntervalResolution {
     #[must_use]
     pub const fn from_seconds(s: u32) -> Option<Self> {
         match s {
-            0 => None,
             900 => Some(Self::QuarterHour),
             1800 => Some(Self::HalfHour),
             3600 => Some(Self::Hour),
-            _ => Some(Self::Custom(s)),
+            other => match CustomSeconds::new(other) {
+                Some(c) => Some(Self::Custom(c)),
+                // Only zero is left, and a zero-length interval is not a
+                // resolution.
+                None => None,
+            },
         }
     }
 
@@ -296,7 +365,7 @@ mod tests {
             IntervalResolution::QuarterHour,
             IntervalResolution::HalfHour,
             IntervalResolution::Hour,
-            IntervalResolution::Custom(7200),
+            IntervalResolution::from_seconds(7200).unwrap(),
         ] {
             assert!(r.is_fixed() && !r.is_calendar(), "{r} must be fixed");
         }
@@ -308,7 +377,7 @@ mod tests {
             IntervalResolution::QuarterHour,
             IntervalResolution::HalfHour,
             IntervalResolution::Hour,
-            IntervalResolution::Custom(7200),
+            IntervalResolution::from_seconds(7200).unwrap(),
         ] {
             let s = r.fixed_seconds().unwrap();
             assert_eq!(IntervalResolution::from_seconds(s), Some(r));
@@ -319,10 +388,30 @@ mod tests {
     /// German calendar day.
     #[test]
     fn a_day_is_not_86400_seconds() {
+        let fixed = IntervalResolution::from_seconds(86_400).unwrap();
+        assert_eq!(fixed.fixed_seconds(), Some(86_400));
+        assert_ne!(fixed, IntervalResolution::Day);
+        assert!(fixed.is_fixed() && !fixed.is_calendar());
+    }
+
+    /// A named length is never reachable as a `Custom`, so one duration has one
+    /// value — the hole that let `Custom(900)` and `QuarterHour` be two
+    /// distinct keys for one 15-minute grid, with `Custom(900).to_string()`
+    /// parsing back as the other one.
+    #[test]
+    fn a_named_length_is_never_a_custom() {
+        for named in [900u32, 1800, 3600] {
+            assert_eq!(CustomSeconds::new(named), None, "{named} s has a name");
+            assert!(CustomSeconds::try_from(named).is_err());
+        }
+        assert_eq!(CustomSeconds::new(0), None, "zero is not a resolution");
         assert_eq!(
-            IntervalResolution::from_seconds(86_400),
-            Some(IntervalResolution::Custom(86_400))
+            IntervalResolution::from_seconds(900),
+            Some(IntervalResolution::QuarterHour)
         );
+        assert_eq!(CustomSeconds::new(7200).map(CustomSeconds::get), Some(7200));
+        assert_eq!(u32::from(CustomSeconds::new(7200).unwrap()), 7200);
+        assert_eq!(CustomSeconds::new(7200).unwrap().to_string(), "7200");
     }
 
     #[test]
@@ -332,7 +421,7 @@ mod tests {
 
     #[test]
     fn custom_seconds_preserved() {
-        let r = IntervalResolution::Custom(7200);
+        let r = IntervalResolution::from_seconds(7200).unwrap();
         assert_eq!(r.fixed_seconds(), Some(7200));
         assert!(!r.is_subhourly());
     }
@@ -356,15 +445,18 @@ mod tests {
             IntervalResolution::Day,
             IntervalResolution::Month,
             IntervalResolution::Year,
-            IntervalResolution::Custom(300),
-            IntervalResolution::Custom(86_400),
+            IntervalResolution::from_seconds(300).unwrap(),
+            IntervalResolution::from_seconds(86_400).unwrap(),
         ] {
             let s = r.to_string();
             assert_eq!(s.parse::<IntervalResolution>(), Ok(r), "round trip {s}");
         }
         assert_eq!(IntervalResolution::QuarterHour.to_string(), "PT15M");
         assert_eq!(IntervalResolution::Day.to_string(), "P1D");
-        assert_eq!(IntervalResolution::Custom(300).to_string(), "PT300S");
+        assert_eq!(
+            IntervalResolution::from_seconds(300).unwrap().to_string(),
+            "PT300S"
+        );
     }
 
     /// Equal durations parse to the same variant, whichever spelling arrives.
@@ -384,7 +476,7 @@ mod tests {
         );
         assert_eq!(
             "PT2H".parse::<IntervalResolution>(),
-            Ok(IntervalResolution::Custom(7200))
+            Ok(IntervalResolution::from_seconds(7200).unwrap())
         );
     }
 

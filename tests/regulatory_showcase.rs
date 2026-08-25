@@ -489,8 +489,7 @@ fn ht_nt_weekend_all_nt() {
 }
 
 /// §14a EnWG Modul 3 — three tariff levels, mandatory for every Netzbetreiber
-/// since 1 April 2025. The two-register model this crate used to have could not
-/// express it.
+/// since 1 April 2025, and why a two-register model does not suffice.
 #[test]
 fn modul_3_splits_a_day_into_three_registers() {
     let zzd = Zaehlzeitdefinition::modul_3(
@@ -765,9 +764,8 @@ fn v07_dst_ambiguity_detected_for_local_time_storage() {
     );
 
     // A gap somewhere *else* on the same day is a V01 gap and nothing more.
-    // The rule used to compare the whole day against 25 hours, so any two
-    // missing quarter-hours produced a confident — and wrong — report that the
-    // repeated hour had been collapsed.
+    // Comparing the whole day against 25 hours instead would report any two
+    // missing quarter-hours as a collapsed repeated hour.
     let midday_gap: Vec<MeterInterval> = full_day(false)
         .into_iter()
         .filter(|iv| iv.from != datetime!(2026-10-25 11:00 UTC))
@@ -1304,4 +1302,123 @@ fn faulty_intervals_excluded_from_billing_sum() {
         dec!(3.0),
         "§ 60 Abs. 6 MsbG: FAULTY interval (99.9 kWh) must be excluded from billing total"
     );
+}
+
+// ── EDI@Energy Allgemeine Festlegungen v6.1c, Kap. 3.1 ───────────────────────
+
+/// The four day-start codings the Allgemeine Festlegungen prints, asserted
+/// against what this crate computes.
+///
+/// Kap. 3.1 lists the only `HHMM` values a spartenspezifische prozessuale
+/// Zeitangabe may carry in DE2380:
+///
+/// | Sparte | MEZ | MESZ |
+/// |---|---|---|
+/// | Strom | `"2300"` (23:00 UTC = 00:00 MEZ) | `"2200"` (22:00 UTC = 00:00 MESZ) |
+/// | Gas   | `"0500"` (05:00 UTC = 06:00 MEZ) | `"0400"` (04:00 UTC = 06:00 MESZ) |
+///
+/// Those four instants are exactly `calendar::day_start_utc` and
+/// `calendar::gas_day_start_utc` in winter and summer. The document is a
+/// primary source for a number this crate would otherwise be asserting on its
+/// own authority.
+#[test]
+fn day_starts_match_the_allgemeine_festlegungen_codings() {
+    use metering::calendar;
+    use time::macros::{date, datetime};
+
+    // Sparte Strom — 00:00 gesetzliche deutsche Zeit.
+    assert_eq!(
+        calendar::day_start_utc(date!(2026 - 01 - 15)),
+        datetime!(2026-01-14 23:00 UTC),
+        "MEZ: \"2300\""
+    );
+    assert_eq!(
+        calendar::day_start_utc(date!(2026 - 07 - 15)),
+        datetime!(2026-07-14 22:00 UTC),
+        "MESZ: \"2200\""
+    );
+
+    // Sparte Gas — 06:00 gesetzliche deutsche Zeit.
+    assert_eq!(
+        calendar::gas_day_start_utc(date!(2026 - 01 - 15)),
+        datetime!(2026-01-15 5:00 UTC),
+        "MEZ: \"0500\""
+    );
+    assert_eq!(
+        calendar::gas_day_start_utc(date!(2026 - 07 - 15)),
+        datetime!(2026-07-15 4:00 UTC),
+        "MESZ: \"0400\""
+    );
+
+    // The worked example of the same section: the Bilanzierungsmonat Juni 2021
+    // covers 01.06 00:00–01.07 00:00 for Strom and 01.06 06:00–01.07 06:00 for
+    // Gas, which is what `DayBoundary` produces for a month.
+    use metering::calendar::DayBoundary;
+    assert_eq!(
+        DayBoundary::Midnight.month_start_utc(date!(2021 - 06 - 15)),
+        calendar::day_start_utc(date!(2021 - 06 - 01))
+    );
+    assert_eq!(
+        DayBoundary::Midnight.month_end_utc(date!(2021 - 06 - 15)),
+        calendar::day_start_utc(date!(2021 - 07 - 01))
+    );
+    assert_eq!(
+        DayBoundary::Gastag.month_start_utc(date!(2021 - 06 - 15)),
+        calendar::gas_day_start_utc(date!(2021 - 06 - 01))
+    );
+    assert_eq!(
+        DayBoundary::Gastag.month_end_utc(date!(2021 - 06 - 15)),
+        calendar::gas_day_start_utc(date!(2021 - 07 - 01))
+    );
+}
+
+/// EDI@Energy *Codeliste der OBIS-Kennzahlen und Medien* v2.5c, §2.1 and §2.2,
+/// asserted against the predicates that read them.
+#[test]
+fn the_obis_value_groups_follow_codeliste_2_5c() {
+    use metering::ObisCode;
+
+    // §2.1 — "+ Bezug des Kunden aus dem Netz (z. B. 1-b:1.x.y)",
+    //        "- (Rück-)Lieferung des Kunden an das Netz (z. B. 1-b:2.x.y)".
+    // `x` and `y` are free, so the Messart never enters the direction.
+    for messart in [6u8, 8, 9, 29] {
+        let bezug: ObisCode = format!("1-0:1.{messart}.0").parse().unwrap();
+        let lieferung: ObisCode = format!("1-0:2.{messart}.0").parse().unwrap();
+        assert!(bezug.is_import() && !bezug.is_export(), "{bezug}");
+        assert!(
+            lieferung.is_export() && !lieferung.is_import(),
+            "{lieferung}"
+        );
+    }
+
+    // §2.1 — the Zeitintegrale: 1 = Zählerstände, 2 = Vorschübe,
+    // 5 = Lastgang (Energiemengen für Zeitintervalle äquidistanter Dauer).
+    assert!(ObisCode::STROM_BEZUG_TOTAL.is_zaehlerstand()); // D = 8
+    assert!(ObisCode::STROM_BEZUG_VORSCHUB.is_vorschub()); // D = 9
+    assert!(ObisCode::STROM_BEZUG_LASTGANG.is_lastgang()); // D = 29
+    assert!(ObisCode::STROM_BEZUG_MAXIMUM.is_maximum()); // D = 6
+
+    // §2.2 — Messgröße C: 1/2 Wirkleistung ±, 3/4 Blindleistung ±,
+    // 5…8 Blindleistung Q I…Q IV.
+    for c in 3..=8u8 {
+        let code: ObisCode = format!("1-0:{c}.8.0").parse().unwrap();
+        assert!(code.is_reactive(), "1-0:{c}.8.0");
+    }
+
+    // §2.2 — Tarif E: 0 Total, 1…62 Tarif, 63 Fehlerregister. The Codeliste
+    // lists `1-b:1.8.63` as a real code, so it must parse and must not be
+    // mistaken for tariff 63.
+    let fehler: ObisCode = "1-0:1.8.63".parse().unwrap();
+    assert!(fehler.is_fehlerregister());
+    assert_eq!(fehler.tariff_register(), None);
+    assert_eq!(
+        "1-0:1.8.62".parse::<ObisCode>().unwrap().tariff_register(),
+        Some(62)
+    );
+
+    // §2.3 — "Wertegruppe F wird für die Kommunikation im deutschen Gasmarkt
+    // nicht verwendet", and the value-group diagram marks A B C D E as the ones
+    // the German market uses. So the canonical string carries five groups.
+    assert_eq!(ObisCode::GAS_VOLUME_M3.to_string(), "7-0:3.0.0");
+    assert_eq!(ObisCode::STROM_BEZUG_LASTGANG.to_string(), "1-0:1.29.0");
 }

@@ -26,9 +26,7 @@
 //!   friends). They say "this sample is outside the band" — useful for
 //!   triage, and not a conformance verdict.
 //! - [`assess_en50160`] answers the standard's actual question over a series.
-//!
-//! Earlier releases labelled the per-interval predicates *"per DIN EN 50160"*.
-//! They were never that.
+
 //!
 //! ## What is deliberately not assessed
 //!

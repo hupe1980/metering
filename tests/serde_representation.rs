@@ -131,9 +131,7 @@ fn measurement_source_shape_is_stable() {
 /// An OBIS code travels as its canonical string, not as six separate numbers —
 /// and the canonical string omits `*F` when F is 255 ("not applicable").
 ///
-/// Changed in 0.16.0: the wire form was `"1-0:1.8.0*255"`, which no consumer
-/// could produce by typing the code or by copying it out of an MSCONS message.
-/// See `tests/string_canonicalisation.rs` for the invariants that fixes.
+/// See `tests/string_canonicalisation.rs` for the invariants behind it.
 #[test]
 fn obis_code_is_a_string_on_the_wire() {
     assert_eq!(json(&ObisCode::STROM_BEZUG_TOTAL), "\"1-0:1.8.0\"");
@@ -157,17 +155,18 @@ fn obis_code_is_a_string_on_the_wire() {
 /// `IntervalResolution` travels as its ISO 8601 duration — the same string
 /// `Display` writes and `FromStr` reads.
 ///
-/// Changed in 0.16.0: the derived form used the Rust variant names
-/// (`"QuarterHour"`, `{"Custom":300}`), so the type had two spellings per value
-/// and the serde one was a rename away from silently invalidating stored data.
-/// ISO 8601 is an external standard that no refactor here can rename.
+/// ISO 8601 is an external standard that no refactor here can rename, so the
+/// type has one spelling per value rather than a renameable Rust variant name.
 #[test]
 fn interval_resolution_shape_is_stable() {
     assert_eq!(json(&IntervalResolution::QuarterHour), "\"PT15M\"");
     assert_eq!(json(&IntervalResolution::Day), "\"P1D\"");
     assert_eq!(json(&IntervalResolution::Month), "\"P1M\"");
     assert_eq!(json(&IntervalResolution::Year), "\"P1Y\"");
-    assert_eq!(json(&IntervalResolution::Custom(300)), "\"PT300S\"");
+    assert_eq!(
+        json(&IntervalResolution::from_seconds(300).unwrap()),
+        "\"PT300S\""
+    );
 
     // ...which is exactly the string form, rather than a parallel convention.
     assert_eq!(IntervalResolution::QuarterHour.to_string(), "PT15M");
@@ -240,7 +239,7 @@ fn every_enum_round_trips_through_json() {
         IntervalResolution::Day,
         IntervalResolution::Month,
         IntervalResolution::Year,
-        IntervalResolution::Custom(300),
+        IntervalResolution::from_seconds(300).unwrap(),
     ] {
         round_trip(v);
     }
@@ -384,8 +383,8 @@ fn tags_added_in_0_18_are_pinned() {
     assert_eq!(json(&LoadProfile::GasGKO), r#""GKO""#);
     assert_eq!(json(&LoadProfile::Custom), r#""CUSTOM""#);
     assert!(
-        serde_json::from_str::<LoadProfile>(r#""GHD""#).is_err(),
-        "GHD never named a gas SLP and no longer decodes"
+        serde_json::from_str::<LoadProfile>(r#""GARBAGE""#).is_err(),
+        "an unknown profile code is an error, never a silent default"
     );
 }
 
@@ -415,4 +414,144 @@ fn unknown_tags_are_rejected() {
     assert!(serde_json::from_str::<QualityFlag>("\"Mscons\"").is_err());
     // The lower-camel spelling a hand-written fixture might guess at:
     assert!(serde_json::from_str::<MeasurementSource>(r#"{"Mscons":{}}"#).is_err());
+}
+
+/// Tags introduced in 0.19, pinned on arrival so the commitment starts here
+/// rather than at the first rename.
+#[test]
+fn tags_added_in_0_19_are_pinned() {
+    use metering::calendar::DayBoundary;
+    use metering::lifecycle::{MeterLifecycleEventType, MeterStatus};
+
+    assert_eq!(json(&DayBoundary::Midnight), r#""MIDNIGHT""#);
+    assert_eq!(json(&DayBoundary::Gastag), r#""GASTAG""#);
+
+    for v in MeterStatus::ALL {
+        assert_eq!(json(&v), format!("\"{}\"", v.as_str()), "{v:?}");
+    }
+    for v in MeterLifecycleEventType::ALL {
+        assert_eq!(json(&v), format!("\"{}\"", v.as_str()), "{v:?}");
+    }
+    assert_eq!(json(&MeterStatus::Active), r#""ACTIVE""#);
+    assert_eq!(
+        json(&MeterLifecycleEventType::Recalibrated),
+        r#""RECALIBRATED""#
+    );
+}
+
+/// A 2025 profile table travels as a **list** of day tables, because a JSON
+/// object key must be a string and a `(month, day_type)` tuple is not one. The
+/// derived map representation compiled and then failed at run time with "key
+/// must be a string" — an API that existed only in the type system.
+#[test]
+fn a_dynamic_slp_profile_travels_as_a_list_of_day_tables() {
+    use metering::load_profile::{DynamicSlpProfile, SlpDayType};
+
+    let mut profile = DynamicSlpProfile {
+        profile: Some(metering::LoadProfile::G25),
+        ..Default::default()
+    };
+    profile
+        .values
+        .insert((1, SlpDayType::Samstag), vec![dec!(0.25)]);
+
+    let encoded = json(&profile);
+    assert!(
+        encoded.contains(r#""values":[{"month":1,"day_type":"SAMSTAG","values":["0.25"]}]"#),
+        "{encoded}"
+    );
+    let back: DynamicSlpProfile = serde_json::from_str(&encoded).expect("reads back");
+    assert_eq!(back.values, profile.values);
+}
+
+/// The GHD Summenlastprofil — the fifteenth gas profile type, pinned so its tag
+/// cannot drift.
+#[test]
+fn the_ghd_summenlastprofil_is_on_the_wire() {
+    use metering::LoadProfile;
+
+    assert_eq!(json(&LoadProfile::GasGHD), r#""GHD""#);
+    assert_eq!(
+        serde_json::from_str::<LoadProfile>(r#""GHD""#).unwrap(),
+        LoadProfile::GasGHD
+    );
+    assert_eq!(
+        LoadProfile::ALL.iter().filter(|p| p.is_gas()).count(),
+        15,
+        "the Leitfaden publishes fifteen gas profiles"
+    );
+}
+
+/// `AggregationRule` is internally tagged on `kind`, and that tag is
+/// `VirtualMeterKind`'s own spelling.
+///
+/// External tagging would put the discriminator in a JSON *key* whose depth
+/// varies by variant, so a stored rule would need a separate `rule_type` column:
+/// a key cannot be indexed or queried as a value.
+#[test]
+fn an_aggregation_rule_carries_one_discriminator() {
+    use metering::{AggregationRule, VirtualMeterKind};
+
+    let rule = AggregationRule::GgvConstantAllocation {
+        plant_melo_id: "MELO_PLANT".to_owned(),
+        tenant_melo_id: "MELO_T1".to_owned(),
+        fraction: dec!(0.10),
+    };
+    let encoded = json(&rule);
+
+    // The discriminator is a value at a fixed path, not a variant-dependent key.
+    let value: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+    assert_eq!(value["kind"], "GGV_CONSTANT_ALLOCATION");
+    assert_eq!(value["plant_melo_id"], "MELO_PLANT");
+    assert_eq!(
+        value["fraction"], "0.10",
+        "a Decimal travels as its exact string"
+    );
+
+    // ...and it is the same spelling `VirtualMeterKind` writes.
+    assert_eq!(value["kind"], serde_json::json!(rule.kind()));
+    assert_eq!(
+        json(&VirtualMeterKind::GgvConstantAllocation),
+        r#""GGV_CONSTANT_ALLOCATION""#
+    );
+    assert_eq!(rule.kind().as_str(), "GGV_CONSTANT_ALLOCATION");
+
+    // Every variant round-trips, and every payload field sits at depth one.
+    for rule in [
+        AggregationRule::Sum {
+            source_malo_ids: vec!["A".to_owned()],
+        },
+        AggregationRule::Residual {
+            total_malo_id: "T".to_owned(),
+            subtract_malo_ids: vec!["P".to_owned()],
+        },
+        AggregationRule::PvSelfConsumption {
+            grid_malo_id: "G".to_owned(),
+            generation_malo_id: "P".to_owned(),
+        },
+        rule.clone(),
+        AggregationRule::GgvProportionalAllocation {
+            plant_melo_id: "P".to_owned(),
+            tenant_melo_id: "T1".to_owned(),
+            all_tenant_melo_ids: vec!["T1".to_owned()],
+        },
+    ] {
+        let encoded = json(&rule);
+        let value: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(
+            value["kind"],
+            serde_json::json!(rule.kind().as_str()),
+            "{encoded}"
+        );
+        assert_eq!(
+            serde_json::from_str::<AggregationRule>(&encoded).unwrap(),
+            rule
+        );
+    }
+
+    // The old external tagging must not be silently accepted.
+    assert!(
+        serde_json::from_str::<AggregationRule>(r#"{"Sum":{"source_malo_ids":["A"]}}"#).is_err(),
+        "the pre-0.19 shape is gone, not quietly tolerated"
+    );
 }

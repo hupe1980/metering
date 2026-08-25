@@ -33,8 +33,7 @@
 //!   participant consumption. The per-tenant cap this module applies —
 //!   `max(0, …)`, so no tenant is credited more PV than they themselves drew —
 //!   comes from the BDEW Anwendungshilfe's `Pos()` operator, not from that
-//!   sentence. Earlier releases attributed a per-tenant sentence to Abs. 5 that
-//!   the provision does not contain.
+//!   sentence.
 //! - **BDEW Anwendungshilfe "Beispiele von Berechnungsformeln für das
 //!   Solarpaket 1"** v1.0, 25.01.2024 — the worked allocation formulas.
 //! - **MaBiS** (BNetzA BK6-07-002, Lesefassung BK6-24-174) — portfolio
@@ -46,7 +45,7 @@ use std::hash::BuildHasher;
 use rust_decimal::Decimal;
 use time::OffsetDateTime;
 
-use crate::aggregation_rule::AggregationRule;
+use crate::aggregation_rule::{AggregationRule, VirtualMeterKind};
 use crate::interval::{MeterInterval, QualityFlag};
 
 /// Source series keyed by MaLo / MeLo ID.
@@ -79,6 +78,13 @@ pub enum VirtualMeterError {
         /// Actual sum of the provided fractions.
         sum: Decimal,
     },
+
+    /// [`compute_ggv_allocation`] was given a rule that allocates nothing.
+    #[error("{kind} is not a GGV allocation rule — it has no allocated amount")]
+    NotAGgvRule {
+        /// The rule kind that was supplied.
+        kind: VirtualMeterKind,
+    },
 }
 
 // ── compute_virtual_meter ─────────────────────────────────────────────────────
@@ -110,16 +116,16 @@ pub fn compute_virtual_meter<S: BuildHasher>(
             grid_malo_id,
             generation_malo_id,
         } => compute_net_grid(grid_malo_id, generation_malo_id, sources),
-        AggregationRule::GgvConstantAllocation {
-            plant_melo_id,
-            tenant_melo_id,
-            fraction,
-        } => compute_ggv_constant(plant_melo_id, tenant_melo_id, *fraction, sources),
-        AggregationRule::GgvProportionalAllocation {
-            plant_melo_id,
-            tenant_melo_id,
-            all_tenant_melo_ids,
-        } => compute_ggv_proportional(plant_melo_id, tenant_melo_id, all_tenant_melo_ids, sources),
+        // Both GGV variants project from the full allocation, so the `Pos()`
+        // cap of § 42b Abs. 5 has exactly one implementation and the two entry
+        // points cannot drift apart.
+        AggregationRule::GgvConstantAllocation { .. }
+        | AggregationRule::GgvProportionalAllocation { .. } => {
+            Ok(compute_ggv_allocation(rule, sources)?
+                .iter()
+                .map(GgvInterval::to_net_interval)
+                .collect())
+        }
     }
 }
 
@@ -147,11 +153,14 @@ fn compute_sum<S: BuildHasher>(
         };
         let mut sum = Decimal::ZERO;
         let mut quality = QualityFlag::Measured;
+        // The furthest end, not the last one listed: sources are named in the
+        // rule's order, and a result whose interval length depends on how the
+        // caller happened to order two ids is not a result.
         let mut end: Option<OffsetDateTime> = None;
         for iv in ivs {
             sum += iv.value;
             quality = quality.worse_of(iv.quality);
-            end = Some(iv.to);
+            end = Some(end.map_or(iv.to, |e: OffsetDateTime| e.max(iv.to)));
         }
         if let Some(to) = end {
             result.push(MeterInterval {
@@ -245,31 +254,178 @@ fn compute_net_grid<S: BuildHasher>(
     Ok(result)
 }
 
+// ── GGV allocation, in full ──────────────────────────────────────────────────
+
+/// One interval of a § 42b GGV allocation.
+///
+/// [`compute_virtual_meter`] returns only the tenant's **net grid draw**, which
+/// is what the Marktlokation is billed for. A § 42b or § 42c settlement is
+/// built on the **allocated** energy — the share of community PV credited to
+/// this tenant — so it is reported here rather than left to be recovered by
+/// subtracting the net from a re-projected consumption series.
+///
+/// `consumption == allocated + net_grid_draw` holds in every interval,
+/// exactly: all three are [`Decimal`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct GgvInterval {
+    /// Interval start (UTC, inclusive).
+    pub from: OffsetDateTime,
+    /// Interval end (UTC, exclusive).
+    pub to: OffsetDateTime,
+
+    /// The tenant's metered consumption — `Melo_i Verbrauch`.
+    pub consumption: Decimal,
+    /// The community plant's whole generation in the interval —
+    /// `Melo1 Erzeugung`.
+    pub generation: Decimal,
+
+    /// The tenant's share of that generation **before** the `Pos()` cap:
+    /// `fraction × generation`, or `ratio × generation`.
+    pub share: Decimal,
+    /// The share actually credited: `min(consumption, share)`.
+    pub allocated: Decimal,
+    /// What the tenant still draws from the public grid:
+    /// `consumption − allocated`.
+    pub net_grid_draw: Decimal,
+
+    /// Worst quality across the plant and every contributing tenant.
+    pub quality: QualityFlag,
+}
+
+impl GgvInterval {
+    /// `true` when this tenant's share was limited by their own consumption,
+    /// so the remainder fed the grid — the `Pos()` operator of the BDEW
+    /// Anwendungshilfe (UTILTS Z83) made visible.
+    #[must_use]
+    pub fn capped(&self) -> bool {
+        self.share > self.allocated
+    }
+
+    /// The part of this tenant's nominal share that they could not use, and
+    /// which therefore fed the public grid.
+    #[must_use]
+    pub fn surplus_to_grid(&self) -> Decimal {
+        self.share - self.allocated
+    }
+
+    /// The net-grid-draw interval [`compute_virtual_meter`] returns for the
+    /// same input.
+    #[must_use]
+    pub fn to_net_interval(&self) -> MeterInterval {
+        MeterInterval {
+            from: self.from,
+            to: self.to,
+            value: self.net_grid_draw,
+            quality: self.quality,
+            obis_code: None,
+        }
+    }
+}
+
+/// Compute a § 42b GGV allocation in full — consumption, generation, share,
+/// allocated energy and net grid draw per interval.
+///
+/// Both GGV variants produce the same shape; they differ in how the share is
+/// derived:
+///
+/// | Rule | Share |
+/// |---|---|
+/// | [`GgvConstantAllocation`](AggregationRule::GgvConstantAllocation) | `fraction × generation` (UTILTS `CCI+ZG6`) |
+/// | [`GgvProportionalAllocation`](AggregationRule::GgvProportionalAllocation) | `(consumption ÷ Σ consumption) × generation` (UTILTS Z74) |
+///
+/// In both, `allocated = min(consumption, share)` — the `Pos()` operator — and
+/// `net_grid_draw = consumption − allocated`.
+///
+/// # Errors
+///
+/// [`NotAGgvRule`](VirtualMeterError::NotAGgvRule) for a rule that allocates
+/// nothing, [`MissingSource`](VirtualMeterError::MissingSource) for an absent
+/// series, [`InvalidFractions`](VirtualMeterError::InvalidFractions) for a
+/// constant fraction outside `(0, 1]`.
+///
+/// # Example
+///
+/// ```rust
+/// use metering::{AggregationRule, MeterInterval, QualityFlag, compute_ggv_allocation};
+/// use rust_decimal::dec;
+/// use std::collections::HashMap;
+/// use time::macros::datetime;
+///
+/// let iv = |kwh| vec![MeterInterval {
+///     from: datetime!(2026-06-01 12:00 UTC),
+///     to:   datetime!(2026-06-01 12:15 UTC),
+///     value: kwh,
+///     quality: QualityFlag::Measured,
+///     obis_code: None,
+/// }];
+/// let mut sources = HashMap::new();
+/// sources.insert("PLANT".to_owned(), iv(dec!(10)));   // 10 kWh generated
+/// sources.insert("T1".to_owned(), iv(dec!(1)));       //  1 kWh drawn
+///
+/// let rule = AggregationRule::GgvConstantAllocation {
+///     plant_melo_id: "PLANT".to_owned(),
+///     tenant_melo_id: "T1".to_owned(),
+///     fraction: dec!(0.5),                             // half the plant
+/// };
+/// let out = compute_ggv_allocation(&rule, &sources)?;
+///
+/// // The nominal share is 5 kWh, but the tenant only drew 1.
+/// assert_eq!(out[0].share, dec!(5.0));
+/// assert_eq!(out[0].allocated, dec!(1));
+/// assert_eq!(out[0].net_grid_draw, dec!(0));
+/// assert!(out[0].capped(), "limited by their own consumption");
+/// assert_eq!(out[0].surplus_to_grid(), dec!(4.0), "the rest fed the grid");
+///
+/// // ...and the identity holds exactly.
+/// assert_eq!(out[0].consumption, out[0].allocated + out[0].net_grid_draw);
+/// # Ok::<(), metering::VirtualMeterError>(())
+/// ```
+pub fn compute_ggv_allocation<S: BuildHasher>(
+    rule: &AggregationRule,
+    sources: &SourceMap<S>,
+) -> Result<Vec<GgvInterval>, VirtualMeterError> {
+    match rule {
+        AggregationRule::GgvConstantAllocation {
+            plant_melo_id,
+            tenant_melo_id,
+            fraction,
+        } => ggv_constant(plant_melo_id, tenant_melo_id, *fraction, sources),
+        AggregationRule::GgvProportionalAllocation {
+            plant_melo_id,
+            tenant_melo_id,
+            all_tenant_melo_ids,
+        } => ggv_proportional(plant_melo_id, tenant_melo_id, all_tenant_melo_ids, sources),
+        other => Err(VirtualMeterError::NotAGgvRule { kind: other.kind() }),
+    }
+}
+
+/// `allocated = min(consumption, share)`, and the net that follows.
+///
+/// One place, so the `Pos()` cap of § 42b Abs. 5 / UTILTS Z83 is applied once
+/// and both entry points read the same arithmetic.
+fn ggv_split(consumption: Decimal, share: Decimal) -> (Decimal, Decimal) {
+    let allocated = consumption.min(share).max(Decimal::ZERO);
+    (allocated, consumption - allocated)
+}
+
 // ── GGV constant allocation (§42b EnWG Beispiel 1, CCI+ZG6) ──────────────────
 
-/// Constant-fraction GGV allocation per §42b Abs. 5 EnWG.
+/// Constant-fraction GGV allocation — BDEW Anwendungshilfe Beispiel 1,
+/// UTILTS `CCI+ZG6` with `CAV+Z28`.
 ///
-/// Formula (BDEW Anwendungshilfe Beispiel 1):
 /// ```text
-/// net_grid_draw[t] = max(0, tenant_consumption[t] - fraction × plant_generation[t])
+/// share     = fraction × generation
+/// allocated = min(consumption, share)          // Pos(), UTILTS Z83
+/// net       = consumption − allocated
 /// ```
-///
-/// The `max(0, …)` is the `Pos()` operator (UTILTS Z83). It ensures the tenant
-/// cannot "receive" more PV energy than they actually consumed in the interval,
-/// satisfying §42b Abs. 5 EnWG: "begrenzt auf die durch ihn in diesem
-/// Zeitintervall verbrauchte Strommenge."
-fn compute_ggv_constant<S: BuildHasher>(
+fn ggv_constant<S: BuildHasher>(
     plant_id: &str,
     tenant_id: &str,
     fraction: Decimal,
     sources: &SourceMap<S>,
-) -> Result<Vec<MeterInterval>, VirtualMeterError> {
-    if !sources.contains_key(plant_id) {
-        return Err(VirtualMeterError::MissingSource(plant_id.to_owned()));
-    }
-    if !sources.contains_key(tenant_id) {
-        return Err(VirtualMeterError::MissingSource(tenant_id.to_owned()));
-    }
+) -> Result<Vec<GgvInterval>, VirtualMeterError> {
+    require(sources, [plant_id, tenant_id])?;
     if fraction <= Decimal::ZERO || fraction > Decimal::ONE {
         return Err(VirtualMeterError::InvalidFractions { sum: fraction });
     }
@@ -282,59 +438,48 @@ fn compute_ggv_constant<S: BuildHasher>(
         else {
             continue;
         };
-
-        // allocated = fraction × plant_generation (UTILTS Z82 × ZG6)
-        let allocated = fraction * plant_iv.value;
-        // net_grid_draw = Pos(consumption - allocated) = max(0, consumption - allocated)
-        let net_grid_draw = (tenant_iv.value - allocated).max(Decimal::ZERO);
-
-        result.push(MeterInterval {
+        let share = fraction * plant_iv.value;
+        let (allocated, net_grid_draw) = ggv_split(tenant_iv.value, share);
+        result.push(GgvInterval {
             from: ts,
             to: tenant_iv.to,
-            value: net_grid_draw,
+            consumption: tenant_iv.value,
+            generation: plant_iv.value,
+            share,
+            allocated,
+            net_grid_draw,
             quality: plant_iv.quality.worse_of(tenant_iv.quality),
-            obis_code: None,
         });
     }
     Ok(result)
 }
 
-// ── GGV proportional allocation (§42b EnWG Beispiel 3) ───────────────────────
-
-/// Variable consumption-proportional GGV allocation per §42b Abs. 5 EnWG.
+/// Consumption-proportional GGV allocation — BDEW Anwendungshilfe Beispiel 3,
+/// UTILTS Z74 Divisionsquotient.
 ///
-/// Formula (BDEW Anwendungshilfe Beispiel 3):
 /// ```text
-/// total[t]        = Σ all_tenant_consumption_j[t]
-/// ratio[t]        = tenant_consumption[t] / total[t]  (0 when total = 0)
-/// net_grid_draw[t] = max(0, tenant_consumption[t] - ratio[t] × plant_generation[t])
+/// total     = Σ consumption_j
+/// share     = (consumption ÷ total) × generation     (0 when total = 0)
+/// allocated = min(consumption, share)
+/// net       = consumption − allocated
 /// ```
 ///
-/// Division-by-zero protection: when `total[t] = 0`, `ratio[t] = 0` and
-/// `net_grid_draw[t] = 0`. This matches the BDEW Anwendungshilfe note:
-/// "Ist die Energiemenge einer Marktlokation zugeordneten Messlokation = 0,
-/// so ist auch der Verbrauch der Marktlokation auf 0 zu setzen."
-fn compute_ggv_proportional<S: BuildHasher>(
+/// The zero-denominator branch follows the Anwendungshilfe: *"Ist die
+/// Energiemenge einer Marktlokation zugeordneten Messlokation = 0, so ist auch
+/// der Verbrauch der Marktlokation auf 0 zu setzen. Dies verhindert auch eine
+/// Division durch 0."* With quantities positive-or-zero (Codeliste v2.5c
+/// §2.1), `total = 0` implies this tenant's own consumption is 0, so the net
+/// is 0 by the identity rather than by a special case — which is why the net
+/// is computed the same way in both branches instead of being forced to zero.
+fn ggv_proportional<S: BuildHasher>(
     plant_id: &str,
     tenant_id: &str,
     all_tenant_ids: &[String],
     sources: &SourceMap<S>,
-) -> Result<Vec<MeterInterval>, VirtualMeterError> {
-    if !sources.contains_key(plant_id) {
-        return Err(VirtualMeterError::MissingSource(plant_id.to_owned()));
-    }
-    for id in all_tenant_ids {
-        if !sources.contains_key(id.as_str()) {
-            return Err(VirtualMeterError::MissingSource(id.clone()));
-        }
-    }
-    // tenant_id must be present in all_tenant_ids (sanity — not hard-errored here,
-    // a missing tenant_id is caught by the loop above if it's correctly listed)
-    if !sources.contains_key(tenant_id) {
-        return Err(VirtualMeterError::MissingSource(tenant_id.to_owned()));
-    }
+) -> Result<Vec<GgvInterval>, VirtualMeterError> {
+    require(sources, [plant_id, tenant_id])?;
+    require(sources, all_tenant_ids.iter().map(String::as_str))?;
 
-    // Align all IDs: plant + every tenant
     let all_ids: Vec<&str> = std::iter::once(plant_id)
         .chain(all_tenant_ids.iter().map(String::as_str))
         .collect();
@@ -347,9 +492,7 @@ fn compute_ggv_proportional<S: BuildHasher>(
         else {
             continue;
         };
-
-        // Denominator: Σ all tenant consumptions
-        let Some(total_consumption) = all_tenant_ids
+        let Some(total) = all_tenant_ids
             .iter()
             .map(|id| index.get(id, ts).map(|iv| iv.value))
             .sum::<Option<Decimal>>()
@@ -357,31 +500,44 @@ fn compute_ggv_proportional<S: BuildHasher>(
             continue;
         };
 
-        // Dynamic ratio: protect against zero-division
-        let net_grid_draw = if total_consumption > Decimal::ZERO {
-            let ratio = tenant_iv.value / total_consumption;
-            let allocated = ratio * plant_iv.value;
-            (tenant_iv.value - allocated).max(Decimal::ZERO)
+        let share = if total > Decimal::ZERO {
+            tenant_iv.value / total * plant_iv.value
         } else {
-            // All tenants consume 0 → grid draw is 0
             Decimal::ZERO
         };
+        let (allocated, net_grid_draw) = ggv_split(tenant_iv.value, share);
 
-        // Worst quality across plant + all tenants (any estimated interval affects output)
+        // Any estimated or substituted contributor moves the whole result.
         let quality = all_tenant_ids
             .iter()
             .filter_map(|id| index.get(id, ts))
             .fold(plant_iv.quality, |q, iv| q.worse_of(iv.quality));
 
-        result.push(MeterInterval {
+        result.push(GgvInterval {
             from: ts,
             to: tenant_iv.to,
-            value: net_grid_draw,
+            consumption: tenant_iv.value,
+            generation: plant_iv.value,
+            share,
+            allocated,
+            net_grid_draw,
             quality,
-            obis_code: None,
         });
     }
     Ok(result)
+}
+
+/// Every named series must be present before any arithmetic starts.
+fn require<'a, S: BuildHasher>(
+    sources: &SourceMap<S>,
+    ids: impl IntoIterator<Item = &'a str>,
+) -> Result<(), VirtualMeterError> {
+    for id in ids {
+        if !sources.contains_key(id) {
+            return Err(VirtualMeterError::MissingSource(id.to_owned()));
+        }
+    }
+    Ok(())
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
@@ -887,5 +1043,214 @@ mod tests {
         };
         let result = compute_virtual_meter(&rule, &map).unwrap();
         assert_eq!(result[0].quality, QualityFlag::Estimated);
+    }
+}
+
+#[cfg(test)]
+mod ggv_allocation_tests {
+    use super::*;
+    use rust_decimal::dec;
+    use time::{Duration, macros::datetime};
+
+    fn series(values: &[Decimal]) -> Vec<MeterInterval> {
+        values
+            .iter()
+            .enumerate()
+            .map(|(i, &value)| {
+                let from = datetime!(2026-06-01 12:00 UTC) + Duration::minutes(15 * i as i64);
+                MeterInterval {
+                    from,
+                    to: from + Duration::minutes(15),
+                    value,
+                    quality: QualityFlag::Measured,
+                    obis_code: None,
+                }
+            })
+            .collect()
+    }
+
+    fn sources(pairs: &[(&str, &[Decimal])]) -> SourceMap {
+        pairs
+            .iter()
+            .map(|(id, vals)| ((*id).to_owned(), series(vals)))
+            .collect()
+    }
+
+    fn constant(fraction: Decimal) -> AggregationRule {
+        AggregationRule::GgvConstantAllocation {
+            plant_melo_id: "PLANT".to_owned(),
+            tenant_melo_id: "T1".to_owned(),
+            fraction,
+        }
+    }
+
+    /// The identity a settlement reconciles against, exactly — all three are
+    /// `Decimal`, so there is no rounding residue to explain away.
+    #[test]
+    fn consumption_is_exactly_allocated_plus_net() {
+        let src = sources(&[
+            ("PLANT", &[dec!(10), dec!(0), dec!(4), dec!(7.3)]),
+            ("T1", &[dec!(1), dec!(3), dec!(4), dec!(2.9)]),
+        ]);
+        let out = compute_ggv_allocation(&constant(dec!(0.5)), &src).unwrap();
+        assert_eq!(out.len(), 4);
+        for iv in &out {
+            assert_eq!(
+                iv.consumption,
+                iv.allocated + iv.net_grid_draw,
+                "at {}",
+                iv.from
+            );
+            assert!(iv.allocated >= Decimal::ZERO && iv.net_grid_draw >= Decimal::ZERO);
+            assert!(iv.allocated <= iv.share, "the cap never credits more");
+        }
+    }
+
+    /// `capped` is the number an operator wants: it says the tenant's share was
+    /// limited by their own draw and the remainder fed the grid — which is the
+    /// whole economics of § 42b Abs. 5.
+    #[test]
+    fn capping_and_the_surplus_that_fed_the_grid() {
+        // 10 kWh generated, half allocated, 1 kWh drawn → 4 kWh surplus.
+        let src = sources(&[("PLANT", &[dec!(10)]), ("T1", &[dec!(1)])]);
+        let capped = &compute_ggv_allocation(&constant(dec!(0.5)), &src).unwrap()[0];
+        assert_eq!(capped.share, dec!(5.0));
+        assert_eq!(capped.allocated, dec!(1));
+        assert_eq!(capped.net_grid_draw, dec!(0));
+        assert!(capped.capped());
+        assert_eq!(capped.surplus_to_grid(), dec!(4.0));
+
+        // 10 kWh generated, half allocated, 8 kWh drawn → nothing spare.
+        let src = sources(&[("PLANT", &[dec!(10)]), ("T1", &[dec!(8)])]);
+        let short = &compute_ggv_allocation(&constant(dec!(0.5)), &src).unwrap()[0];
+        assert_eq!(short.allocated, dec!(5.0));
+        assert_eq!(short.net_grid_draw, dec!(3.0));
+        assert!(!short.capped());
+        assert_eq!(short.surplus_to_grid(), Decimal::ZERO);
+
+        // Exactly equal is not capped — the tenant used their whole share.
+        let src = sources(&[("PLANT", &[dec!(10)]), ("T1", &[dec!(5)])]);
+        let exact = &compute_ggv_allocation(&constant(dec!(0.5)), &src).unwrap()[0];
+        assert!(!exact.capped());
+        assert_eq!(exact.net_grid_draw, Decimal::ZERO);
+    }
+
+    /// The proportional variant shares by actual draw, and the shares over all
+    /// tenants exhaust the generation when nobody is capped.
+    #[test]
+    fn the_proportional_shares_exhaust_the_generation() {
+        let src = sources(&[
+            ("PLANT", &[dec!(9)]),
+            ("T1", &[dec!(2)]),
+            ("T2", &[dec!(4)]),
+            ("T3", &[dec!(6)]),
+        ]);
+        let tenants: Vec<String> = ["T1", "T2", "T3"].iter().map(|s| (*s).to_owned()).collect();
+
+        let mut total_share = Decimal::ZERO;
+        for tenant in &tenants {
+            let rule = AggregationRule::GgvProportionalAllocation {
+                plant_melo_id: "PLANT".to_owned(),
+                tenant_melo_id: tenant.clone(),
+                all_tenant_melo_ids: tenants.clone(),
+            };
+            let iv = &compute_ggv_allocation(&rule, &src).unwrap()[0];
+            assert_eq!(iv.generation, dec!(9));
+            // Nobody draws less than their share here, so nothing is capped.
+            assert!(!iv.capped(), "{tenant}");
+            assert_eq!(iv.allocated, iv.share);
+            total_share += iv.share;
+        }
+        assert_eq!(total_share, dec!(9), "the shares exhaust the generation");
+    }
+
+    /// A zero total is the Anwendungshilfe's division-by-zero guard. With
+    /// quantities positive-or-zero it implies this tenant drew nothing, so the
+    /// identity gives a zero net without needing a special case.
+    #[test]
+    fn a_zero_denominator_allocates_nothing() {
+        let src = sources(&[
+            ("PLANT", &[dec!(5)]),
+            ("T1", &[dec!(0)]),
+            ("T2", &[dec!(0)]),
+        ]);
+        let rule = AggregationRule::GgvProportionalAllocation {
+            plant_melo_id: "PLANT".to_owned(),
+            tenant_melo_id: "T1".to_owned(),
+            all_tenant_melo_ids: vec!["T1".to_owned(), "T2".to_owned()],
+        };
+        let iv = &compute_ggv_allocation(&rule, &src).unwrap()[0];
+        assert_eq!(iv.share, Decimal::ZERO);
+        assert_eq!(iv.allocated, Decimal::ZERO);
+        assert_eq!(iv.net_grid_draw, Decimal::ZERO);
+        assert_eq!(iv.consumption, iv.allocated + iv.net_grid_draw);
+    }
+
+    /// The two entry points cannot drift: the net series is a projection of the
+    /// allocation, not a second implementation of the same cap.
+    #[test]
+    fn the_net_series_is_a_projection_of_the_allocation() {
+        let src = sources(&[
+            ("PLANT", &[dec!(10), dec!(2), dec!(0)]),
+            ("T1", &[dec!(1), dec!(3), dec!(4)]),
+        ]);
+        let rule = constant(dec!(0.5));
+        let net = compute_virtual_meter(&rule, &src).unwrap();
+        let full = compute_ggv_allocation(&rule, &src).unwrap();
+
+        assert_eq!(net.len(), full.len());
+        for (n, f) in net.iter().zip(&full) {
+            assert_eq!(n, &f.to_net_interval());
+            assert_eq!(n.value, f.net_grid_draw);
+        }
+    }
+
+    /// Quality propagates from every contributor, so an estimated plant reading
+    /// marks the tenant's allocation as estimated too.
+    #[test]
+    fn the_worst_contributor_sets_the_quality() {
+        let mut src = sources(&[("PLANT", &[dec!(10)]), ("T1", &[dec!(8)])]);
+        src.get_mut("PLANT").unwrap()[0].quality = QualityFlag::Estimated;
+        let iv = &compute_ggv_allocation(&constant(dec!(0.5)), &src).unwrap()[0];
+        assert_eq!(iv.quality, QualityFlag::Estimated);
+        assert_eq!(iv.to_net_interval().quality, QualityFlag::Estimated);
+    }
+
+    /// A rule that allocates nothing is an error, not an empty result.
+    #[test]
+    fn a_non_ggv_rule_is_refused_by_name() {
+        let src = sources(&[("A", &[dec!(1)]), ("B", &[dec!(2)])]);
+        let err = compute_ggv_allocation(
+            &AggregationRule::Sum {
+                source_malo_ids: vec!["A".to_owned(), "B".to_owned()],
+            },
+            &src,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            VirtualMeterError::NotAGgvRule {
+                kind: VirtualMeterKind::Sum
+            }
+        );
+        assert!(err.to_string().contains("SUM"), "{err}");
+    }
+
+    #[test]
+    fn missing_sources_and_bad_fractions_are_refused() {
+        let src = sources(&[("PLANT", &[dec!(10)])]);
+        assert!(matches!(
+            compute_ggv_allocation(&constant(dec!(0.5)), &src),
+            Err(VirtualMeterError::MissingSource(id)) if id == "T1"
+        ));
+
+        let src = sources(&[("PLANT", &[dec!(10)]), ("T1", &[dec!(1)])]);
+        for bad in [dec!(0), dec!(-0.1), dec!(1.5)] {
+            assert!(matches!(
+                compute_ggv_allocation(&constant(bad), &src),
+                Err(VirtualMeterError::InvalidFractions { .. })
+            ));
+        }
+        assert!(compute_ggv_allocation(&constant(dec!(1)), &src).is_ok());
     }
 }

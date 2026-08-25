@@ -56,15 +56,11 @@
 //! assert_eq!(slp_day_type(fronleichnam, Bundesland::Be), SlpDayType::Werktag);
 //! ```
 
-use std::fmt;
-use std::str::FromStr;
-
 use time::{Date, Month, Weekday};
 
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
-use crate::error::ParseError;
 use crate::load_profile::SlpDayType;
 
 // ── Bundesland ────────────────────────────────────────────────────────────────
@@ -131,7 +127,7 @@ impl Bundesland {
 
     /// The ISO 3166-2:DE subdivision code without the `DE-` prefix — `"BY"`.
     ///
-    /// This is the `serde` tag and the [`FromStr`] input.
+    /// This is the `serde` tag and the [`FromStr`](std::str::FromStr) input.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -153,12 +149,6 @@ impl Bundesland {
             Self::Th => "TH",
         }
     }
-
-    /// The accepted [`FromStr`] codes, in the same order as [`ALL`](Self::ALL).
-    pub const CODES: &'static [&'static str] = &[
-        "BW", "BY", "BE", "BB", "HB", "HH", "HE", "MV", "NI", "NW", "RP", "SL", "SN", "ST", "SH",
-        "TH",
-    ];
 
     /// The Land's full German name.
     #[must_use]
@@ -211,25 +201,17 @@ impl Bundesland {
     }
 }
 
-impl fmt::Display for Bundesland {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-impl FromStr for Bundesland {
-    type Err = ParseError;
-
-    /// Parses the ISO code with or without the `DE-` prefix, case-insensitively.
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let t = s.trim().to_uppercase();
-        let code = t.strip_prefix("DE-").unwrap_or(&t);
-        Self::ALL
-            .iter()
-            .copied()
-            .find(|b| b.as_str() == code)
-            .ok_or_else(|| ParseError::one_of("Bundesland", s, Self::CODES))
-    }
+crate::codes::string_codes! {
+    // ISO 3166-2 writes these with a `DE-` prefix; the market writes them
+    // without. Both are accepted, the bare code is what comes out.
+    Bundesland, aliases = [
+        ("DE-BW", Self::Bw), ("DE-BY", Self::By), ("DE-BE", Self::Be),
+        ("DE-BB", Self::Bb), ("DE-HB", Self::Hb), ("DE-HH", Self::Hh),
+        ("DE-HE", Self::He), ("DE-MV", Self::Mv), ("DE-NI", Self::Ni),
+        ("DE-NW", Self::Nw), ("DE-RP", Self::Rp), ("DE-SL", Self::Sl),
+        ("DE-SN", Self::Sn), ("DE-ST", Self::St), ("DE-SH", Self::Sh),
+        ("DE-TH", Self::Th),
+    ];
 }
 
 // ── Holiday ───────────────────────────────────────────────────────────────────
@@ -322,7 +304,38 @@ impl Holiday {
         Self::ZweiterWeihnachtstag,
     ];
 
-    /// The holiday's German name.
+    /// Stable DB/wire label. Matches the `serde` tag and
+    /// [`FromStr`](std::str::FromStr) input.
+    ///
+    /// [`name`](Self::name) is the German name for a human — *"Buß- und
+    /// Bettag"*, with an ß and a space. This is the code: ASCII, no
+    /// punctuation, safe in a column, a URL and a CLI argument.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Neujahr => "NEUJAHR",
+            Self::HeiligeDreiKoenige => "HEILIGE_DREI_KOENIGE",
+            Self::Frauentag => "FRAUENTAG",
+            Self::Karfreitag => "KARFREITAG",
+            Self::Ostersonntag => "OSTERSONNTAG",
+            Self::Ostermontag => "OSTERMONTAG",
+            Self::TagDerArbeit => "TAG_DER_ARBEIT",
+            Self::ChristiHimmelfahrt => "CHRISTI_HIMMELFAHRT",
+            Self::Pfingstsonntag => "PFINGSTSONNTAG",
+            Self::Pfingstmontag => "PFINGSTMONTAG",
+            Self::Fronleichnam => "FRONLEICHNAM",
+            Self::MariaeHimmelfahrt => "MARIAE_HIMMELFAHRT",
+            Self::Weltkindertag => "WELTKINDERTAG",
+            Self::TagDerDeutschenEinheit => "TAG_DER_DEUTSCHEN_EINHEIT",
+            Self::Reformationstag => "REFORMATIONSTAG",
+            Self::Allerheiligen => "ALLERHEILIGEN",
+            Self::BussUndBettag => "BUSS_UND_BETTAG",
+            Self::ErsterWeihnachtstag => "ERSTER_WEIHNACHTSTAG",
+            Self::ZweiterWeihnachtstag => "ZWEITER_WEIHNACHTSTAG",
+        }
+    }
+
+    /// The holiday's German name, for display.
     #[must_use]
     pub const fn name(self) -> &'static str {
         match self {
@@ -441,10 +454,8 @@ impl Holiday {
     }
 }
 
-impl fmt::Display for Holiday {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.name())
-    }
+crate::codes::string_codes! {
+    Holiday;
 }
 
 // ── SLP day type ──────────────────────────────────────────────────────────────

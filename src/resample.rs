@@ -33,6 +33,13 @@
 //! spring-forward day expects **92** quarter-hours and the fall-back day
 //! **100** — not a flat 96 that would hide four missing intervals every autumn.
 //!
+//! Day, month and year buckets are cut at **00:00 by default and at 06:00 on
+//! request** — [`ResampleConfig::on`] with
+//! [`crate::calendar::DayBoundary::Gastag`]. The German
+//! gas market balances on the Gastag, so summing a gas Lastgang over the
+//! calendar day books the 00:00–06:00 draw into the wrong Bilanzierungstag,
+//! every day.
+//!
 //! `from` and `to` on a bucket remain UTC instants; convert with
 //! [`crate::calendar::to_berlin`] for display.
 //!
@@ -52,7 +59,7 @@ use time::{Duration, OffsetDateTime};
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
-use crate::calendar;
+use crate::calendar::DayBoundary;
 use crate::interval::{MeterInterval, QualityFlag};
 use crate::resolution::IntervalResolution;
 
@@ -78,10 +85,10 @@ pub struct ResampledBucket {
     /// How many intervals a complete bucket holds, when that is knowable.
     ///
     /// `None` when [`ResampleConfig::source_resolution`] is a calendar period,
-    /// which has no fixed count to divide by. It was previously `0` for that
-    /// case, and `0` made [`coverage_pct`](Self::coverage_pct) report 100 % and
-    /// [`is_complete`](Self::is_complete) report `true` — so a bucket nobody
-    /// could assess looked like a perfect one.
+    /// which has no fixed count to divide by — not `0`, which would make
+    /// [`coverage_pct`](Self::coverage_pct) report 100 % and
+    /// [`is_complete`](Self::is_complete) `true` for a bucket nobody can
+    /// assess.
     pub expected_count: Option<u32>,
     /// Worst quality flag among all contributing intervals.
     pub quality: QualityFlag,
@@ -142,16 +149,49 @@ pub struct ResampleConfig {
     /// resolution leaves that `None` — there is no fixed count to divide a
     /// bucket by. Default: [`IntervalResolution::QuarterHour`].
     pub source_resolution: IntervalResolution,
+    /// Where a day, month and year are cut.
+    ///
+    /// [`DayBoundary::Midnight`] by default — the electricity market's
+    /// Liefertag. [`DayBoundary::Gastag`] moves every daily, monthly and yearly
+    /// bucket onto the 06:00 boundary the gas market balances on. Sub-daily
+    /// buckets are unaffected: they snap on the UTC grid either way.
+    pub day_boundary: DayBoundary,
 }
 
 impl ResampleConfig {
-    /// Resample from `source` to `target`.
+    /// Resample from `source` to `target`, on calendar days.
     #[must_use]
     pub const fn new(source: IntervalResolution, target: IntervalResolution) -> Self {
         Self {
             target_resolution: target,
             source_resolution: source,
+            day_boundary: DayBoundary::Midnight,
         }
+    }
+
+    /// Cut days, months and years on `boundary` (builder style).
+    ///
+    /// ```rust
+    /// use metering::{IntervalResolution, ResampleConfig, calendar::DayBoundary};
+    ///
+    /// // Daily gas totals per Gastag rather than per calendar day.
+    /// let cfg = ResampleConfig::to_daily().on(DayBoundary::Gastag);
+    /// assert_eq!(cfg.day_boundary, DayBoundary::Gastag);
+    /// # let _ = IntervalResolution::Day;
+    /// ```
+    #[must_use]
+    pub const fn on(mut self, boundary: DayBoundary) -> Self {
+        self.day_boundary = boundary;
+        self
+    }
+
+    /// Gas day totals — the 06:00-to-06:00 Gastag, from hourly gas intervals.
+    ///
+    /// Summing a gas Lastgang over the *calendar* day books the 00:00–06:00
+    /// draw into the wrong Bilanzierungstag, every day.
+    #[must_use]
+    pub const fn to_gas_daily() -> Self {
+        Self::new(IntervalResolution::Hour, IntervalResolution::Day).on(DayBoundary::Gastag)
     }
 
     /// Standard: resample 15-min RLM data to hourly buckets.
@@ -214,7 +254,8 @@ pub fn resample(intervals: &[MeterInterval], config: &ResampleConfig) -> Vec<Res
     let mut buckets: BTreeMap<i64, ResampledBucket> = BTreeMap::new();
 
     for iv in intervals {
-        let (bucket_start, bucket_end) = bucket_bounds_for(iv.from, config.target_resolution);
+        let (bucket_start, bucket_end) =
+            bucket_bounds_for(iv.from, config.target_resolution, config.day_boundary);
 
         let entry = buckets
             .entry(bucket_start.unix_timestamp())
@@ -261,26 +302,28 @@ pub fn resample(intervals: &[MeterInterval], config: &ResampleConfig) -> Vec<Res
 fn bucket_bounds_for(
     ts: OffsetDateTime,
     res: IntervalResolution,
+    boundary: DayBoundary,
 ) -> (OffsetDateTime, OffsetDateTime) {
     match res {
         IntervalResolution::Day => {
-            let day = calendar::local_day(ts);
-            (calendar::day_start_utc(day), calendar::day_end_utc(day))
+            let day = boundary.local_day(ts);
+            (boundary.day_start_utc(day), boundary.day_end_utc(day))
         }
         IntervalResolution::Month => {
-            let day = calendar::local_day(ts);
-            (calendar::month_start_utc(day), calendar::month_end_utc(day))
+            let day = boundary.local_day(ts);
+            (boundary.month_start_utc(day), boundary.month_end_utc(day))
         }
         IntervalResolution::Year => {
-            let year = calendar::local_year(ts);
-            (calendar::year_start_utc(year), calendar::year_end_utc(year))
+            let year = boundary.local_year(ts);
+            (boundary.year_start_utc(year), boundary.year_end_utc(year))
         }
         // Fixed-length resolutions: snap the Unix timestamp onto the grid.
-        // `fixed_seconds` is `None` only for the calendar arms above and for
-        // `Custom(0)`, which degenerates to a single bucket holding everything.
+        // `fixed_seconds` answers `Some` for every one of them — a
+        // `CustomSeconds` cannot be zero — so the fallback is unreachable and
+        // exists only so this function is total without an `expect`.
         fixed => {
             let Some(secs) = fixed.fixed_seconds() else {
-                return (ts, ts);
+                return (ts, ts + Duration::seconds(1));
             };
             let s = i64::from(secs);
             let snapped = ts.unix_timestamp().div_euclid(s) * s;
@@ -484,8 +527,8 @@ mod tests {
     }
 
     /// "Unknown" must not read as "complete". A calendar source resolution has
-    /// no fixed count, so the bucket cannot be assessed — and used to report
-    /// 100 % coverage and `is_complete() == true` for exactly that reason.
+    /// no fixed count, so the bucket cannot be assessed at all — and an
+    /// unassessable bucket is not a perfect one.
     #[test]
     fn an_unknown_expected_count_is_not_a_complete_bucket() {
         let cfg = ResampleConfig::new(IntervalResolution::Day, IntervalResolution::Month);
@@ -539,5 +582,97 @@ mod tests {
         let ivs = vec![make_iv(base, dec!(1.0))]; // 1 of 4
         let result = resample(&ivs, &ResampleConfig::to_hourly());
         assert!((result[0].coverage_pct().unwrap() - 25.0).abs() < 0.01);
+    }
+}
+
+#[cfg(test)]
+mod gas_day_tests {
+    use super::*;
+    use crate::calendar;
+    use crate::interval::QualityFlag;
+    use rust_decimal::dec;
+    use time::macros::{date, datetime};
+
+    /// Hourly gas intervals over `n` hours from `start`, 1 kWh each.
+    fn hourly(start: OffsetDateTime, n: i64) -> Vec<MeterInterval> {
+        (0..n)
+            .map(|i| {
+                let from = start + Duration::hours(i);
+                MeterInterval {
+                    from,
+                    to: from + Duration::hours(1),
+                    value: dec!(1),
+                    quality: QualityFlag::Measured,
+                    obis_code: None,
+                }
+            })
+            .collect()
+    }
+
+    /// The failure the boundary exists to prevent: the German gas market
+    /// balances 06:00 to 06:00, so a calendar-day total books the first six
+    /// hours of every Gastag into the previous one.
+    #[test]
+    fn gas_days_are_cut_at_0600_local() {
+        // Two whole Gastage: 06:00 local on 15 January to 06:00 on the 17th.
+        let start = calendar::gas_day_start_utc(date!(2026 - 01 - 15));
+        let buckets = resample(&hourly(start, 48), &ResampleConfig::to_gas_daily());
+
+        assert_eq!(buckets.len(), 2, "two gas days, not three");
+        assert_eq!(buckets[0].from, datetime!(2026-01-15 5:00 UTC));
+        assert_eq!(buckets[0].to, datetime!(2026-01-16 5:00 UTC));
+        assert_eq!(buckets[0].total, dec!(24));
+        assert_eq!(buckets[0].expected_count, Some(24));
+        assert_eq!(buckets[0].is_complete(), Some(true));
+
+        // The same data on calendar days splits into three partial buckets.
+        let calendar_days = resample(
+            &hourly(start, 48),
+            &ResampleConfig::new(IntervalResolution::Hour, IntervalResolution::Day),
+        );
+        assert_eq!(calendar_days.len(), 3);
+        assert!(calendar_days[0].has_missing_data(), "18:00–24:00 only");
+    }
+
+    /// A Gastag inherits the DST length of the day it *contains*, and the
+    /// transition happens at 03:00 local — inside the gas day that began on
+    /// Saturday, not the one named after the Sunday.
+    #[test]
+    fn the_long_gas_day_is_saturdays() {
+        let start = calendar::gas_day_start_utc(date!(2026 - 10 - 24));
+        let buckets = resample(&hourly(start, 49), &ResampleConfig::to_gas_daily());
+
+        assert_eq!(
+            buckets[0].from,
+            calendar::gas_day_start_utc(date!(2026 - 10 - 24))
+        );
+        assert_eq!(
+            buckets[0].expected_count,
+            Some(25),
+            "Saturday's Gastag holds the extra hour"
+        );
+        assert_eq!(buckets[0].interval_count, 25);
+        assert_eq!(buckets[0].is_complete(), Some(true));
+        assert_eq!(buckets[1].expected_count, Some(24), "Sunday's is ordinary");
+    }
+
+    /// The boundary carries up to months and years: a gas month is a whole
+    /// number of Gastage, not a calendar month shifted six hours.
+    #[test]
+    fn gas_months_are_whole_gas_days() {
+        let cfg = ResampleConfig::new(IntervalResolution::Hour, IntervalResolution::Month)
+            .on(DayBoundary::Gastag);
+        let start = calendar::gas_day_start_utc(date!(2026 - 01 - 31));
+        let buckets = resample(&hourly(start, 48), &cfg);
+
+        assert_eq!(buckets.len(), 2, "the month ends at 06:00 on 1 February");
+        assert_eq!(
+            buckets[0].to,
+            calendar::gas_day_start_utc(date!(2026 - 02 - 01))
+        );
+        assert_eq!(
+            buckets[1].from,
+            calendar::gas_day_start_utc(date!(2026 - 02 - 01))
+        );
     }
 }

@@ -79,7 +79,8 @@ dividing rounds once, at the end, instead of once per reading.
 
 Unlike the 2025 electricity profiles, whose value tables are licensed, the gas
 SLP procedure is published in full: the BDEW/VKU/GEODE Leitfaden *"Abwicklung
-von Standardlastprofilen Gas"* prints the profile function, the temperature
+von Standardlastprofilen Gas"* — current edition **KoV XV, Stand 27.03.2026**,
+coefficients in Anlage 6 — prints the profile function, the temperature
 weighting, the weekday factors and every coefficient set. `metering::gas_slp`
 implements that arithmetic:
 
@@ -113,8 +114,30 @@ The **Kundenwert** — the customer's consumption on a day where `h = 1` — com
 from a metered reference period as `KW = Q / Σ(h·F)`, weekday factors must sum
 to exactly 7.0000 for the standard week, and a gesetzlicher Feiertag takes the
 Sunday factor, nationwide by default and per-Land on request — all as the
-Leitfaden specifies. The older pure-sigmoid TUM profiles are the special case
-with zero linear parts.
+Leitfaden specifies. The pure-sigmoid form — zero linear parts — is both the
+pre-2015 TUM generation and how HKO, the Kochgasprofil, is published today.
+
+### The fifteen profile types
+
+The Leitfaden publishes **fifteen** gas profile types in two variants each
+(`33` and `34`, differing in how much of the demand the linear part carries):
+`HEF`, `HMF`, `HKO` for households, eleven Gewerbe sector types, and `GHD`.
+
+`GHD` is the *Summenlastprofil Gewerbe, Handel, Dienstleistung* — the EDI@Energy
+*Codeliste TUM- und BDEW-SLP Gas* v1.1 §6.3 lists it under the TUM codes `HD3`
+and `HD4`, and `GHD` is its BDEW/SigLinDe short code, formed as `G` + the TUM
+stem like `GMF` from `MF`. Its coefficients and weekday factors are a weighted
+mean across the sector types, and a delivery point takes it when it fits none of
+them.
+
+```rust
+use metering::LoadProfile;
+
+let ghd = LoadProfile::parse("GHD").expect("a real profile");
+assert!(ghd.is_gas() && ghd.is_commercial());
+assert!(ghd.is_gas_aggregate(), "the only aggregate of the fifteen");
+assert_eq!(LoadProfile::ALL.iter().filter(|p| p.is_gas()).count(), 15);
+```
 
 ## The Gastag runs 06:00 to 06:00
 
@@ -127,6 +150,42 @@ the boundary.
 One consequence worth knowing: the clocks change at 02:00/03:00 local, *before*
 the 06:00 boundary — so the 23- or 25-hour Gastag is the one named after the
 **Saturday**, not the transition Sunday.
+
+The boundary is not something you have to re-derive at each call site.
+`DayBoundary::Gastag` moves a whole daily, monthly or yearly grid onto it:
+
+```rust
+use metering::{MeterInterval, QualityFlag, ResampleConfig, calendar};
+use rust_decimal::dec;
+use time::{Duration, macros::date};
+
+// Two whole Gastage of hourly gas intervals.
+let start = calendar::gas_day_start_utc(date!(2026 - 01 - 15));
+let series: Vec<MeterInterval> = (0..48).map(|i| MeterInterval {
+    from:  start + Duration::hours(i),
+    to:    start + Duration::hours(i + 1),
+    value: dec!(1),
+    quality: QualityFlag::Measured,
+    obis_code: None,
+}).collect();
+
+let gas_days = metering::resample(&series, &ResampleConfig::to_gas_daily());
+assert_eq!(gas_days.len(), 2);
+assert_eq!(gas_days[0].total, dec!(24));
+assert_eq!(gas_days[0].is_complete(), Some(true));
+
+// The same data on calendar days is three partial buckets, the first holding
+// only 18:00–24:00.
+let calendar_days = metering::resample(
+    &series,
+    &ResampleConfig::new(metering::IntervalResolution::Hour, metering::IntervalResolution::Day),
+);
+assert_eq!(calendar_days.len(), 3);
+assert!(calendar_days[0].has_missing_data());
+```
+
+`FillGapsConfig::on` takes the same boundary, so Ersatzwertbildung on a gas SLP
+walks Gastage rather than Liefertage.
 
 ## Warm water under HeizkostenV § 9 Abs. 2
 

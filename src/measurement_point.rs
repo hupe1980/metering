@@ -5,21 +5,12 @@
 //! the structural context that turns a bare [`crate::MeterInterval`] into a
 //! reading somebody can invoice.
 //!
-//! ## One type, not two
+//! ## One type, one direction enum
 //!
-//! Earlier releases also carried a `MeterRegister` in a separate module. The
-//! two modelled the same thing — MaLo, meter serial, OBIS code, direction,
-//! validity — with two different direction enums (`EnergyFlow` and
-//! `EnergyDirection`) that could disagree about the same register. They had
-//! separate `is_import` / `is_bezug` predicates, and when those turned out to
-//! be able to report a point as both import *and* export, the bug had to be
-//! fixed twice because the concept existed twice.
-//!
-//! `MeterRegister`'s two genuinely distinct fields survive here: the
-//! [`wandler_factor`](MeasurementPoint::wandler_factor), and the register unit
-//! — which is now **derived** from the OBIS code
+//! [`EnergyFlow`] is the only direction enum here, and the register unit is
+//! **derived** from the OBIS code
 //! ([`ObisCode::register_unit`](crate::ObisCode::register_unit)) rather than
-//! stored, since a stored unit can contradict the code that determines it.
+//! stored — a stored unit can contradict the code that determines it.
 //!
 //! ## Relationship to MSCONS
 //!
@@ -74,10 +65,12 @@ pub enum MarktRolle {
     /// Bilanzkreisverantwortlicher — balance group management.
     Bkv,
     /// Übertragungsnetzbetreiber (Strom) / FNB (Gas).
+    #[cfg_attr(feature = "serde", serde(rename = "UENB"))]
     Uenb,
     /// Einspeiseverantwortlicher — responsible for feed-in control.
     Eiv,
     /// Direktvermarkter — direct marketing of renewable energy.
+    #[cfg_attr(feature = "serde", serde(rename = "DV"))]
     Direktvermarkter,
     /// Marktgebietsverantwortlicher (Gas).
     Mgv,
@@ -86,9 +79,45 @@ pub enum MarktRolle {
 }
 
 impl MarktRolle {
-    /// BDEW abbreviation.
+    /// Every role, in declaration order.
+    pub const ALL: [Self; 9] = [
+        Self::Nb,
+        Self::Lf,
+        Self::Msb,
+        Self::Bkv,
+        Self::Uenb,
+        Self::Eiv,
+        Self::Direktvermarkter,
+        Self::Mgv,
+        Self::Esa,
+    ];
+
+    /// Stable DB/wire label. Matches the `serde` tag and
+    /// [`FromStr`](std::str::FromStr) input.
+    ///
+    /// ASCII, unlike [`abbreviation`](Self::abbreviation), which writes the
+    /// BDEW spelling `ÜNB`. A code that a database column, a CLI argument and
+    /// a URL path segment all have to survive is not the place for an umlaut;
+    /// `FromStr` accepts `ÜNB` as a lenient input alias.
     #[must_use]
-    pub fn abbreviation(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Nb => "NB",
+            Self::Lf => "LF",
+            Self::Msb => "MSB",
+            Self::Bkv => "BKV",
+            Self::Uenb => "UENB",
+            Self::Eiv => "EIV",
+            Self::Direktvermarkter => "DV",
+            Self::Mgv => "MGV",
+            Self::Esa => "ESA",
+        }
+    }
+
+    /// BDEW abbreviation, as printed in the Rollenmodell — `ÜNB` with the
+    /// umlaut. For a stored code use [`as_str`](Self::as_str).
+    #[must_use]
+    pub const fn abbreviation(self) -> &'static str {
         match self {
             Self::Nb => "NB",
             Self::Lf => "LF",
@@ -107,7 +136,7 @@ impl MarktRolle {
     /// The ÜNB is one of them: under MaBiS the Netzbetreiber transmits the
     /// Bilanzierungs-Summenzeitreihen to the ÜNB as Bilanzkoordinator via
     /// MSCONS, and the ÜNB acknowledges them — it is a receiver in exactly the
-    /// sense this predicate answers. Earlier releases said `false` for it.
+    /// sense this predicate answers.
     #[must_use]
     pub fn is_mscons_receiver(self) -> bool {
         matches!(
@@ -145,6 +174,19 @@ pub enum EnergyFlow {
 }
 
 impl EnergyFlow {
+    /// Stable DB/wire label. Matches the `serde` tag and
+    /// [`FromStr`](std::str::FromStr) input.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Consumption => "CONSUMPTION",
+            Self::Generation => "GENERATION",
+            Self::StorageCharge => "STORAGE_CHARGE",
+            Self::StorageDischarge => "STORAGE_DISCHARGE",
+            Self::Bidirectional => "BIDIRECTIONAL",
+        }
+    }
+
     /// Every variant, in declaration order.
     pub const ALL: [Self; 5] = [
         Self::Consumption,
@@ -175,6 +217,11 @@ impl EnergyFlow {
     }
 }
 
+crate::codes::string_codes! {
+    MarktRolle, aliases = [("ÜNB", Self::Uenb)];
+    EnergyFlow;
+}
+
 // ── MeasurementPoint ─────────────────────────────────────────────────────────
 
 /// The complete regulatory and physical context for a meter register.
@@ -195,7 +242,7 @@ impl EnergyFlow {
 /// Virtual meters (GGV community solar, Residuallast) also have `MeasurementPoint`
 /// entries with `is_virtual = true`. Their `obis_code` is a conventional code
 /// like `1-0:1.8.0` (total import) since virtual meters are logical.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct MeasurementPoint {
     /// Marktlokations-ID (billing reference).
@@ -266,11 +313,10 @@ impl MeasurementPoint {
     /// [`energy_flow`](Self::energy_flow) only when the code carries no
     /// direction, as a gas or heat code does not.
     ///
-    /// The two used to be combined with `||`, which let a point whose
-    /// `energy_flow` said `Generation` and whose OBIS code said `1-0:1.8.0`
-    /// answer `true` to both this and [`is_einspeisung`](Self::is_einspeisung).
-    /// A pair of predicates that are simultaneously true is worse than either
-    /// being wrong, because nothing downstream can detect the contradiction.
+    /// Mutually exclusive with [`is_einspeisung`](Self::is_einspeisung) by
+    /// construction: a pair of predicates that can both be true is worse than
+    /// either being wrong, because nothing downstream can detect the
+    /// contradiction.
     #[must_use]
     pub fn is_bezug(&self) -> bool {
         if self.obis_code.is_import() {

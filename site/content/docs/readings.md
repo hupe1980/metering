@@ -69,6 +69,8 @@ let cfg = LastgangConfig::strom().with_register_digits(6);
 let wrapped = to_lastgang(&zsg, &cfg);
 assert_eq!(wrapped.intervals[0].value, dec!(3.0));
 assert_eq!(wrapped.rollovers.len(), 1);
+assert_eq!(wrapped.rollovers[0].from, datetime!(2026-06-01 0:00 UTC));
+assert_eq!(wrapped.rollovers[0].to,   datetime!(2026-06-01 0:15 UTC));
 ```
 
 Two safeguards make reconstruction safe rather than dangerous:
@@ -76,9 +78,9 @@ Two safeguards make reconstruction safe rather than dangerous:
 - **No register width, no reconstruction.** Guessing the width wrong turns a
   meter exchange into a million kWh.
 - **A plausibility cap.** A backwards step has two explanations — a wrap and an
-  undocumented exchange — and `with_capacity_kw(30, 900)` is what tells them
-  apart. Without it, a meter swapped at 800 000 reads as 200 000 kWh of
-  consumption in a quarter-hour.
+  undocumented exchange — and `with_capacity_kw(dec!(30), QuarterHour)` is what
+  tells them apart. Without it, a meter swapped at 800 000 reads as 200 000 kWh
+  of consumption in a quarter-hour.
 
 ## The conversion never invents a value
 
@@ -103,12 +105,80 @@ assert_eq!(consumption_between(&start, &end, &LastgangConfig::default())?, dec!(
 # Ok::<(), metering::reading::Anomaly>(())
 ```
 
+## The derived series is a different channel
+
+A Lastgang is not the Zählerstand it came from: `1-0:1.8.0` is a Zählerstand
+(D = 8) and `1-0:1.29.0` is the Lastgang (D = 29). `ObisCode::as_lastgang()`,
+`as_zaehlerstand()` and `as_vorschub()` convert between the three Zeitintegrale
+the Codeliste defines, and `LastgangConfig::strom()` uses the first to relabel
+each interval from the register it actually came from.
+
+The channel matters as much as the value. A **fixed** result code would stamp
+`1-0:1.29.0` on everything, so differencing an Einspeisung Zählerstandsgang
+would produce intervals labelled *import* — values right, channel wrong, and
+nothing downstream able to see it.
+
+```rust
+use metering::ObisCode;
+
+let bezug: ObisCode = "1-0:1.8.0".parse()?;
+let einspeisung: ObisCode = "1-0:2.8.0".parse()?;
+
+assert_eq!(bezug.as_lastgang(),       Some(ObisCode::STROM_BEZUG_LASTGANG));
+assert_eq!(einspeisung.as_lastgang(), Some(ObisCode::STROM_EINSPEISUNG_LASTGANG));
+assert_eq!(bezug.as_lastgang().unwrap().as_zaehlerstand(), Some(bezug));
+
+// No tariff-differentiated Lastgang exists, and D = 29 means nothing for gas,
+// so neither is invented — the reading keeps its own code instead.
+assert_eq!("1-0:1.8.1".parse::<ObisCode>()?.as_lastgang(), None);
+assert_eq!(ObisCode::GAS_VOLUME_M3.as_lastgang(), None);
+# Ok::<(), metering::ParseError>(())
+```
+
+## Cadence comes from the readings
+
+`detect_interval_length` medians each interval's **duration**, and a
+`MeterReading` is a point with no duration — so it cannot answer "how often is
+this meter read?". `detect_reading_cadence` medians the gaps between consecutive
+timestamps instead, which is what `LastgangConfig::with_capacity_kw` needs:
+
+```rust
+use metering::reading::{MeterReading, detect_reading_cadence, LastgangConfig};
+use metering::IntervalResolution;
+use rust_decimal::{Decimal, dec};
+use time::{Duration, macros::datetime};
+
+let zsg: Vec<MeterReading> = (0..8)
+    .map(|i| MeterReading::measured(
+        datetime!(2026-06-01 0:00 UTC) + Duration::minutes(15 * i),
+        dec!(1000) + Decimal::from(i),
+    ))
+    .collect();
+
+let cadence = detect_reading_cadence(&zsg).unwrap();
+assert_eq!(cadence, IntervalResolution::QuarterHour);
+
+// 30 kW over a quarter-hour is 7.5 kWh — the most that connection can pass
+// between two readings, so a bigger step is not a reading, it is a fault.
+let cfg = LastgangConfig::strom().with_capacity_kw(dec!(30), cadence);
+assert_eq!(cfg.max_delta, Some(dec!(7.5)));
+```
+
+A **daily** cadence is a calendar `Day`, and the ceiling it derives uses the
+longest that day can be — 25 hours. A cap computed from a flat 24 would reject a
+legitimate fall-back day on every daily-read meter in the country.
+
 ## Across a meter exchange
 
 The readings cannot be subtracted across the boundary, because the new register
 starts over. `MeterExchangeEvent` pairs the old meter's final reading with the
 new one's first, and differences them separately.
 
-These methods return `Result`. They used to clamp a backwards step to zero under
-the name *"rollover protection"* — which meant a Jahresabrechnung whose old
-register had wrapped billed **0 kWh** for the whole pre-exchange span, silently.
+These methods return `Result` rather than clamping a backwards step to zero:
+clamping would bill **0 kWh** for the whole pre-exchange span of a
+Jahresabrechnung whose old register had wrapped, silently.
+
+The exchange carries one timestamp, not a timestamp and a date. The Berlin
+calendar day a billing period aligns on is `exchange_date()`, derived from
+`exchange_at` — a stored copy beside it would be a second thing to keep in step,
+and 23:30 UTC on 14 June is already 15 June in Berlin.

@@ -58,6 +58,7 @@ use rust_decimal::Decimal;
 use time::{Duration, OffsetDateTime};
 use time_tz::{OffsetDateTimeExt as _, timezones};
 
+use crate::calendar::DayBoundary;
 use crate::interval::{MeterInterval, QualityFlag};
 use crate::resolution::IntervalResolution;
 
@@ -114,6 +115,21 @@ impl SubstituteMethod {
         Self::LastValueCarryForward,
     ];
 
+    /// Stable DB/wire label. Matches the `serde` tag and
+    /// [`FromStr`](std::str::FromStr) input.
+    ///
+    /// [`description`](Self::description) is the German prose for a human;
+    /// this is the code for a column.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::LinearInterpolation => "LINEAR_INTERPOLATION",
+            Self::PriorPeriodAverage => "PRIOR_PERIOD_AVERAGE",
+            Self::ZeroFill => "ZERO_FILL",
+            Self::LastValueCarryForward => "LAST_VALUE_CARRY_FORWARD",
+        }
+    }
+
     /// German description, for an audit record or an invoice annex.
     #[must_use]
     pub const fn description(self) -> &'static str {
@@ -166,6 +182,21 @@ impl SubstitutionReason {
         Self::Other,
     ];
 
+    /// Stable DB/wire label. Matches the `serde` tag and
+    /// [`FromStr`](std::str::FromStr) input.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NoMeasurementAvailable => "NO_MEASUREMENT_AVAILABLE",
+            Self::MeterFault => "METER_FAULT",
+            Self::GatewayCommFailure => "GATEWAY_COMM_FAILURE",
+            Self::PlausibilityCheckFailed => "PLAUSIBILITY_CHECK_FAILED",
+            Self::ManualCorrection => "MANUAL_CORRECTION",
+            Self::MeterExchangeInterpolation => "METER_EXCHANGE_INTERPOLATION",
+            Self::Other => "OTHER",
+        }
+    }
+
     /// German description, for an audit record.
     #[must_use]
     pub const fn description(self) -> &'static str {
@@ -179,6 +210,11 @@ impl SubstitutionReason {
             Self::Other => "Sonstiger dokumentierter Grund",
         }
     }
+}
+
+crate::codes::string_codes! {
+    SubstituteMethod;
+    SubstitutionReason;
 }
 
 // ── SubstituteEntry ───────────────────────────────────────────────────────────
@@ -205,11 +241,9 @@ pub struct SubstituteEntry {
 
 /// Configuration for [`fill_gaps`]: the grid, the period, and the policy.
 ///
-/// There is no `Default`. The grid resolution and the period are the two
-/// things a gap fill cannot proceed without and the two most easily got wrong —
-/// they were loose positional arguments until 0.17, where a caller could pass
-/// `900` for a daily series or transpose `from` and `to` without the type
-/// system noticing. They are constructor arguments now.
+/// There is no `Default`: the grid resolution and the period are the two things
+/// a gap fill cannot proceed without, and the two most easily got wrong, so they
+/// are constructor arguments.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FillGapsConfig {
     /// The grid to fill against.
@@ -244,6 +278,13 @@ pub struct FillGapsConfig {
     /// Default: `3`. Set to `0` to apply the configured method uniformly.
     pub short_gap_threshold: usize,
 
+    /// Where a daily, monthly or yearly grid slot is cut.
+    ///
+    /// [`DayBoundary::Midnight`] by default. [`DayBoundary::Gastag`] walks
+    /// 06:00-to-06:00 gas days instead — the grid a gas SLP allocation is
+    /// filled against. Sub-daily resolutions are unaffected.
+    pub day_boundary: DayBoundary,
+
     /// Recorded on every generated entry.
     pub reason: SubstitutionReason,
 }
@@ -259,8 +300,29 @@ impl FillGapsConfig {
             method: SubstituteMethod::default(),
             prior_period_intervals: Vec::new(),
             short_gap_threshold: 3,
+            day_boundary: DayBoundary::Midnight,
             reason: SubstitutionReason::NoMeasurementAvailable,
         }
+    }
+
+    /// Cut daily, monthly and yearly slots on `boundary` (builder style).
+    ///
+    /// ```rust
+    /// use metering::{FillGapsConfig, IntervalResolution, calendar::DayBoundary};
+    /// use time::macros::datetime;
+    ///
+    /// let cfg = FillGapsConfig::new(
+    ///     IntervalResolution::Day,
+    ///     datetime!(2026-01-01 5:00 UTC),
+    ///     datetime!(2026-01-08 5:00 UTC),
+    /// )
+    /// .on(DayBoundary::Gastag);
+    /// assert_eq!(cfg.day_boundary, DayBoundary::Gastag);
+    /// ```
+    #[must_use]
+    pub const fn on(mut self, boundary: DayBoundary) -> Self {
+        self.day_boundary = boundary;
+        self
     }
 
     /// Apply `method` to gaps longer than the short-gap threshold.
@@ -342,18 +404,16 @@ impl FilledSeries {
 ///
 /// Gaps of at most [`FillGapsConfig::short_gap_threshold`] intervals are
 /// interpolated regardless of the configured method; longer ones use it. The
-/// gap length is measured once, at the gap's first missing slot — measuring it
-/// from a moving cursor shrinks it as the gap fills, which silently reverted
-/// the last few intervals of every long gap to interpolation.
+/// length is measured once, at the gap's first missing slot, so a long gap
+/// keeps its method to the last interval.
 ///
 /// A **present but non-billable** slot (`Faulty`, `Unknown`) is never
-/// overwritten — this function fills *missing* slots — but it does not anchor
-/// an interpolation either: the straight line runs between the billable
-/// values either side, each at the grid slot it actually occupies, so the
-/// missing slots around a faulty reading land on one consistent line.
+/// overwritten, and never anchors an interpolation either: the line runs
+/// between the billable values either side, each at the grid slot it actually
+/// occupies, so every missing slot around a faulty reading lands on one line.
 ///
-/// Leading and trailing gaps are filled too, and are the cases most likely to
-/// have no bracketing value: the entries record the fallback that ran.
+/// Leading and trailing gaps are filled too, and are the likeliest to have no
+/// bracketing value: the entries record the fallback that ran.
 ///
 /// An interval is matched to a slot by its `from` timestamp, so the period
 /// should start on a boundary of the chosen resolution — a daily fill starting
@@ -403,21 +463,10 @@ pub fn fill_gaps(intervals: &[MeterInterval], config: &FillGapsConfig) -> Filled
     let (from, to) = config.period;
     let resolution = config.resolution;
 
-    let sorted_input = || {
-        let mut intervals = intervals.to_vec();
-        intervals.sort_by_key(|iv| iv.from);
-        FilledSeries {
-            intervals,
-            substitutions: Vec::new(),
-        }
-    };
-
-    // A resolution with neither a fixed length nor a calendar meaning —
-    // `Custom(0)` — cannot describe a grid. Hand the input back rather than
-    // discarding it: the caller's parameters are wrong, their data is not.
-    if !resolution.is_fixed() && !resolution.is_calendar() {
-        return sorted_input();
-    }
+    // Every `IntervalResolution` describes a grid — a fixed length or a calendar
+    // period — so there is no "no grid" case left to guard against: a
+    // `CustomSeconds` cannot be zero.
+    //
     // An empty or inverted range has no slots at all, so there is nothing to
     // return — not even the input, which lies outside the requested range.
     if to <= from {
@@ -447,11 +496,17 @@ pub fn fill_gaps(intervals: &[MeterInterval], config: &FillGapsConfig) -> Filled
     // whole gap shares one length and one bracket.
     let mut gap: Option<Gap> = None;
 
-    let obis = intervals.first().and_then(|iv| iv.obis_code);
+    // The channel the substitutes are labelled with is the earliest interval's,
+    // not `intervals[0]`'s: the input need not be sorted, and a label that
+    // depends on the caller's ordering is not a label.
+    let obis = intervals
+        .iter()
+        .min_by_key(|iv| iv.from)
+        .and_then(|iv| iv.obis_code);
     let mut cursor = from;
     let mut idx = 0usize;
     while cursor < to {
-        let Some(next) = advance(cursor, resolution) else {
+        let Some(next) = advance(cursor, resolution, config.day_boundary) else {
             break;
         };
         let ts = cursor.unix_timestamp();
@@ -470,7 +525,15 @@ pub fn fill_gaps(intervals: &[MeterInterval], config: &FillGapsConfig) -> Filled
         let current = match gap {
             Some(ref g) => g.clone(),
             None => {
-                let g = Gap::measure(&measured, cursor, idx, resolution, to, anchor);
+                let g = Gap::measure(
+                    &measured,
+                    cursor,
+                    idx,
+                    resolution,
+                    config.day_boundary,
+                    to,
+                    anchor,
+                );
                 gap = Some(g.clone());
                 g
             }
@@ -512,14 +575,18 @@ pub fn fill_gaps(intervals: &[MeterInterval], config: &FillGapsConfig) -> Filled
 /// The end of the grid slot starting at `cursor`.
 ///
 /// Calendar resolutions resolve through [`crate::calendar`], so a `Day` step is
-/// 23, 24 or 25 hours depending on the date. `None` when the resolution has no
-/// grid or the arithmetic leaves the representable range.
-fn advance(cursor: OffsetDateTime, resolution: IntervalResolution) -> Option<OffsetDateTime> {
-    use crate::calendar;
+/// 23, 24 or 25 hours depending on the date, and `boundary` decides whether
+/// that day starts at 00:00 or at the 06:00 Gastag. `None` when the arithmetic
+/// leaves the representable range.
+fn advance(
+    cursor: OffsetDateTime,
+    resolution: IntervalResolution,
+    boundary: DayBoundary,
+) -> Option<OffsetDateTime> {
     let next = match resolution {
-        IntervalResolution::Day => calendar::day_end_utc(calendar::local_day(cursor)),
-        IntervalResolution::Month => calendar::month_end_utc(calendar::local_day(cursor)),
-        IntervalResolution::Year => calendar::year_end_utc(calendar::local_year(cursor)),
+        IntervalResolution::Day => boundary.day_end_utc(boundary.local_day(cursor)),
+        IntervalResolution::Month => boundary.month_end_utc(boundary.local_day(cursor)),
+        IntervalResolution::Year => boundary.year_end_utc(boundary.local_year(cursor)),
         fixed => cursor + Duration::seconds(i64::from(fixed.fixed_seconds()?)),
     };
     // A calendar step lands on the *end of the period containing* the cursor,
@@ -553,11 +620,13 @@ struct Gap {
 }
 
 impl Gap {
+    #[allow(clippy::too_many_arguments)]
     fn measure(
         measured: &BTreeMap<i64, &MeterInterval>,
         start: OffsetDateTime,
         start_idx: usize,
         resolution: IntervalResolution,
+        boundary: DayBoundary,
         end: OffsetDateTime,
         preceding: Option<(usize, Decimal)>,
     ) -> Self {
@@ -566,7 +635,7 @@ impl Gap {
         let mut cursor = start;
         while cursor < end && !measured.contains_key(&cursor.unix_timestamp()) {
             run_len += 1;
-            let Some(next) = advance(cursor, resolution) else {
+            let Some(next) = advance(cursor, resolution, boundary) else {
                 break;
             };
             cursor = next;
@@ -590,7 +659,7 @@ impl Gap {
             let mut walk = cursor;
             let mut walk_idx = start_idx + run_len;
             while walk.unix_timestamp() < target {
-                walk = advance(walk, resolution)?;
+                walk = advance(walk, resolution, boundary)?;
                 walk_idx += 1;
             }
             Some((walk_idx, iv.value))
@@ -810,10 +879,9 @@ mod tests {
 
     // ── method selection ─────────────────────────────────────────────────────
 
-    /// A long gap must keep its configured method to the last interval. The gap
-    /// length used to be re-measured from the moving cursor, so it shrank as
-    /// the gap filled and the last `short_gap_threshold` intervals silently
-    /// reverted to interpolation.
+    /// A long gap keeps its configured method to the last interval: the length
+    /// is measured once, at the first missing slot, not from a moving cursor
+    /// that would shrink it as the gap fills.
     #[test]
     fn a_long_gap_keeps_its_method_to_the_last_interval() {
         let filled = fill_gaps(
@@ -969,8 +1037,8 @@ mod tests {
         );
     }
 
-    /// Only the preceding week counts. The window used to be a `debug_assert`
-    /// on the caller's slice length, which compiles out in release.
+    /// Only the preceding week counts, and the window is applied here rather
+    /// than trusted from the caller.
     #[test]
     fn only_the_preceding_week_feeds_the_average() {
         let gap = datetime!(2026-03-09 08:00 UTC); // a Monday
@@ -1247,7 +1315,11 @@ mod tests {
         // transition and substitutes most of what follows.
         let fixed = fill_gaps(
             &series,
-            &FillGapsConfig::new(IntervalResolution::Custom(86_400), period.0, period.1),
+            &FillGapsConfig::new(
+                IntervalResolution::from_seconds(86_400).unwrap(),
+                period.0,
+                period.1,
+            ),
         );
         assert!(
             fixed.substituted_count() > 5,
@@ -1262,18 +1334,6 @@ mod tests {
     #[test]
     fn degenerate_parameters_do_not_loop_or_panic() {
         let intervals = vec![iv(0, dec!(2.0))];
-
-        // A resolution with no grid at all: the data comes back untouched.
-        let no_grid = fill_gaps(
-            &intervals,
-            &FillGapsConfig::new(
-                IntervalResolution::Custom(0),
-                BASE,
-                BASE + Duration::hours(1),
-            ),
-        );
-        assert_eq!(no_grid.intervals.len(), 1);
-        assert!(no_grid.substitutions.is_empty());
 
         // Inverted range.
         let inverted = fill_gaps(
@@ -1333,5 +1393,83 @@ mod tests {
         }
         assert_eq!(SubstituteMethod::ALL.len(), 4);
         assert_eq!(SubstitutionReason::ALL.len(), 7);
+    }
+}
+
+#[cfg(test)]
+mod gas_day_grid_tests {
+    use super::*;
+    use crate::calendar;
+    use rust_decimal::dec;
+    use time::macros::date;
+
+    /// A daily gas fill walks Gastage, so its slots start at 06:00 local and
+    /// stretch to 25 hours across the autumn transition — the same DST
+    /// correctness the calendar grid has, on the boundary gas balances on.
+    #[test]
+    fn a_daily_gas_fill_walks_gas_days() {
+        let from = calendar::gas_day_start_utc(date!(2026 - 10 - 23));
+        let to = calendar::gas_day_start_utc(date!(2026 - 10 - 27));
+
+        let measured = vec![MeterInterval {
+            from,
+            to: calendar::gas_day_end_utc(date!(2026 - 10 - 23)),
+            value: dec!(500),
+            quality: QualityFlag::Measured,
+            obis_code: None,
+        }];
+
+        let filled = fill_gaps(
+            &measured,
+            &FillGapsConfig::new(IntervalResolution::Day, from, to)
+                .on(DayBoundary::Gastag)
+                .with_method(SubstituteMethod::LastValueCarryForward)
+                .short_gap_threshold(0),
+        );
+
+        assert_eq!(filled.intervals.len(), 4, "four Gastage");
+        for (i, day) in [
+            date!(2026 - 10 - 23),
+            date!(2026 - 10 - 24),
+            date!(2026 - 10 - 25),
+            date!(2026 - 10 - 26),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert_eq!(
+                filled.intervals[i].from,
+                calendar::gas_day_start_utc(day),
+                "{day}"
+            );
+            assert_eq!(
+                filled.intervals[i].to,
+                calendar::gas_day_end_utc(day),
+                "{day}"
+            );
+        }
+
+        // Saturday's Gastag carries the repeated hour, so it is 25 hours long.
+        let saturday = &filled.intervals[1];
+        assert_eq!((saturday.to - saturday.from).whole_hours(), 25);
+        assert_eq!(filled.substituted_count(), 3);
+    }
+
+    /// The default boundary is unchanged, so an electricity fill still walks
+    /// calendar days.
+    #[test]
+    fn the_default_boundary_is_still_midnight() {
+        let cfg = FillGapsConfig::new(
+            IntervalResolution::Day,
+            calendar::day_start_utc(date!(2026 - 06 - 01)),
+            calendar::day_start_utc(date!(2026 - 06 - 03)),
+        );
+        assert_eq!(cfg.day_boundary, DayBoundary::Midnight);
+        let filled = fill_gaps(&[], &cfg);
+        assert_eq!(filled.intervals.len(), 2);
+        assert_eq!(
+            filled.intervals[0].from,
+            calendar::day_start_utc(date!(2026 - 06 - 01))
+        );
     }
 }

@@ -25,14 +25,35 @@
 //! ## Scope
 //!
 //! Everything here is Europe/Berlin, which is the market area this crate
-//! models. EDI@Energy *Allgemeine Festlegungen* v6.1b, Kap. 3 states the split
+//! models. EDI@Energy *Allgemeine Festlegungen* v6.1c, Kap. 3 states the split
 //! this module exists to manage: *"Die Angabe von Zeiten in einer EDIFACT
-//! Nachricht erfolgt in koordinierter Weltzeit (UTC) … Alle in den Prozessen
-//! genannten Zeitpunkte … nutzen die gesetzliche deutsche Zeit."* Timestamps on
-//! the wire are UTC; periods and deadlines are MEZ/MESZ. The rules come from the
-//! IANA tz database via `time-tz`, so historical transitions are correct too —
-//! this is not a hard-coded "last Sunday in March" approximation.
-//! [`berlin`] exposes the timezone for callers needing something else.
+//! Nachricht erfolgt in koordinierter Weltzeit (Coordinated Universal Time,
+//! UTC). In Deutschland gilt die Mitteleuropäische Zeit (MEZ) bzw. die
+//! Mitteleuropäische Sommerzeit (MESZ) als gesetzliche deutsche Zeit. Alle in
+//! den Prozessen genannten Zeitpunkte … nutzen die gesetzliche deutsche
+//! Zeit."* Timestamps on the wire are UTC; periods and deadlines are MEZ/MESZ.
+//! The rules come from the IANA tz database via `time-tz`, so historical
+//! transitions are correct too — this is not a hard-coded "last Sunday in
+//! March" approximation. [`berlin`] exposes the timezone for callers needing
+//! something else.
+//!
+//! Kap. 3.1 goes on to pin the four day-start codings this module produces, and
+//! `tests/regulatory_showcase.rs` asserts them against it:
+//!
+//! | Sparte | MEZ | MESZ |
+//! |---|---|---|
+//! | Strom (00:00 local) | `2300` — 23:00 UTC | `2200` — 22:00 UTC |
+//! | Gas (06:00 local) | `0500` — 05:00 UTC | `0400` — 04:00 UTC |
+//!
+//! ## Leap seconds are not represented
+//!
+//! Kap. 3.9 permits a second-precision timestamp to name a leap second
+//! (`23:59:60`). [`time::OffsetDateTime`] has no such second, so a value that
+//! named one could not be constructed at all — it would fail at the parse,
+//! where the message is still available to report, rather than silently
+//! becoming `23:59:59`. Interval boundaries are quarter-hours and never land
+//! there; none has been inserted since 2016, and the CGPM resolved in 2022 to
+//! stop inserting them by 2035.
 //!
 //! ## Example
 //!
@@ -53,8 +74,11 @@
 //! );
 //! ```
 
-use time::{Date, Duration, Month, OffsetDateTime, PrimitiveDateTime, Time};
-use time_tz::{OffsetDateTimeExt as _, OffsetResult, PrimitiveDateTimeExt as _, Tz, timezones};
+use time::{Date, Duration, Month, OffsetDateTime, PrimitiveDateTime, Time, macros::time};
+use time_tz::{
+    Offset as _, OffsetDateTimeExt as _, OffsetResult, PrimitiveDateTimeExt as _, TimeZone as _,
+    Tz, timezones,
+};
 
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
@@ -140,6 +164,159 @@ pub fn day_end_utc(day: Date) -> OffsetDateTime {
 
 // ── the Gastag ────────────────────────────────────────────────────────────────
 
+/// The Berlin wall-clock time a Gastag begins at: 06:00.
+const GAS_DAY_START: Time = time!(6:00);
+
+/// Which daily boundary a period is cut on.
+///
+/// German electricity settles on the calendar day and German gas on the
+/// **Gastag**, which runs 06:00 to 06:00 local (GaBi Gas, following Art. 3
+/// Nr. 6 VO (EU) 312/2014). Both are "one day"; they simply start six hours
+/// apart, so the distinction is a *boundary*, not a length — which is why it
+/// lives here and not in [`IntervalResolution`], whose canonical string is an
+/// ISO 8601 duration and has nothing to say about phase.
+///
+/// It carries all the way up to the month, and that is the market's own rule,
+/// not an extrapolation. EDI@Energy *Allgemeine Festlegungen* v6.1c, Kap. 3.1:
+/// *"Die Angabe des Bilanzierungsmonats erfolgt unter Angabe von Jahr und
+/// Monat (z. B. Juni 2021), sodass damit der Zeitraum vom 01.06.2021 00:00 Uhr
+/// bis 01.07.2021 00:00 Uhr gesetzlicher deutscher Zeit abgedeckt ist, wenn es
+/// sich um den Bilanzierungsmonat in der Sparte Strom handelt, in der Sparte
+/// Gas ist damit der Zeitraum vom 01.06.2021 06:00 Uhr bis 01.07.2021 06:00
+/// Uhr gesetzlicher deutscher Zeit abgedeckt."*
+///
+/// Pass it to [`crate::ResampleConfig::on`] or
+/// [`crate::FillGapsConfig::on`] to move a daily, monthly or yearly grid onto
+/// gas days without touching anything else.
+///
+/// ```rust
+/// use metering::calendar::DayBoundary;
+/// use time::macros::{date, datetime};
+///
+/// // The same calendar date, two different windows.
+/// assert_eq!(
+///     DayBoundary::Midnight.day_start_utc(date!(2026 - 01 - 15)),
+///     datetime!(2026-01-14 23:00 UTC),
+/// );
+/// assert_eq!(
+///     DayBoundary::Gastag.day_start_utc(date!(2026 - 01 - 15)),
+///     datetime!(2026-01-15 5:00 UTC),
+/// );
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "SCREAMING_SNAKE_CASE"))]
+pub enum DayBoundary {
+    /// 00:00 Europe/Berlin — the Liefertag of the electricity market.
+    #[default]
+    Midnight,
+    /// 06:00 Europe/Berlin — the Gastag of the gas market.
+    Gastag,
+}
+
+impl DayBoundary {
+    /// Every variant, in declaration order.
+    pub const ALL: [Self; 2] = [Self::Midnight, Self::Gastag];
+
+    /// Stable DB/wire label. Matches the `serde` tag and
+    /// [`FromStr`](std::str::FromStr) input.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Midnight => "MIDNIGHT",
+            Self::Gastag => "GASTAG",
+        }
+    }
+
+    /// The UTC instant the day named `day` begins at.
+    #[must_use]
+    pub fn day_start_utc(self, day: Date) -> OffsetDateTime {
+        match self {
+            Self::Midnight => day_start_utc(day),
+            Self::Gastag => gas_day_start_utc(day),
+        }
+    }
+
+    /// The UTC instant the day named `day` ends at (exclusive).
+    #[must_use]
+    pub fn day_end_utc(self, day: Date) -> OffsetDateTime {
+        match self {
+            Self::Midnight => day_end_utc(day),
+            Self::Gastag => gas_day_end_utc(day),
+        }
+    }
+
+    /// The day an instant belongs to under this boundary.
+    #[must_use]
+    pub fn local_day(self, instant: OffsetDateTime) -> Date {
+        match self {
+            Self::Midnight => local_day(instant),
+            Self::Gastag => local_gas_day(instant),
+        }
+    }
+
+    /// How long that day lasts: 23 h, 24 h or 25 h.
+    ///
+    /// The transition falls in a **different** named day for the two
+    /// boundaries: the clocks move at 02:00/03:00 local, before 06:00, so the
+    /// long or short Gastag is the one named after the Saturday.
+    #[must_use]
+    pub fn day_length(self, day: Date) -> Duration {
+        self.day_end_utc(day) - self.day_start_utc(day)
+    }
+
+    /// Number of intervals of `resolution` in that day, or `None` when the
+    /// resolution does not divide it evenly or is coarser than a day.
+    #[must_use]
+    pub fn intervals_in_day(self, day: Date, resolution: IntervalResolution) -> Option<u32> {
+        match resolution {
+            IntervalResolution::Day => Some(1),
+            IntervalResolution::Month | IntervalResolution::Year => None,
+            other => divide(self.day_length(day), other),
+        }
+    }
+
+    /// The month containing `day`, as its first day.
+    ///
+    /// A gas month runs from 06:00 on the first to 06:00 on the first of the
+    /// next — the boundary carries all the way up, so a monthly gas total is
+    /// not a calendar-month total shifted, it is a whole number of Gastage.
+    #[must_use]
+    pub fn local_month(self, instant: OffsetDateTime) -> Date {
+        first_of_month(self.local_day(instant))
+    }
+
+    /// The UTC instant the month containing `day` begins at.
+    #[must_use]
+    pub fn month_start_utc(self, day: Date) -> OffsetDateTime {
+        self.day_start_utc(first_of_month(day))
+    }
+
+    /// The UTC instant the month containing `day` ends at (exclusive).
+    #[must_use]
+    pub fn month_end_utc(self, day: Date) -> OffsetDateTime {
+        self.day_start_utc(first_of_next_month(day))
+    }
+
+    /// The year an instant falls in.
+    #[must_use]
+    pub fn local_year(self, instant: OffsetDateTime) -> i32 {
+        self.local_day(instant).year()
+    }
+
+    /// The UTC instant a year begins at.
+    #[must_use]
+    pub fn year_start_utc(self, year: i32) -> OffsetDateTime {
+        self.day_start_utc(jan_first(year))
+    }
+
+    /// The UTC instant a year ends at (exclusive).
+    #[must_use]
+    pub fn year_end_utc(self, year: i32) -> OffsetDateTime {
+        self.day_start_utc(jan_first(year + 1))
+    }
+}
+
 /// The UTC instant at which the **Gastag** `day` begins — 06:00 Europe/Berlin.
 ///
 /// The German gas market balances on gas days, not calendar days: a Gastag
@@ -174,13 +351,7 @@ pub fn day_end_utc(day: Date) -> OffsetDateTime {
 /// ```
 #[must_use]
 pub fn gas_day_start_utc(day: Date) -> OffsetDateTime {
-    let naive = PrimitiveDateTime::new(day, Time::from_hms(6, 0, 0).unwrap_or(Time::MIDNIGHT));
-    match naive.assume_timezone(berlin()) {
-        OffsetResult::Some(t) => t,
-        OffsetResult::Ambiguous(first, _) => first,
-        OffsetResult::None => naive.assume_timezone_utc(berlin()),
-    }
-    .to_offset(time::UtcOffset::UTC)
+    resolve_local(PrimitiveDateTime::new(day, GAS_DAY_START)).to_offset(time::UtcOffset::UTC)
 }
 
 /// The UTC instant at which the Gastag `day` ends (exclusive) — 06:00
@@ -208,7 +379,7 @@ pub fn gas_day_end_utc(day: Date) -> OffsetDateTime {
 pub fn local_gas_day(instant: OffsetDateTime) -> Date {
     let local = to_berlin(instant);
     let day = local.date();
-    if local.time() < Time::from_hms(6, 0, 0).unwrap_or(Time::MIDNIGHT) {
+    if local.time() < GAS_DAY_START {
         day.previous_day().unwrap_or(day)
     } else {
         day
@@ -289,6 +460,20 @@ pub enum DayKind {
 }
 
 impl DayKind {
+    /// Every kind, in declaration order.
+    pub const ALL: [Self; 3] = [Self::Normal, Self::ShortDay, Self::LongDay];
+
+    /// Stable DB/wire label. Matches the `serde` tag and
+    /// [`FromStr`](std::str::FromStr) input.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Normal => "NORMAL",
+            Self::ShortDay => "SHORT_DAY",
+            Self::LongDay => "LONG_DAY",
+        }
+    }
+
     /// `true` for the two DST transition days.
     #[must_use]
     pub fn is_dst_transition(self) -> bool {
@@ -351,6 +536,11 @@ pub fn dst_transition_utc(day: Date) -> Option<OffsetDateTime> {
         cursor = next;
     }
     None
+}
+
+crate::codes::string_codes! {
+    DayKind;
+    DayBoundary;
 }
 
 // ── expected interval counts ──────────────────────────────────────────────────
@@ -455,13 +645,7 @@ pub fn shift_back_one_year(instant: OffsetDateTime) -> OffsetDateTime {
     let Ok(shifted) = Date::from_calendar_date(target_year, date.month(), day) else {
         return instant;
     };
-    let naive = PrimitiveDateTime::new(shifted, local.time());
-    match naive.assume_timezone(berlin()) {
-        OffsetResult::Some(t) => t,
-        OffsetResult::Ambiguous(first, _) => first,
-        OffsetResult::None => naive.assume_timezone_utc(berlin()),
-    }
-    .to_offset(time::UtcOffset::UTC)
+    resolve_local(PrimitiveDateTime::new(shifted, local.time())).to_offset(time::UtcOffset::UTC)
 }
 
 /// The same Berlin wall-clock time `days` calendar days earlier.
@@ -475,7 +659,9 @@ pub fn shift_back_one_year(instant: OffsetDateTime) -> OffsetDateTime {
 /// a week every October.
 ///
 /// An ambiguous local time (the repeated autumn hour) resolves to the earlier
-/// instant; a skipped one (the spring hour) to the instant the clock jumps.
+/// instant; a skipped one (the spring hour) is pushed forward by the gap, so
+/// 02:30 on the transition Sunday becomes 03:30 — the convention `java.time`,
+/// `chrono` and Python's `zoneinfo` share.
 ///
 /// ```rust
 /// use metering::calendar;
@@ -493,13 +679,7 @@ pub fn shift_back_days(instant: OffsetDateTime, days: i64) -> OffsetDateTime {
     let Some(date) = local.date().checked_sub(Duration::days(days)) else {
         return instant;
     };
-    let naive = PrimitiveDateTime::new(date, local.time());
-    match naive.assume_timezone(berlin()) {
-        OffsetResult::Some(t) => t,
-        OffsetResult::Ambiguous(first, _) => first,
-        OffsetResult::None => naive.assume_timezone_utc(berlin()),
-    }
-    .to_offset(time::UtcOffset::UTC)
+    resolve_local(PrimitiveDateTime::new(date, local.time())).to_offset(time::UtcOffset::UTC)
 }
 
 /// Days in the Berlin calendar month containing `day` (28–31).
@@ -522,20 +702,43 @@ pub fn is_leap_year(year: i32) -> bool {
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
-/// Resolve 00:00 Berlin local on `day` to the instant it occurs at.
+/// Resolve a Berlin wall-clock date and time to the instant it occurs at.
 ///
-/// Europe/Berlin has not moved its clocks at midnight since the tz database
-/// began, so the ordinary branch is the only one taken in practice. The other
-/// two are still handled rather than unwrapped: an ambiguous midnight resolves
-/// to the **earlier** instant, so consecutive days tile without overlap, and a
-/// skipped midnight resolves to the instant the clock jumps, so no day is empty.
-fn local_midnight_utc(day: Date) -> OffsetDateTime {
-    let naive = PrimitiveDateTime::new(day, Time::MIDNIGHT);
+/// The one place this crate turns a local time into an instant, so the two
+/// awkward cases are decided once:
+///
+/// - **Ambiguous** — the autumn hour that happens twice — resolves to the
+///   **earlier** instant. Consecutive periods then tile without overlap.
+/// - **Skipped** — the spring hour that never happens — is **pushed forward by
+///   the length of the gap**, so 02:30 on the transition Sunday becomes 03:30.
+///   That is the convention `java.time`, `chrono` and Python's `zoneinfo` all
+///   use, and it keeps the map from local times to instants monotonic. The
+///   previous fallback reinterpreted the naive time as UTC, which landed
+///   *before* the gap: "02:30, one day earlier" came back as 01:30 local.
+///
+/// Neither case arises at 00:00 or 06:00 — Europe/Berlin has never moved its
+/// clocks at either — so the ordinary branch is the only one taken by
+/// [`day_start_utc`] and [`gas_day_start_utc`]. [`shift_back_days`] and
+/// [`shift_back_one_year`] can land anywhere, and do reach them.
+fn resolve_local(naive: PrimitiveDateTime) -> OffsetDateTime {
     match naive.assume_timezone(berlin()) {
         OffsetResult::Some(t) => t,
         OffsetResult::Ambiguous(first, _) => first,
-        OffsetResult::None => naive.assume_timezone_utc(berlin()),
+        OffsetResult::None => {
+            // Inside a forward transition the local time does not exist. The
+            // offset in force *before* it — sampled a day earlier, since the
+            // zone transitions at most once a day — maps the naive time onto
+            // the first instant at or after the jump, which is the same as
+            // adding the gap to the wall clock.
+            let before = naive.assume_utc() - Duration::days(1);
+            naive.assume_offset(berlin().get_offset_utc(&before).to_utc())
+        }
     }
+}
+
+/// Resolve 00:00 Berlin local on `day` to the instant it occurs at.
+fn local_midnight_utc(day: Date) -> OffsetDateTime {
+    resolve_local(PrimitiveDateTime::new(day, Time::MIDNIGHT))
 }
 
 /// `span / resolution`, but only for resolutions with a fixed second count and
@@ -741,13 +944,12 @@ mod tests {
             Some(23)
         );
         assert_eq!(
-            intervals_in_day(date!(2026 - 06 - 01), IntervalResolution::Custom(420)),
+            intervals_in_day(
+                date!(2026 - 06 - 01),
+                IntervalResolution::from_seconds(420).unwrap()
+            ),
             None,
             "420 s does not divide 86 400 s"
-        );
-        assert_eq!(
-            intervals_in_day(date!(2026 - 06 - 01), IntervalResolution::Custom(0)),
-            None
         );
     }
 
@@ -882,6 +1084,110 @@ mod tests {
 
         // Zero days is the identity.
         assert_eq!(shift_back_days(plain, 0), plain);
+    }
+
+    /// A local time inside the spring gap does not exist. It is pushed
+    /// **forward** by the gap — the java.time / chrono / zoneinfo convention.
+    /// Reinterpreting it as UTC instead would land at 01:30 local, an hour
+    /// *before* the time that was asked for.
+    #[test]
+    fn a_skipped_local_time_is_pushed_forward_by_the_gap() {
+        // Monday 2026-03-30 02:30 CEST, one day back: Sunday 02:30, which the
+        // clocks skip. 03:30 CEST is the first instant that exists.
+        let back = shift_back_days(datetime!(2026-03-30 0:30 UTC), 1);
+        assert_eq!(back, datetime!(2026-03-29 1:30 UTC));
+        let local = to_berlin(back);
+        assert_eq!(local.date(), date!(2026 - 03 - 29));
+        assert_eq!(local.hour(), 3);
+        assert_eq!(local.minute(), 30);
+
+        // The same rule through the annual shift: 2027-03-29 02:30 CEST maps
+        // to 2026-03-29 02:30, which is the hour that year skips.
+        let year = shift_back_one_year(datetime!(2027-03-29 0:30 UTC));
+        assert_eq!(year, datetime!(2026-03-29 1:30 UTC));
+        assert_eq!(to_berlin(year).hour(), 3, "{year}");
+
+        // ...and the shift never moves backwards past the requested wall clock.
+        for minute in [0i64, 15, 30, 45] {
+            let src = datetime!(2026-03-30 0:00 UTC) + Duration::minutes(minute);
+            let shifted = shift_back_days(src, 1);
+            assert!(shifted < src, "the shift must go back a day");
+            assert!(
+                to_berlin(shifted).hour() >= 2,
+                "a skipped hour resolves forward, not back: {shifted}"
+            );
+        }
+    }
+
+    /// The repeated autumn hour resolves to the **earlier** pass, so the map
+    /// from local times to instants stays single-valued and consecutive
+    /// periods tile.
+    #[test]
+    fn an_ambiguous_local_time_resolves_to_the_earlier_pass() {
+        // Monday 2026-10-26 02:30 CET, one day back: Sunday 02:30, which
+        // happens twice — at 00:30 UTC (CEST) and 01:30 UTC (CET).
+        let back = shift_back_days(datetime!(2026-10-26 1:30 UTC), 1);
+        assert_eq!(back, datetime!(2026-10-25 0:30 UTC));
+        assert_eq!(
+            to_berlin(back).offset(),
+            time::UtcOffset::from_hms(2, 0, 0).unwrap()
+        );
+    }
+
+    /// The Gastag is a boundary, not a length: `DayBoundary` moves a daily
+    /// window six hours without changing anything else.
+    #[test]
+    fn day_boundaries_cut_the_same_day_two_ways() {
+        let day = date!(2026 - 01 - 15);
+        assert_eq!(
+            DayBoundary::Midnight.day_start_utc(day),
+            datetime!(2026-01-14 23:00 UTC)
+        );
+        assert_eq!(
+            DayBoundary::Gastag.day_start_utc(day),
+            datetime!(2026-01-15 5:00 UTC)
+        );
+        assert_eq!(DayBoundary::default(), DayBoundary::Midnight);
+
+        for boundary in DayBoundary::ALL {
+            // Consecutive days tile, and the day an instant falls in contains it.
+            let mut cursor = boundary.day_start_utc(date!(2026 - 10 - 23));
+            let mut d = date!(2026 - 10 - 23);
+            while d < date!(2026 - 10 - 28) {
+                assert_eq!(boundary.day_start_utc(d), cursor, "{boundary:?} {d}");
+                assert_eq!(boundary.local_day(cursor), d, "{boundary:?} {d}");
+                cursor = boundary.day_end_utc(d);
+                d = d.next_day().unwrap();
+            }
+        }
+
+        // The long day is named after the Saturday for gas and the Sunday for
+        // the calendar — the transition falls at 03:00 local, before 06:00.
+        assert_eq!(
+            DayBoundary::Midnight
+                .day_length(date!(2026 - 10 - 25))
+                .whole_hours(),
+            25
+        );
+        assert_eq!(
+            DayBoundary::Gastag
+                .day_length(date!(2026 - 10 - 24))
+                .whole_hours(),
+            25
+        );
+        assert_eq!(
+            DayBoundary::Gastag
+                .intervals_in_day(date!(2026 - 10 - 24), IntervalResolution::QuarterHour),
+            Some(100)
+        );
+        assert_eq!(
+            DayBoundary::Gastag.intervals_in_day(date!(2026 - 10 - 24), IntervalResolution::Day),
+            Some(1)
+        );
+        assert_eq!(
+            DayBoundary::Gastag.intervals_in_day(date!(2026 - 10 - 24), IntervalResolution::Year),
+            None
+        );
     }
 
     /// The Gastag runs 06:00–06:00 local, tiles the timeline, and the DST

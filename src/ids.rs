@@ -90,6 +90,24 @@ pub enum MaloIssuer {
     Bdew,
 }
 
+impl MaloIssuer {
+    /// Every Vergabestelle, in declaration order.
+    pub const ALL: [Self; 2] = [Self::Dvgw, Self::Bdew];
+
+    /// Stable DB/wire label. Matches the `serde` tag and `FromStr` input.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Dvgw => "DVGW",
+            Self::Bdew => "BDEW",
+        }
+    }
+}
+
+crate::codes::string_codes! {
+    MaloIssuer;
+}
+
 // ── MaloId ────────────────────────────────────────────────────────────────────
 
 /// A validated 11-digit Marktlokations-Identifikationsnummer.
@@ -413,8 +431,8 @@ mod tests {
     fn the_scheme_is_not_luhn() {
         assert_eq!(MaloId::compute_check_digit("5123869678"), Some(1));
         assert!("51238696781".parse::<MaloId>().is_ok());
-        // The old, check-digit-invalid spelling this crate itself used to
-        // carry in its examples fails — which is the point of the type.
+        // ...while the same digits with a wrong check digit do not — which is
+        // the point of the type.
         assert!("51238696780".parse::<MaloId>().is_err());
     }
 

@@ -48,7 +48,7 @@ there is no Leistungspreis.
 
 Every `from` and `to` in this crate is a UTC instant. Every *period* — a
 Liefertag, a Liefermonat, a tariff band — is Europe/Berlin local. That is the
-market's own split, stated in the EDI@Energy *Allgemeine Festlegungen* v6.1b,
+market's own split, stated in the EDI@Energy *Allgemeine Festlegungen* v6.1c,
 Kap. 3:
 
 > Die Angabe von Zeiten in einer EDIFACT Nachricht erfolgt in koordinierter

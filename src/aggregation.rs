@@ -10,11 +10,6 @@
 //! - **§ 2 MsbG** — registrierende Lastgangmessung, the metering that makes a
 //!   Viertelstundenleistung available at all.
 //!
-//! Earlier releases cited *§ 12 StromNZV* for the Spitzenleistung. That
-//! provision is *"Standardisierte Lastprofile; Zählerstandsgangmessung"* — it
-//! is about SLP, says nothing about peak demand, and was in any case repealed
-//! with effect from the end of 31 December 2025.
-//!
 //! ## Spitzenleistung (peak demand)
 //!
 //! ```text
@@ -55,12 +50,6 @@
 //! // The split reconstructs the total, always.
 //! assert_eq!(registers.values().sum::<rust_decimal::Decimal>(), period.arbeitsmenge);
 //! ```
-//!
-//! Earlier releases put a two-register `ht_nt` split on [`BillingPeriod`],
-//! configured by an `include_ht_nt` flag and a `TariffWindow`. It could not
-//! express Modul 3, which has three bands and which every Netzbetreiber has had
-//! to offer since 1 April 2025 — so the split moved to the one mechanism that
-//! can express any number of them.
 
 use rust_decimal::Decimal;
 use time::OffsetDateTime;
@@ -150,9 +139,7 @@ pub struct BillingPeriod {
 
     /// Number of intervals that contributed to the Arbeitsmenge.
     ///
-    /// Billable intervals only, so it always matches the sum. It previously
-    /// counted every supplied interval, including the `Faulty` ones that were
-    /// excluded from the total.
+    /// Billable intervals only, so it always matches the sum.
     pub billable_count: usize,
 
     /// Number of intervals supplied but excluded as non-billable.
@@ -174,7 +161,11 @@ pub struct BillingPeriod {
 
 /// Aggregate meter intervals into a [`BillingPeriod`].
 ///
-/// Intervals are sorted by `from` internally.
+/// **Order-independent, and no sort happens.** Every quantity here — a sum, a
+/// maximum, two counts, a covered duration — is order-independent by
+/// construction, so shuffled input gives an identical result in a single pass
+/// with no allocation.
+///
 /// Only intervals where `quality.is_billable()` contribute to the result.
 ///
 /// # Example
@@ -333,5 +324,41 @@ mod tests {
         ];
         let period = aggregate(&intervals, &AggregationConfig::rlm());
         assert_eq!(period.spitzenleistung_kw, Some(dec!(14)));
+    }
+}
+
+#[cfg(test)]
+mod order_tests {
+    use super::*;
+    use crate::interval::QualityFlag;
+    use rust_decimal::dec;
+    use time::macros::datetime;
+
+    /// The documented property, asserted rather than asserted-in-prose: no sort
+    /// is performed because none is needed.
+    #[test]
+    fn aggregation_is_order_independent() {
+        let base = datetime!(2026-01-01 0:00 UTC);
+        let ordered: Vec<MeterInterval> = [dec!(2.5), dec!(5.0), dec!(1.0), dec!(3.25)]
+            .into_iter()
+            .enumerate()
+            .map(|(i, value)| MeterInterval {
+                from: base + time::Duration::minutes(i as i64 * 15),
+                to: base + time::Duration::minutes(i as i64 * 15 + 15),
+                value,
+                quality: QualityFlag::Measured,
+                obis_code: None,
+            })
+            .collect();
+        let mut shuffled = ordered.clone();
+        shuffled.reverse();
+
+        let a = aggregate(&ordered, &AggregationConfig::rlm());
+        let b = aggregate(&shuffled, &AggregationConfig::rlm());
+        assert_eq!(a, b);
+        assert_eq!(
+            a.spitzenleistung_at,
+            Some(base + time::Duration::minutes(15))
+        );
     }
 }

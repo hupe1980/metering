@@ -147,6 +147,66 @@ proptest! {
     fn resolution_strings_are_injective(x in arb_resolution(), y in arb_resolution()) {
         prop_assert_eq!(x == y, x.to_string() == y.to_string());
     }
+
+    /// One duration, one value. Two resolutions with the same fixed length used
+    /// to be constructible — `Custom(900)` alongside `QuarterHour` — which gave
+    /// one 15-minute grid two database keys and broke the round trip, because
+    /// `Custom(900)` writes `"PT900S"` and `"PT900S"` reads back as
+    /// `QuarterHour`. The payload is opaque now, so this holds by construction.
+    #[test]
+    fn one_fixed_length_is_one_value(x in arb_resolution(), y in arb_resolution()) {
+        if let (Some(a), Some(b)) = (x.fixed_seconds(), y.fixed_seconds()) {
+            prop_assert_eq!(a == b, x == y);
+        }
+    }
+
+    /// `from_seconds` is the normal form: it is the only constructor, it is
+    /// idempotent through `fixed_seconds`, and what it builds round-trips.
+    #[test]
+    fn from_seconds_is_the_normal_form(secs in 1u32..1_000_000) {
+        let r = IntervalResolution::from_seconds(secs).expect("nonzero");
+        prop_assert_eq!(r.fixed_seconds(), Some(secs));
+        prop_assert_eq!(IntervalResolution::from_seconds(secs), Some(r));
+        prop_assert_eq!(r.to_string().parse::<IntervalResolution>(), Ok(r));
+    }
+}
+
+// ── LoadProfile and the lifecycle codes ──────────────────────────────────────
+
+/// Every closed-vocabulary enum with a `Display` form obeys the same four
+/// invariants, so they are checked in one place rather than per module.
+#[test]
+fn closed_vocabularies_round_trip_and_stay_injective() {
+    use metering::LoadProfile;
+    use metering::lifecycle::{MeterLifecycleEventType, MeterStatus};
+    use std::collections::BTreeSet;
+
+    macro_rules! check {
+        ($ty:ty) => {{
+            let all = <$ty>::ALL;
+            assert_eq!(all.len(), <$ty>::CODES.len(), stringify!($ty));
+            let mut seen = BTreeSet::new();
+            for (v, code) in all.iter().zip(<$ty>::CODES) {
+                assert_eq!(v.as_str(), *code, "{v:?}");
+                assert_eq!(&v.to_string(), *code, "{v:?}");
+                assert_eq!(&v.to_string().parse::<$ty>().unwrap(), v, "{v:?}");
+                // Lenient in, canonical out — as everywhere in this crate.
+                assert_eq!(
+                    &format!("  {}  ", code.to_lowercase())
+                        .parse::<$ty>()
+                        .unwrap(),
+                    v,
+                    "{v:?}"
+                );
+                assert!(seen.insert(*code), "duplicate code {code}");
+            }
+            assert!("NOT_A_CODE".parse::<$ty>().is_err(), stringify!($ty));
+        }};
+    }
+
+    check!(LoadProfile);
+    check!(MeterStatus);
+    check!(MeterLifecycleEventType);
 }
 
 // ── MaloId / MeloId ──────────────────────────────────────────────────────────
@@ -277,7 +337,7 @@ mod serde_agrees_with_display {
             vec![
                 IntervalResolution::QuarterHour,
                 IntervalResolution::Day,
-                IntervalResolution::Custom(300),
+                IntervalResolution::from_seconds(300).unwrap(),
             ]
         );
     }

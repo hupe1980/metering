@@ -7,7 +7,7 @@
 [![License](https://img.shields.io/crates/l/metering.svg)](#-license)
 
 **German energy metering domain library for Rust.** Europe/Berlin calendar
-arithmetic (including the 06:00 Gastag), Zählerstandsgang → Lastgang, gas
+arithmetic — Liefertag *and* Gastag — Zählerstandsgang → Lastgang, gas
 m³→kWh_Hs and the SigLinDe gas SLP, Ersatzwertbildung, a robust validation
 engine, EN 50160, §14a Modul 3 tariff registers, virtual meters (§42b EnWG),
 check-digit-validated MaLo-IDs and Jahresprognose.
@@ -89,6 +89,39 @@ A completeness check built on a hard-coded 96 raises a false alarm every spring
 and — worse — **hides a genuine four-interval gap every autumn**, because 96 of
 an expected 100 looks complete.
 
+### ...and gas does not start its day at midnight
+
+Gas balances on the **Gastag**, 06:00 to 06:00 local. That is the same day cut
+six hours later, not a different length — so it is a *boundary*, and
+`DayBoundary` carries it into the places a daily grid is actually built:
+
+```rust
+use metering::{MeterInterval, QualityFlag, ResampleConfig, calendar, resample};
+use rust_decimal::dec;
+use time::{Duration, macros::date};
+
+let start = calendar::gas_day_start_utc(date!(2026 - 01 - 15));
+let series: Vec<MeterInterval> = (0..48).map(|i| MeterInterval {
+    from: start + Duration::hours(i),
+    to:   start + Duration::hours(i + 1),
+    value: dec!(1),
+    quality: QualityFlag::Measured,
+    obis_code: None,
+}).collect();
+
+// Two whole Gastage...
+let gas_days = resample(&series, &ResampleConfig::to_gas_daily());
+assert_eq!(gas_days.len(), 2);
+assert_eq!(gas_days[0].is_complete(), Some(true));
+
+// ...where the calendar day makes three partial buckets out of the same data.
+let calendar_days = resample(
+    &series,
+    &ResampleConfig::new(metering::IntervalResolution::Hour, metering::IntervalResolution::Day),
+);
+assert_eq!(calendar_days.len(), 3);
+```
+
 → [Time and the calendar](https://hupe1980.github.io/metering/docs/time-and-calendar/)
 
 ### The whole pipeline, end to end
@@ -109,15 +142,15 @@ it. It asserts its own invariants, so CI runs it as a test.
 
 | Area | What it does | Guide |
 |---|---|---|
-| **Calendar** | Berlin days, months, years **and the 06:00 Gastag**; DST-correct interval counts; Bundesland holidays | [→](https://hupe1980.github.io/metering/docs/time-and-calendar/) |
+| **Calendar** | Berlin days, months, years **and the 06:00 Gastag**; `DayBoundary` carries the choice into resampling and gap filling; DST-correct interval counts; Bundesland holidays | [→](https://hupe1980.github.io/metering/docs/time-and-calendar/) |
 | **Readings** | Zählerstandsgang → Lastgang, register rollover, meter exchange | [→](https://hupe1980.github.io/metering/docs/readings/) |
 | **Identifiers** | `MaloId` with the BDEW check digit verified at the parse; `MeloId` | [→](https://hupe1980.github.io/metering/docs/identifiers/) |
-| **Validation** | Order-independent rules V01–V12 (V10 retired), Hampel outlier test, A/B/C/F grading | [→](https://hupe1980.github.io/metering/docs/validation/) |
+| **Validation** | Order-independent rules V01–V12 (V10 retired), Hampel outlier test, A/B/C/F grading, and a `RuleSet` saying which rules actually ran | [→](https://hupe1980.github.io/metering/docs/validation/) |
 | **Ersatzwerte** | Four methods, calendar-aware grid, audit trail of what actually ran | [→](https://hupe1980.github.io/metering/docs/substitute-values/) |
 | **Tariff registers** | HT/NT and §14a Modul 3 in one mechanism | [→](https://hupe1980.github.io/metering/docs/tariff-registers/) |
 | **Gas & units** | m³→kWh_Hs, G 685 rounding, the SigLinDe gas SLP, exact-rational unit normalisation | [→](https://hupe1980.github.io/metering/docs/gas-and-units/) |
 | **Power quality** | EN 50160 as the statistical test it actually is | [→](https://hupe1980.github.io/metering/docs/power-quality/) |
-| **Virtual meters** | Sum, Residual, GGV allocation (§42b EnWG) | [→](https://hupe1980.github.io/metering/docs/virtual-meters/) |
+| **Virtual meters** | Sum, Residual, GGV allocation (§42b EnWG) — net grid draw *and* the allocated share | [→](https://hupe1980.github.io/metering/docs/virtual-meters/) |
 | **End to end** | The full MSB pipeline as a runnable example | [→](https://hupe1980.github.io/metering/docs/pipeline/) |
 
 ---
@@ -148,8 +181,22 @@ cannot be done without one — but it counts no business days.
 - **Exact decimals for quantities, `f64` only for statistics.** The two meet in
   one place — the outlier rule converts values to run the Hampel filter — and
   nothing a float touches is written back into a quantity.
-- **One value, one string.** `ObisCode` and `IntervalResolution` each have
-  exactly one canonical spelling, held by a proptest suite.
+- **One value, one string — and one meaning, one value.** `ObisCode` and
+  `IntervalResolution` each have exactly one canonical spelling, and two
+  distinct values can never mean the same thing: `IntervalResolution::Custom`
+  refuses a length that already has a name. Both held by a proptest suite.
+- **Every coded enum carries the whole contract** — `ALL`, `CODES`, `as_str`,
+  `Display`, `FromStr`, and a `serde` tag that *is* the code. Generate a
+  database `CHECK` constraint from `CODES` and it cannot drift from what the
+  crate writes; one test asserts all six properties for all thirty-four enums.
+- **A clean validation report says which rules ran.** Four of the eleven are
+  opt-in — they need a number the library will not invent — so
+  `ValidationResult::evaluated` and `ValidationConfig::disabled_rules()` make
+  the difference between "found nothing" and "never looked" a fact you can log
+  or assert on.
+- **No second copy of a fact.** A register's unit comes from its OBIS code, a
+  meter exchange's date from its instant, a series' worst quality from its
+  intervals — never from a field that can drift out of step.
 - **Serde tags are semver-covered**, pinned literally by a test.
 - **Domain enums are exhaustive**; only error enums are `#[non_exhaustive]`.
 - **Unknown is not good.** Where a quantity cannot be determined the API says
@@ -184,6 +231,9 @@ just site   # serve the documentation site locally
 
 Beyond the unit tests:
 
+- `tests/code_contract.rs` — every coded enum, six properties each: `ALL` vs
+  `CODES`, `as_str` is `Display`, `FromStr` inverts it, codes are distinct, the
+  `serde` tag *is* the code, and an unknown code is an error
 - `tests/berlin_calendar.rs` — DST interval counts against the tz database
 - `tests/string_canonicalisation.rs` — proptest: stability, totality,
   idempotence, injectivity of every string form

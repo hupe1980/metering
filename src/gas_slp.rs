@@ -4,13 +4,15 @@
 //!
 //! Unlike the 2025 electricity profiles, whose value tables are licensed, the
 //! gas SLP procedure is **published in full**: the BDEW/VKU/GEODE Leitfaden
-//! *"Abwicklung von Standardlastprofilen Gas"* (KoV, current edition
-//! 28.10.2025; the formulas below are unchanged since the SigLinDe profiles
-//! were introduced in 2015) prints the profile function, the temperature
-//! weighting, the weekday factors and every coefficient set. Historically the
-//! duty to apply standard load profiles below 1.5 million kWh/a stood in
-//! § 24 GasNZV, repealed with effect from the end of 31.12.2025; the procedure
-//! itself continues under the KoV Leitfaden and the BNetzA Festlegungen.
+//! *"Abwicklung von Standardlastprofilen Gas"*, Anlage zur
+//! Kooperationsvereinbarung Gas — current edition **KoV XV, Stand
+//! 27.03.2026**, coefficients in Anlage 6 — prints the profile function, the
+//! temperature weighting, the weekday factors and every coefficient set. The
+//! formulas below are unchanged since the SigLinDe profiles were introduced in
+//! 2015. Historically the duty to apply standard load profiles below
+//! 1.5 million kWh/a stood in § 24 GasNZV, repealed with effect from the end
+//! of 31.12.2025; the procedure itself continues under the KoV Leitfaden and
+//! the BNetzA Festlegungen.
 //!
 //! ## The profile function
 //!
@@ -50,11 +52,13 @@
 //!
 //! ## What is deliberately not here
 //!
-//! - **Coefficient tables for every profile.** The Leitfaden publishes them
-//!   (14 profile types — HEF, HMF, HKO and eleven Gewerbe types — in several
-//!   Ausprägungen each); operators load the set they balance with. One
-//!   published reference set, [`SigLinDe::DE_HEF34`], is embedded so the
-//!   implementation can be verified against the printed numbers.
+//! - **Coefficient tables for every profile.** The Leitfaden publishes them —
+//!   15 profile types (HEF, HMF, HKO, eleven Gewerbe sector types and the GHD
+//!   Summenlastprofil) in two variants each, `33` and `34`, which differ in
+//!   how much of the demand the linear part carries. Operators load the set
+//!   they balance with. One published reference set, [`SigLinDe::DE_HEF34`],
+//!   is embedded so the implementation can be verified against the printed
+//!   numbers.
 //! - **The analytical procedure's decomposition step.** Splitting a metered
 //!   Restlast across delivery points needs the whole network's data and is a
 //!   settlement-system concern; the synthetic arithmetic here is also what the
@@ -133,13 +137,20 @@ impl SigLinDe {
     /// coefficients themselves carry seven.
     pub const H_VALUE_DP: u32 = 6;
 
-    /// The published **DE_HEF34** coefficient set — FfE SigLinDe,
-    /// Einfamilienhaushalt, bundesweit, Ausprägung `+` (EDI code `1D4`).
+    /// The published **DE_HEF34** coefficient set — SigLinDe,
+    /// Einfamilienhaushalt (`HEF`), bundesweit (`DE`), variant `34`.
     ///
-    /// Quoted from the Leitfaden's *"Koeffizienten und Wochentagfaktoren für
-    /// Deutschland"* annex, where the same row states `h(8 °C) = 1.00000` —
-    /// the normalisation this module's tests verify. Households carry no
-    /// weekday dependence, so its factors are all `1.0000`.
+    /// The trailing two digits are the **variant**, not a Bundesland code: the
+    /// Leitfaden publishes each of the fifteen profiles as `33` and `34`,
+    /// which differ in how much of the demand the linear part carries. Quoted
+    /// from Anlage 6, where the same row states `h(8 °C) = 1.00000` — the
+    /// normalisation this module's tests verify. Households carry no weekday
+    /// dependence, so its factors are all `1.0000`.
+    ///
+    /// No EDI code is asserted: the UTILMD code for a delivery point's profile
+    /// depends on the Klasse and Ausprägung the Netzbetreiber assigns
+    /// (EDI@Energy *Codeliste TUM- und BDEW-SLP Gas*), which is master data
+    /// this crate does not hold.
     pub const DE_HEF34: Self = Self {
         a: 1.381_966_3,
         b: -37.412_415_5,
@@ -152,8 +163,13 @@ impl SigLinDe {
         b_w: 0.135_507_0,
     };
 
-    /// A pure sigmoid profile — the pre-2015 TUM form, with no linear parts
-    /// and the standard reference temperature of 40 °C.
+    /// A pure sigmoid profile — no linear parts, and the standard reference
+    /// temperature of 40 °C.
+    ///
+    /// This is the pre-2015 TUM form, and also how the Leitfaden publishes
+    /// **HKO**, the Kochgasprofil: a connection serving only a cooker or an
+    /// instantaneous water heater has no space-heating and no storage draw, so
+    /// `mH = bH = mW = bW = 0` and the curve is nearly flat in temperature.
     #[must_use]
     pub const fn pure_sigmoid(a: f64, b: f64, c: f64, d: f64) -> Self {
         Self {
@@ -244,7 +260,9 @@ pub fn allocation_temperature(
 /// The Leitfaden gives them with four decimal places and requires the
 /// standard week to sum to **7.0000** exactly — [`new`](Self::new) enforces
 /// it. Household profiles (HEF/HMF/HKO) carry no weekday dependence:
-/// [`NONE`](Self::NONE).
+/// [`NONE`](Self::NONE). The GHD Summenlastprofil does carry factors, but
+/// close to `1` — they are a weighted mean over the eleven sector profiles,
+/// whose working-week shapes largely cancel.
 ///
 /// ## Feiertage take the Sunday factor
 ///

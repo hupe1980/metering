@@ -14,8 +14,7 @@
 //!   need a Steuerungseinrichtung at the Netzanschlusspunkt.
 //! - **Nr. 2b**: Anlagenbetreiber (EEG/KWK) with installed capacity
 //!   **> 7 kW**, to the extent required to meet the §45 Abs. 1 quotas.
-//!   The pre-GNDEW 7–100 kW band no longer appears in the current text —
-//!   there is no verified upper capacity limit.
+//!   The current text sets no upper capacity limit.
 //!
 //! Source: gesetze-im-internet.de/messbg/__29.html (retrieved 2026-07).
 
@@ -48,6 +47,26 @@ pub enum RolloutObligation {
 }
 
 impl RolloutObligation {
+    /// Every outcome, in declaration order.
+    pub const ALL: [Self; 4] = [
+        Self::PflichtConsumption,
+        Self::PflichtSteuerbare14a,
+        Self::PflichtGeneration,
+        Self::Optionsfall,
+    ];
+
+    /// Stable DB/wire label. Matches the `serde` tag and
+    /// [`FromStr`](std::str::FromStr) input.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::PflichtConsumption => "PFLICHT_CONSUMPTION",
+            Self::PflichtSteuerbare14a => "PFLICHT_STEUERBARE14A",
+            Self::PflichtGeneration => "PFLICHT_GENERATION",
+            Self::Optionsfall => "OPTIONSFALL",
+        }
+    }
+
     /// `true` for every mandatory case of §29 Abs. 1 MsbG.
     #[must_use]
     pub fn is_pflichteinbaufall(self) -> bool {
@@ -109,6 +128,26 @@ pub enum QuotaScope {
     TotalStock,
     /// Share of the Messstellen newly falling due within the window.
     NewInWindow,
+}
+
+impl QuotaScope {
+    /// Every scope, in declaration order.
+    pub const ALL: [Self; 2] = [Self::TotalStock, Self::NewInWindow];
+
+    /// Stable DB/wire label. Matches the `serde` tag and
+    /// [`FromStr`](std::str::FromStr) input.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::TotalStock => "TOTAL_STOCK",
+            Self::NewInWindow => "NEW_IN_WINDOW",
+        }
+    }
+}
+
+crate::codes::string_codes! {
+    RolloutObligation;
+    QuotaScope;
 }
 
 /// One milestone of the §45 Abs. 1 MsbG Rollout-Fahrplan.

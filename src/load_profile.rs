@@ -30,7 +30,8 @@
 //! | P0 | Pumping stations | Electricity |
 //! | H25/G25/L25/P25/S25 | The 2025 revision | Electricity |
 //! | HEF/HMF/HKO | Households (heating / cooking gas) | Gas |
-//! | GKO…GMF | Eleven Gewerbe types (TUM/FfE) | Gas |
+//! | GKO…GMF | Eleven Gewerbe sector types (TUM/FfE) | Gas |
+//! | GHD | The Gewerbe/Handel/Dienstleistung Summenlastprofil | Gas |
 //!
 //! ## Usage
 //!
@@ -135,11 +136,10 @@ pub enum LoadProfile {
 
     // ── Gas profiles ─────────────────────────────────────────────────────────
     // The TUM/FfE profile types of the BDEW/VKU/GEODE Leitfaden "Abwicklung
-    // von Standardlastprofilen Gas" — the temperature-dependent daily profiles
-    // whose arithmetic lives in `crate::gas_slp`. Earlier releases carried
-    // three invented codes ("EF", "MF", "GHD"); no gas SLP is named any of
-    // those, and "GHD" in particular does not exist — the commercial sector is
-    // eleven separate profile types.
+    // von Standardlastprofilen Gas" (KoV XV, Stand 27.03.2026), Anlage 6 —
+    // the temperature-dependent daily profiles whose arithmetic lives in
+    // `crate::gas_slp`. Fifteen in all: three household types, eleven Gewerbe
+    // sector types, and the GHD Summenlastprofil.
     /// HEF — Haushalt, Einfamilienhaushalt (single-family, heating gas).
     #[cfg_attr(feature = "serde", serde(rename = "HEF"))]
     GasHEF,
@@ -197,6 +197,20 @@ pub enum LoadProfile {
     #[cfg_attr(feature = "serde", serde(rename = "GMF"))]
     GasGMF,
 
+    /// GHD — the **Summenlastprofil Gewerbe, Handel, Dienstleistung**
+    /// ("GHD-Stützpunkt"), for a delivery point that cannot be assigned to one
+    /// of the eleven sector types.
+    ///
+    /// Its coefficients and weekday factors are a weighted mean across the
+    /// sector profiles, so it has its own published SigLinDe row rather than
+    /// being a placeholder. The TUM coding calls it *"Summenlastprofil
+    /// Gewerbe, Handel, Dienstleistung"*, codes `HD3` and `HD4` (EDI@Energy
+    /// *Codeliste TUM- und BDEW-SLP Gas* v1.1, §6.3); `GHD` is the
+    /// BDEW/SigLinDe short code, formed as `G` + the TUM stem like `GMF` from
+    /// `MF`.
+    #[cfg_attr(feature = "serde", serde(rename = "GHD"))]
+    GasGHD,
+
     // ── Legacy / other ────────────────────────────────────────────────────────
     /// Custom profile — not a standard BDEW profile.
     /// The profile name is stored separately in the MaLo record.
@@ -209,7 +223,7 @@ impl LoadProfile {
     ///
     /// Used in UTILMD `MR+Z07`/`MR+Z08` segments and the MaLo lastprofil field.
     #[must_use]
-    pub fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::H0 => "H0",
             Self::G0 => "G0",
@@ -242,12 +256,13 @@ impl LoadProfile {
             Self::GasGBA => "GBA",
             Self::GasGPD => "GPD",
             Self::GasGMF => "GMF",
+            Self::GasGHD => "GHD",
             Self::Custom => "CUSTOM",
         }
     }
 
     /// Every variant, in declaration order.
-    pub const ALL: [Self; 32] = [
+    pub const ALL: [Self; 33] = [
         Self::H0,
         Self::G0,
         Self::G1,
@@ -279,70 +294,20 @@ impl LoadProfile {
         Self::GasGBA,
         Self::GasGPD,
         Self::GasGMF,
+        Self::GasGHD,
         Self::Custom,
-    ];
-
-    /// The canonical codes, in the same order as [`ALL`](Self::ALL).
-    ///
-    /// [`parse`](Self::parse) also accepts `"EF"` and `"MF"` — the codes
-    /// earlier releases of this crate wrote for HEF and HMF — as lenient
-    /// aliases; they normalise onto the canonical spelling.
-    pub const CODES: &'static [&'static str] = &[
-        "H0", "G0", "G1", "G2", "G3", "G4", "G5", "G6", "L0", "L1", "L2", "P0", "H25", "G25",
-        "L25", "P25", "S25", "HEF", "HMF", "HKO", "GKO", "GHA", "GMK", "GBD", "GGA", "GBH", "GWA",
-        "GGB", "GBA", "GPD", "GMF", "CUSTOM",
     ];
 
     /// Parse from the BDEW profile identifier string.
     ///
-    /// Returns `None` for unknown profile codes. [`FromStr`](std::str::FromStr)
-    /// is the same parse with a [`ParseError`](crate::ParseError) instead.
+    /// Case-insensitive and tolerant of surrounding whitespace, like every
+    /// other parser in this crate, and lenient about the two codes earlier
+    /// releases wrote (`EF`, `MF`). Returns `None` for an unknown code;
+    /// [`FromStr`](std::str::FromStr) is the same parse with a
+    /// [`ParseError`](crate::ParseError) instead.
     #[must_use]
     pub fn parse(s: &str) -> Option<Self> {
-        match s.to_uppercase().as_str() {
-            "H0" => Some(Self::H0),
-            "G0" => Some(Self::G0),
-            "G1" => Some(Self::G1),
-            "G2" => Some(Self::G2),
-            "G3" => Some(Self::G3),
-            "G4" => Some(Self::G4),
-            "G5" => Some(Self::G5),
-            "G6" => Some(Self::G6),
-            "L0" => Some(Self::L0),
-            "L1" => Some(Self::L1),
-            "L2" => Some(Self::L2),
-            "P0" => Some(Self::P0),
-            "H25" => Some(Self::H25),
-            "G25" => Some(Self::G25),
-            "L25" => Some(Self::L25),
-            "P25" => Some(Self::P25),
-            "S25" => Some(Self::S25),
-            "HEF" => Some(Self::GasHEF),
-            "HMF" => Some(Self::GasHMF),
-            "HKO" => Some(Self::GasHKO),
-            "GKO" => Some(Self::GasGKO),
-            "GHA" => Some(Self::GasGHA),
-            "GMK" => Some(Self::GasGMK),
-            "GBD" => Some(Self::GasGBD),
-            "GGA" => Some(Self::GasGGA),
-            "GBH" => Some(Self::GasGBH),
-            "GWA" => Some(Self::GasGWA),
-            "GGB" => Some(Self::GasGGB),
-            "GBA" => Some(Self::GasGBA),
-            "GPD" => Some(Self::GasGPD),
-            "GMF" => Some(Self::GasGMF),
-            // Lenient aliases for the codes earlier releases wrote. "GHD" is
-            // deliberately not one: no gas SLP is named GHD, and there is no
-            // single profile it could map onto — the commercial sector is
-            // eleven distinct types.
-            "EF" => Some(Self::GasHEF),
-            "MF" => Some(Self::GasHMF),
-            // `Custom` is a real variant with a real code, so it must parse
-            // back — `as_str` emits "CUSTOM", and a mapping whose inverse drops
-            // a variant turns a stored profile into a parse failure on read.
-            "CUSTOM" => Some(Self::Custom),
-            _ => None,
-        }
+        s.parse().ok()
     }
 
     /// `true` when this is a residential profile.
@@ -400,6 +365,7 @@ impl LoadProfile {
                 | Self::GasGBA
                 | Self::GasGPD
                 | Self::GasGMF
+                | Self::GasGHD
         )
     }
 
@@ -429,21 +395,15 @@ impl LoadProfile {
                 | Self::GasGBA
                 | Self::GasGPD
                 | Self::GasGMF
+                | Self::GasGHD
         )
     }
-}
 
-impl std::fmt::Display for LoadProfile {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.as_str())
-    }
-}
-
-impl std::str::FromStr for LoadProfile {
-    type Err = crate::error::ParseError;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        LoadProfile::parse(s)
-            .ok_or_else(|| crate::error::ParseError::one_of("LoadProfile", s, Self::CODES))
+    /// `true` for the GHD Summenlastprofil — the aggregate a delivery point
+    /// takes when it fits none of the eleven Gewerbe sector types.
+    #[must_use]
+    pub fn is_gas_aggregate(self) -> bool {
+        matches!(self, Self::GasGHD)
     }
 }
 
@@ -535,6 +495,37 @@ pub enum SlpDayType {
     SonnFeiertag,
 }
 
+impl SlpDayType {
+    /// Every day type, in declaration order.
+    pub const ALL: [Self; 3] = [Self::Werktag, Self::Samstag, Self::SonnFeiertag];
+
+    /// Stable DB/wire label. Matches the `serde` tag and
+    /// [`FromStr`](std::str::FromStr) input.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Werktag => "WERKTAG",
+            Self::Samstag => "SAMSTAG",
+            Self::SonnFeiertag => "SONN_FEIERTAG",
+        }
+    }
+}
+
+crate::codes::string_codes! {
+    SlpDayType;
+    // `EF` and `MF` are in circulation for HEF and HMF; accepted on the way
+    // in, never written out.
+    LoadProfile, aliases = [("EF", Self::GasHEF), ("MF", Self::GasHMF)];
+}
+
+/// The value tables of a 2025-generation profile, keyed by `(month, day_type)`.
+///
+/// `month` is `1..=12` and each entry holds the day's quarter-hour values — 96
+/// on an ordinary day. A named alias rather than the bare map because it
+/// appears in the struct, the accessor and the `serde` bridge, and a
+/// three-level generic spelled out three times is a type nobody reads.
+pub type SlpValueTable = std::collections::BTreeMap<(u8, SlpDayType), Vec<Decimal>>;
+
 /// A 2025-generation profile table.
 ///
 /// BDEW *Hinweise zu den aktualisierten Standardlastprofilen Strom*
@@ -561,7 +552,14 @@ pub struct DynamicSlpProfile {
     pub profile: Option<LoadProfile>,
     /// `values[(month, day_type)]` → 96 quarter-hour values.
     /// `month` is 1..=12.
-    pub values: std::collections::BTreeMap<(u8, SlpDayType), Vec<Decimal>>,
+    ///
+    /// The `serde` form is a **list** of `{ month, day_type, values }` records,
+    /// not a map: a JSON object key has to be a string, and a tuple key is not
+    /// one, so the derived representation failed at runtime with *"key must be
+    /// a string"* on the format almost every caller uses. The in-memory type
+    /// stays a map, because the lookup wants one.
+    #[cfg_attr(feature = "serde", serde(with = "profile_table"))]
+    pub values: SlpValueTable,
     /// The Dynamisierungsfunktion that came with the table.
     ///
     /// Supplied rather than assumed: the 2025 Anwendungshilfe publishes its
@@ -571,6 +569,54 @@ pub struct DynamicSlpProfile {
     /// [`value_at`](Self::value_at) return `None` rather than silently
     /// returning an entdynamisiert value as if it were a real one.
     pub dynamization: Option<Dynamization>,
+}
+
+/// The `serde` form of [`DynamicSlpProfile::values`]: a list of day tables.
+///
+/// A `BTreeMap` keyed by `(u8, SlpDayType)` cannot be serialised to any format
+/// whose map keys are strings — JSON, YAML, TOML — so the derived
+/// representation was an API that existed at compile time and failed at run
+/// time. A sequence of records has no such restriction, reads well by hand, and
+/// keeps the map's ordering guarantee on the way back in.
+#[cfg(feature = "serde")]
+mod profile_table {
+    use super::{Decimal, SlpDayType, SlpValueTable};
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    /// One (month, day type) row of a 2025 profile table.
+    #[derive(Serialize, Deserialize)]
+    struct DayTable {
+        /// Calendar month, 1..=12.
+        month: u8,
+        /// Werktag / Samstag / Sonn- und Feiertag.
+        day_type: SlpDayType,
+        /// The day's quarter-hour values — 96 of them on an ordinary day.
+        values: Vec<Decimal>,
+    }
+
+    pub(super) fn serialize<S: Serializer>(
+        table: &SlpValueTable,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        let rows: Vec<DayTable> = table
+            .iter()
+            .map(|(&(month, day_type), values)| DayTable {
+                month,
+                day_type,
+                values: values.clone(),
+            })
+            .collect();
+        rows.serialize(serializer)
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<SlpValueTable, D::Error> {
+        Ok(Vec::<DayTable>::deserialize(deserializer)?
+            .into_iter()
+            .map(|row| ((row.month, row.day_type), row.values))
+            .collect())
+    }
 }
 
 impl DynamicSlpProfile {
@@ -724,14 +770,21 @@ mod tests {
     fn gas_classification() {
         let gas_codes = [
             "HEF", "HMF", "HKO", "GKO", "GHA", "GMK", "GBD", "GGA", "GBH", "GWA", "GGB", "GBA",
-            "GPD", "GMF",
+            "GPD", "GMF", "GHD",
         ];
         for p in LoadProfile::ALL {
             assert_eq!(p.is_gas(), gas_codes.contains(&p.as_str()), "{p}");
         }
+        assert_eq!(gas_codes.len(), 15, "the Leitfaden publishes fifteen");
         assert!(LoadProfile::GasHEF.is_gas());
         assert!(LoadProfile::GasGKO.is_gas());
         assert!(!LoadProfile::H0.is_gas());
+
+        // The GHD Summenlastprofil is a Gewerbe profile and the only aggregate.
+        assert!(LoadProfile::GasGHD.is_gas());
+        assert!(LoadProfile::GasGHD.is_commercial());
+        assert!(LoadProfile::GasGHD.is_gas_aggregate());
+        assert!(!LoadProfile::GasGKO.is_gas_aggregate());
     }
 
     #[test]
@@ -742,8 +795,13 @@ mod tests {
         // The pre-0.18 codes are lenient aliases onto the canonical spelling.
         assert_eq!(LoadProfile::parse("EF"), Some(LoadProfile::GasHEF));
         assert_eq!(LoadProfile::parse("MF"), Some(LoadProfile::GasHMF));
-        // ...but "GHD" never named a gas SLP and maps to nothing.
-        assert_eq!(LoadProfile::parse("GHD"), None);
+
+        // "GHD" is a real profile — the Summenlastprofil Gewerbe, Handel,
+        // Dienstleistung, listed as codes HD3/HD4 in the EDI@Energy Codeliste
+        // TUM- und BDEW-SLP Gas v1.1 §6.3.
+        assert_eq!(LoadProfile::parse("GHD"), Some(LoadProfile::GasGHD));
+        assert_eq!(LoadProfile::parse(" ghd "), Some(LoadProfile::GasGHD));
+        assert_eq!(LoadProfile::GasGHD.as_str(), "GHD");
     }
 
     #[test]
@@ -875,5 +933,59 @@ mod tests {
         let new_year = h25.value_on(date!(2026 - 01 - 01), Bundesland::By, 0);
         let midsummer = h25.value_on(date!(2026 - 06 - 07), Bundesland::By, 0);
         assert!(new_year > midsummer, "winter runs above summer");
+    }
+}
+
+#[cfg(test)]
+mod parse_and_wire_tests {
+    use super::*;
+
+    /// Every parser in this crate tolerates surrounding whitespace. This one
+    /// did not, so a profile code arriving with a trailing space from a CSV or
+    /// a fixed-width EDIFACT field was a parse failure rather than an H0.
+    #[test]
+    fn parsing_is_case_and_whitespace_insensitive() {
+        for spelling in ["H0", "h0", " H0 ", "\th0\n"] {
+            assert_eq!(
+                LoadProfile::parse(spelling),
+                Some(LoadProfile::H0),
+                "{spelling:?}"
+            );
+            assert_eq!(spelling.parse::<LoadProfile>().unwrap(), LoadProfile::H0);
+        }
+        assert_eq!(LoadProfile::parse(" hef "), Some(LoadProfile::GasHEF));
+        assert!(LoadProfile::parse("X9").is_none(), "not a profile code");
+    }
+
+    /// A profile table has to survive a round trip through JSON, which is the
+    /// format an operator's licensed BDEW tables actually arrive in. The
+    /// derived `BTreeMap<(u8, SlpDayType), _>` representation could not: a JSON
+    /// object key must be a string, so `to_string` failed at run time on a type
+    /// whose `serde` form this crate calls part of its public API.
+    #[cfg(feature = "serde")]
+    #[test]
+    fn a_profile_table_round_trips_through_json() {
+        use rust_decimal::dec;
+
+        let mut profile = DynamicSlpProfile {
+            profile: Some(LoadProfile::H25),
+            dynamization: Some(Dynamization::vdew_1999()),
+            ..Default::default()
+        };
+        profile
+            .values
+            .insert((6, SlpDayType::Werktag), vec![dec!(1.5); 96]);
+        profile
+            .values
+            .insert((6, SlpDayType::SonnFeiertag), vec![dec!(0.9); 96]);
+
+        let json = serde_json::to_string(&profile).expect("a table must serialise");
+        assert!(json.contains("\"day_type\":\"WERKTAG\""), "{json}");
+        assert!(json.contains("\"month\":6"), "{json}");
+
+        let back: DynamicSlpProfile = serde_json::from_str(&json).expect("...and read back");
+        assert_eq!(back.values, profile.values);
+        assert_eq!(back.profile, profile.profile);
+        assert_eq!(back.dynamization, profile.dynamization);
     }
 }

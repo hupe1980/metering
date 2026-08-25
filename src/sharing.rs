@@ -66,9 +66,16 @@ pub enum EligibilityBasis {
 }
 
 impl EligibilityBasis {
-    /// Stable label for API responses and logs.
+    /// Every basis, in declaration order.
+    pub const ALL: [Self; 2] = [
+        Self::Zaehlerstandsgangmessung,
+        Self::RegistrierendeLeistungsmessung,
+    ];
+
+    /// Stable DB/wire label. Matches the `serde` tag and
+    /// [`FromStr`](std::str::FromStr) input.
     #[must_use]
-    pub const fn label(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::Zaehlerstandsgangmessung => "ZAEHLERSTANDSGANGMESSUNG",
             Self::RegistrierendeLeistungsmessung => "REGISTRIERENDE_LEISTUNGSMESSUNG",
@@ -124,6 +131,29 @@ pub enum Finding {
 }
 
 impl Finding {
+    /// Stable DB/wire label. Matches the `serde` tag and
+    /// [`FromStr`](std::str::FromStr) input.
+    ///
+    /// [`description_de`](Self::description_de) is the German prose; this is
+    /// the code a readiness report is routed and stored on.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NotRemotelyReadable => "NOT_REMOTELY_READABLE",
+            Self::ModerneMesseinrichtungWithoutGateway => "MODERNE_MESSEINRICHTUNG_WITHOUT_GATEWAY",
+            Self::BalancingMethodHasNoQuarterHourValues => {
+                "BALANCING_METHOD_HAS_NO_QUARTER_HOUR_VALUES"
+            }
+            Self::MeterTypeQualifiesForNeitherLimb => "METER_TYPE_QUALIFIES_FOR_NEITHER_LIMB",
+            Self::ZaehlertypMissing => "ZAEHLERTYP_MISSING",
+            Self::BilanzierungsmethodeMissing => "BILANZIERUNGSMETHODE_MISSING",
+            Self::NoReadings => "NO_READINGS",
+            Self::NotQuarterHourResolution => "NOT_QUARTER_HOUR_RESOLUTION",
+            Self::ResolutionUndeterminable => "RESOLUTION_UNDETERMINABLE",
+            Self::CoverageBelowThreshold => "COVERAGE_BELOW_THRESHOLD",
+        }
+    }
+
     /// Every finding, in declaration order.
     pub const ALL: [Self; 10] = [
         Self::NotRemotelyReadable,
@@ -196,6 +226,17 @@ impl Zaehlertyp {
         Self::ModerneMesseinrichtung,
         Self::Conventional,
     ];
+
+    /// Stable DB/wire label. Matches the `serde` tag and
+    /// [`FromStr`](std::str::FromStr) input.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::IntelligentesMesssystem => "INTELLIGENTES_MESSSYSTEM",
+            Self::ModerneMesseinrichtung => "MODERNE_MESSEINRICHTUNG",
+            Self::Conventional => "CONVENTIONAL",
+        }
+    }
 }
 
 /// How the Marktlokation is balanced (`Marktlokation.bilanzierungsmethode`).
@@ -220,6 +261,19 @@ pub enum Bilanzierungsmethode {
 impl Bilanzierungsmethode {
     /// Every variant, in declaration order.
     pub const ALL: [Self; 5] = [Self::Rlm, Self::Slp, Self::Ims, Self::Tlp, Self::Pauschal];
+
+    /// Stable DB/wire label. Matches the `serde` tag and
+    /// [`FromStr`](std::str::FromStr) input.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Rlm => "RLM",
+            Self::Slp => "SLP",
+            Self::Ims => "IMS",
+            Self::Tlp => "TLP",
+            Self::Pauschal => "PAUSCHAL",
+        }
+    }
 
     /// `true` when the method produces no quarter-hour series and so rules the
     /// point out on its own.
@@ -377,6 +431,22 @@ pub enum Delivery {
     Absent,
 }
 
+impl Delivery {
+    /// Every outcome, in declaration order.
+    pub const ALL: [Self; 3] = [Self::Delivering, Self::Insufficient, Self::Absent];
+
+    /// Stable DB/wire label. Matches the `serde` tag and
+    /// [`FromStr`](std::str::FromStr) input.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Delivering => "DELIVERING",
+            Self::Insufficient => "INSUFFICIENT",
+            Self::Absent => "ABSENT",
+        }
+    }
+}
+
 /// Minimum share of expected quarter-hour slots for a point to count as
 /// delivering.
 ///
@@ -438,6 +508,26 @@ pub enum SharingReadiness {
 }
 
 impl SharingReadiness {
+    /// Every verdict, in declaration order.
+    pub const ALL: [Self; 4] = [
+        Self::Ready,
+        Self::CapableNotDelivering,
+        Self::NotCapable,
+        Self::Unknown,
+    ];
+
+    /// Stable DB/wire label. Matches the `serde` tag and
+    /// [`FromStr`](std::str::FromStr) input.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Ready => "READY",
+            Self::CapableNotDelivering => "CAPABLE_NOT_DELIVERING",
+            Self::NotCapable => "NOT_CAPABLE",
+            Self::Unknown => "UNKNOWN",
+        }
+    }
+
     /// Stable label for API responses.
     #[must_use]
     pub const fn label(self) -> &'static str {
@@ -474,6 +564,15 @@ pub const fn combine(capability: Capability, delivery: Delivery) -> SharingReadi
         (Capability::Disqualified, _) => SharingReadiness::NotCapable,
         (Capability::Unknown, _) => SharingReadiness::Unknown,
     }
+}
+
+crate::codes::string_codes! {
+    EligibilityBasis;
+    Finding;
+    Zaehlertyp;
+    Bilanzierungsmethode;
+    Delivery;
+    SharingReadiness;
 }
 
 #[cfg(test)]

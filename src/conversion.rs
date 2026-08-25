@@ -131,6 +131,26 @@ pub enum G685FinalRounding {
     TwoDecimals,
 }
 
+impl G685FinalRounding {
+    /// Every rounding mode, in declaration order.
+    pub const ALL: [Self; 3] = [Self::None, Self::WholeKwh, Self::TwoDecimals];
+
+    /// Stable DB/wire label. Matches the `serde` tag and
+    /// [`FromStr`](std::str::FromStr) input.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "NONE",
+            Self::WholeKwh => "WHOLE_KWH",
+            Self::TwoDecimals => "TWO_DECIMALS",
+        }
+    }
+}
+
+crate::codes::string_codes! {
+    G685FinalRounding;
+}
+
 /// Input rounding per published G 685 Netzbetreiber practice.
 ///
 /// Consistently observed across NB Merkblätter zur thermischen Gasabrechnung:
@@ -190,7 +210,14 @@ pub fn gas_m3_to_kwh_hs_rounded(
 /// |---|---|
 /// | an energy unit ([`MeasurementUnit::parse_scaled`]) | rescale — kWh, Wh, MWh, GJ, MJ and the UN/ECE Rec 20 codes |
 /// | a volume unit (m³, litres, `MTQ`) | `V × Hs × z`, needing `gas` |
-/// | `"kW"` / `"kvar"` — a **power**, not an energy | `P × duration_h`, needing `duration_secs` |
+/// | `"kW"` — a **power**, not an energy | `P × duration_h`, needing `duration_secs` |
+///
+/// `"kvar"` is deliberately **not** accepted. Integrating a reactive power over
+/// an hour gives kvarh, which is a different dimension from kWh however similar
+/// the arithmetic looks; a function named `normalize_to_kwh` returning it would
+/// put a kvarh figure in a kWh column with nothing to catch it. Reactive
+/// registers are identified by [`crate::ObisCode::is_reactive`] and their unit
+/// by [`crate::obis::RegisterUnit`].
 ///
 /// # Errors
 ///
@@ -228,7 +255,7 @@ pub fn normalize_to_kwh(
     duration_secs: Option<i64>,
 ) -> Result<Decimal, ConversionError> {
     let trimmed = unit.trim();
-    if matches!(trimmed.to_lowercase().as_str(), "kw" | "kvar") {
+    if trimmed.eq_ignore_ascii_case("kw") {
         let secs = duration_secs.ok_or(ConversionError::MissingDuration)?;
         if secs <= 0 {
             return Err(ConversionError::MissingDuration);

@@ -21,14 +21,12 @@
 //! **stündlich ermittelter Zählerstände** von Gasmengen"*. Note the two
 //! resolutions — electricity is quarter-hourly, gas hourly.
 //!
-//! ## Rollover belongs here, not in the validation engine
+//! ## Rollover belongs here
 //!
-//! [`crate::validation`] used to carry a V10 "register rollover" rule that
-//! compared consecutive `MeterInterval::value` for a large drop. That could
-//! not work: an interval value is not cumulative, so it has nothing to roll
-//! over. A rollover (Überlauf) is a property of a **register** — a six-digit
-//! Zählwerk wraps from 999 999 to 0 — and can only be detected where readings
-//! live. That is here, and [`Rollover`] is what V10 was trying to be.
+//! A rollover (Überlauf) is a property of a **register** — a six-digit Zählwerk
+//! wraps from 999 999 to 0 — so it can only be detected where readings live.
+//! An interval value is not cumulative and has nothing to roll over, which is
+//! why [`crate::validation`] leaves the number `V10` unused.
 //!
 //! ## The conversion never invents a value
 //!
@@ -74,6 +72,26 @@ use serde::{Deserialize, Serialize};
 
 use crate::interval::{MeterInterval, QualityFlag};
 use crate::obis::ObisCode;
+use crate::resolution::IntervalResolution;
+
+/// The longest a period of `resolution` can be, in seconds.
+///
+/// Only used to derive a *ceiling*, where erring long is the safe direction: a
+/// cap computed from 24 hours would reject the 25-hour Liefertag on a daily-read
+/// meter every autumn.
+const fn longest_seconds(resolution: IntervalResolution) -> i64 {
+    match resolution {
+        // 25 h, 31 days + 1 h, and a leap year.
+        IntervalResolution::Day => 25 * 3600,
+        IntervalResolution::Month => 31 * 86_400 + 3600,
+        IntervalResolution::Year => 366 * 86_400,
+        fixed => match fixed.fixed_seconds() {
+            Some(s) => s as i64,
+            // Unreachable: only the three calendar arms answer `None`.
+            None => 0,
+        },
+    }
+}
 
 // ── MeterReading ──────────────────────────────────────────────────────────────
 
@@ -135,8 +153,14 @@ impl MeterReading {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct Rollover {
-    /// Instant the wrap was detected at (the later reading).
-    pub at: OffsetDateTime,
+    /// Start of the span the wrap happened in (the earlier reading).
+    pub from: OffsetDateTime,
+    /// End of it — the reading at which the wrap became visible.
+    ///
+    /// Paired with [`from`](Self::from) so a rollover and an [`Anomaly`]
+    /// describe the same shape — *what happened between two readings* — and
+    /// can share one audit table.
+    pub to: OffsetDateTime,
     /// Register value before the wrap.
     pub previous: Decimal,
     /// Register value after it.
@@ -145,6 +169,14 @@ pub struct Rollover {
     pub register_capacity: Decimal,
     /// Consumption across the wrap.
     pub delta: Decimal,
+}
+
+impl Rollover {
+    /// How long the span lasted.
+    #[must_use]
+    pub fn duration(&self) -> time::Duration {
+        self.to - self.from
+    }
 }
 
 // ── Anomaly ───────────────────────────────────────────────────────────────────
@@ -210,6 +242,23 @@ impl AnomalyKind {
         Self::NonBillableEndpoint,
     ];
 
+    /// Stable DB/wire label. Matches the `serde` tag and
+    /// [`FromStr`](std::str::FromStr) input.
+    ///
+    /// An anomaly is the audit record for a span that could not be
+    /// differenced, and § 146 Abs. 4 AO wants that trail intact — so the code
+    /// is a contract rather than a `Debug` rendering.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::BackwardsWithoutRegisterWidth => "BACKWARDS_WITHOUT_REGISTER_WIDTH",
+            Self::ImplausibleRollover => "IMPLAUSIBLE_ROLLOVER",
+            Self::ImplausibleDelta => "IMPLAUSIBLE_DELTA",
+            Self::ZeroLengthSpan => "ZERO_LENGTH_SPAN",
+            Self::NonBillableEndpoint => "NON_BILLABLE_ENDPOINT",
+        }
+    }
+
     /// A short explanation, for a log line or an operator UI.
     #[must_use]
     pub const fn description(self) -> &'static str {
@@ -225,6 +274,10 @@ impl AnomalyKind {
             Self::NonBillableEndpoint => "one endpoint is not billable",
         }
     }
+}
+
+crate::codes::string_codes! {
+    AnomalyKind;
 }
 
 // ── LastgangConfig ────────────────────────────────────────────────────────────
@@ -255,13 +308,55 @@ pub struct LastgangConfig {
     /// ZSG on a 30 kW connection that is 7.5 kWh.
     pub max_delta: Option<Decimal>,
 
-    /// The OBIS code to stamp on the derived intervals.
+    /// How the derived intervals are labelled.
     ///
     /// A Lastgang is a different channel from the Zählerstand it came from:
     /// `1-0:1.8.0` is a Zählerstand (D = 8) and `1-0:1.29.0` is the Lastgang
-    /// (D = 29). `None` carries the readings' own code through unchanged, which
-    /// is convenient but strictly speaking mislabels the result.
-    pub result_obis: Option<ObisCode>,
+    /// (D = 29). See [`ResultChannel`].
+    pub result_channel: ResultChannel,
+}
+
+/// What OBIS code [`to_lastgang`] stamps on the intervals it derives.
+///
+/// The channel matters as much as the value: a **fixed** code turns a feed-in
+/// Zählerstandsgang (`1-0:2.8.0`) into an import Lastgang (`1-0:1.29.0`) with
+/// the values still right and nothing downstream able to tell.
+/// [`Derived`](Self::Derived) reads the channel off the register instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub enum ResultChannel {
+    /// Carry each reading's own OBIS code through unchanged.
+    ///
+    /// Convenient, and strictly speaking a mislabel: the result is a Lastgang
+    /// wearing a Zählerstand's code. The default, because it invents nothing.
+    #[default]
+    Unchanged,
+
+    /// Relabel each interval as the Lastgang of the register it came from —
+    /// `1-0:1.8.0` → `1-0:1.29.0`, `1-0:2.8.0` → `1-0:2.29.0`.
+    ///
+    /// A reading whose code has no Lastgang — a tariff register, a gas code,
+    /// none at all — keeps its own. See [`ObisCode::as_lastgang`].
+    Derived,
+
+    /// One fixed code on every derived interval, for readings that carry none.
+    ///
+    /// Prefer [`Derived`](Self::Derived) where the readings are labelled: this
+    /// asserts a channel rather than reading it.
+    Fixed(ObisCode),
+}
+
+impl ResultChannel {
+    /// The code to stamp on an interval derived from a reading labelled
+    /// `source`.
+    #[must_use]
+    pub fn label(self, source: Option<ObisCode>) -> Option<ObisCode> {
+        match self {
+            Self::Unchanged => source,
+            Self::Derived => source.map(|c| c.as_lastgang().unwrap_or(c)),
+            Self::Fixed(code) => Some(code),
+        }
+    }
 }
 
 impl Default for LastgangConfig {
@@ -275,24 +370,25 @@ impl Default for LastgangConfig {
         Self {
             register_digits: None,
             max_delta: None,
-            result_obis: None,
+            result_channel: ResultChannel::Unchanged,
         }
     }
 }
 
 impl LastgangConfig {
-    /// Electricity: quarter-hourly readings, results labelled `1-0:1.29.0`.
+    /// Electricity: results relabelled as the Lastgang of whichever register
+    /// they came from — see [`ResultChannel`].
     ///
     /// No register width and no delta cap — both are properties of the specific
     /// device and connection, and a wrong default is worse than none. Add them
     /// with [`with_register_digits`](Self::with_register_digits) and
-    /// [`with_max_delta`](Self::with_max_delta).
+    /// [`with_capacity_kw`](Self::with_capacity_kw).
     #[must_use]
     pub const fn strom() -> Self {
         Self {
             register_digits: None,
             max_delta: None,
-            result_obis: Some(ObisCode::STROM_BEZUG_LASTGANG),
+            result_channel: ResultChannel::Derived,
         }
     }
 
@@ -310,24 +406,43 @@ impl LastgangConfig {
         self
     }
 
-    /// Derive the delta cap from a connection capacity in kW.
+    /// Derive the delta cap from a connection capacity in kW and the reading
+    /// **cadence**.
     ///
-    /// `max_delta = capacity_kw × interval_seconds / 3600`, the most energy the
-    /// connection can pass in one reading interval. This is the same ceiling
-    /// [`crate::ValidationConfig::max_plant_power_kw`] applies to the resulting
-    /// Lastgang, expressed at the point where it can prevent a bad value rather
-    /// than merely flag one.
+    /// `max_delta = capacity_kw × cadence_hours`, the most energy the
+    /// connection can pass between two readings. This is the same physical
+    /// ceiling [`crate::ValidationConfig::max_plant_power_kw`] applies to the
+    /// resulting Lastgang, expressed at the point where it can *prevent* a bad
+    /// value rather than merely flag one.
+    ///
+    /// The cadence is an [`IntervalResolution`], not raw seconds — obtain it
+    /// from the readings themselves with
+    /// [`detect_reading_cadence`].
+    ///
+    /// A **calendar** resolution has no single length, so the cap uses the
+    /// longest that period can be — 25 hours for a day, 366 days for a year.
+    /// A ceiling must not reject a legitimate 25-hour Liefertag.
     #[must_use]
-    pub fn with_capacity_kw(mut self, capacity_kw: Decimal, interval_secs: u32) -> Self {
-        let hours = Decimal::from(interval_secs) / Decimal::from(3600u32);
+    pub fn with_capacity_kw(mut self, capacity_kw: Decimal, cadence: IntervalResolution) -> Self {
+        let hours = Decimal::from(longest_seconds(cadence)) / Decimal::from(3600u32);
         self.max_delta = Some(capacity_kw * hours);
         self
     }
 
-    /// Label the derived intervals with `code`.
+    /// Label the derived intervals with one fixed `code`.
+    ///
+    /// Prefer [`ResultChannel::Derived`], which reads the channel off the
+    /// register instead of asserting it.
     #[must_use]
     pub const fn labelled(mut self, code: ObisCode) -> Self {
-        self.result_obis = Some(code);
+        self.result_channel = ResultChannel::Fixed(code);
+        self
+    }
+
+    /// Set how derived intervals are labelled.
+    #[must_use]
+    pub const fn on_channel(mut self, channel: ResultChannel) -> Self {
+        self.result_channel = channel;
         self
     }
 
@@ -483,7 +598,8 @@ pub fn to_lastgang(readings: &[MeterReading], config: &LastgangConfig) -> Lastga
 
         if wrapped {
             rollovers.push(Rollover {
-                at: next.at,
+                from: prev.at,
+                to: next.at,
                 previous: prev.value,
                 current: next.value,
                 register_capacity: capacity.unwrap_or(Decimal::ZERO),
@@ -496,7 +612,7 @@ pub fn to_lastgang(readings: &[MeterReading], config: &LastgangConfig) -> Lastga
             to: next.at,
             value: delta,
             quality: prev.quality.worse_of(next.quality),
-            obis_code: config.result_obis.or(next.obis_code),
+            obis_code: config.result_channel.label(next.obis_code),
         });
     }
 
@@ -505,6 +621,72 @@ pub fn to_lastgang(readings: &[MeterReading], config: &LastgangConfig) -> Lastga
         rollovers,
         anomalies,
     }
+}
+
+// ── cadence ───────────────────────────────────────────────────────────────────
+
+/// The reading cadence of a Zählerstandsgang — the spacing of its timestamps.
+///
+/// The counterpart of
+/// [`detect_interval_length`](crate::classification::detect_interval_length),
+/// which medians each interval's **duration** — a [`MeterReading`] is a point
+/// and has none. The gap between consecutive `at`s is what a reading series has
+/// instead, and the `cadence` [`LastgangConfig::with_capacity_kw`] needs.
+///
+/// Readings are sorted first and the **median** gap is taken, so neither a
+/// missed transmission nor an out-of-order merge moves the answer. The 23–25
+/// hour band makes a daily series a calendar [`Day`](IntervalResolution::Day)
+/// rather than a fixed 86 400 s window.
+///
+/// § 2 Satz 1 Nr. 27 MsbG names the two cadences the market defines:
+/// *"viertelstündig ermittelter Zählerstände von elektrischer Arbeit und
+/// stündlich ermittelter Zählerstände von Gasmengen"*.
+///
+/// `None` for fewer than two readings, or when every gap is zero.
+///
+/// ```rust
+/// use metering::reading::{MeterReading, detect_reading_cadence};
+/// use metering::IntervalResolution;
+/// use rust_decimal::dec;
+/// use time::{Duration, macros::datetime};
+///
+/// let zsg: Vec<MeterReading> = (0..8)
+///     .map(|i| MeterReading::measured(
+///         datetime!(2026-06-01 0:00 UTC) + Duration::minutes(15 * i),
+///         dec!(1000) + rust_decimal::Decimal::from(i),
+///     ))
+///     .collect();
+///
+/// assert_eq!(detect_reading_cadence(&zsg), Some(IntervalResolution::QuarterHour));
+/// assert_eq!(detect_reading_cadence(&zsg[..1]), None, "one point has no spacing");
+/// ```
+#[must_use]
+pub fn detect_reading_cadence(readings: &[MeterReading]) -> Option<IntervalResolution> {
+    if readings.len() < 2 {
+        return None;
+    }
+    let mut instants: Vec<OffsetDateTime> = readings.iter().map(|r| r.at).collect();
+    instants.sort_unstable();
+
+    let mut gaps: Vec<i64> = instants
+        .windows(2)
+        .map(|w| (w[1] - w[0]).whole_seconds())
+        .filter(|&g| g > 0)
+        .collect();
+    if gaps.is_empty() {
+        return None;
+    }
+    gaps.sort_unstable();
+    let median = gaps[gaps.len() / 2];
+
+    Some(match median {
+        750..=1050 => IntervalResolution::QuarterHour, // 900 s ± 150 s
+        1650..=1950 => IntervalResolution::HalfHour,   // 1800 s
+        3300..=3900 => IntervalResolution::Hour,       // 3600 s ± 300 s
+        // 23 h … 25 h — a Berlin calendar day at either DST transition.
+        82_800..=90_000 => IntervalResolution::Day,
+        other => IntervalResolution::from_seconds(u32::try_from(other).ok()?)?,
+    })
 }
 
 // ── consumption between two readings ──────────────────────────────────────────
@@ -667,7 +849,9 @@ mod tests {
         let rollover = &result.rollovers[0];
         assert_eq!(rollover.register_capacity, dec!(1000000));
         assert_eq!(rollover.delta, dec!(3.0));
-        assert_eq!(rollover.at, datetime!(2026-06-01 0:15 UTC));
+        assert_eq!(rollover.from, datetime!(2026-06-01 0:00 UTC));
+        assert_eq!(rollover.to, datetime!(2026-06-01 0:15 UTC));
+        assert_eq!(rollover.duration(), Duration::minutes(15));
         assert!(
             !result.is_clean(),
             "a wrap is explained, but still reported"
@@ -726,11 +910,12 @@ mod tests {
     #[test]
     fn the_delta_cap_can_come_from_a_connection_capacity() {
         // 30 kW over a quarter-hour is 7.5 kWh.
-        let cfg = LastgangConfig::strom().with_capacity_kw(dec!(30), 900);
+        let cfg =
+            LastgangConfig::strom().with_capacity_kw(dec!(30), IntervalResolution::QuarterHour);
         assert_eq!(cfg.max_delta, Some(dec!(7.5)));
 
         // 30 kW over an hour is 30 kWh.
-        let hourly = LastgangConfig::strom().with_capacity_kw(dec!(30), 3600);
+        let hourly = LastgangConfig::strom().with_capacity_kw(dec!(30), IntervalResolution::Hour);
         assert_eq!(hourly.max_delta, Some(dec!(30)));
 
         // 8 kWh in a quarter-hour is 32 kW — over the ceiling.
@@ -876,7 +1061,8 @@ mod tests {
         // The step down to it is backwards, and the step back up is a 506 kWh
         // jump — 2 MW on a 30 kW connection — so the cap catches both sides.
         let readings = zsg(&[dec!(1000), dec!(1002), dec!(500), dec!(1006), dec!(1008)]);
-        let cfg = LastgangConfig::strom().with_capacity_kw(dec!(30), 900);
+        let cfg =
+            LastgangConfig::strom().with_capacity_kw(dec!(30), IntervalResolution::QuarterHour);
         let result = to_lastgang(&readings, &cfg);
         assert_eq!(
             result.anomalies.len(),
@@ -919,5 +1105,250 @@ mod tests {
         for kind in AnomalyKind::ALL {
             assert!(!kind.description().is_empty(), "{kind:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod channel_and_cadence_tests {
+    use super::*;
+    use rust_decimal::dec;
+    use time::{Duration, macros::datetime};
+
+    fn zsg(
+        start: OffsetDateTime,
+        step: Duration,
+        n: i64,
+        code: Option<ObisCode>,
+    ) -> Vec<MeterReading> {
+        (0..n)
+            .map(|i| {
+                let r = MeterReading::measured(
+                    start + step * (i as i32),
+                    dec!(1000) + Decimal::from(i),
+                );
+                match code {
+                    Some(c) => r.with_obis(c),
+                    None => r,
+                }
+            })
+            .collect()
+    }
+
+    /// The bug a fixed result code hid: an Einspeisung Zählerstandsgang came
+    /// out labelled `1-0:1.29.0` — **import** — because `strom()` stamped a
+    /// hard-coded Bezug constant on every interval it derived. The values were
+    /// right and the channel was a lie, so nothing downstream could see it.
+    #[test]
+    fn a_feed_in_series_is_not_relabelled_as_import() {
+        let readings = zsg(
+            datetime!(2026-06-01 0:00 UTC),
+            Duration::minutes(15),
+            4,
+            Some(ObisCode::STROM_EINSPEISUNG_TOTAL),
+        );
+        let result = to_lastgang(&readings, &LastgangConfig::strom());
+
+        for iv in &result.intervals {
+            let code = iv.obis_code.expect("labelled");
+            assert_eq!(code, ObisCode::STROM_EINSPEISUNG_LASTGANG);
+            assert!(code.is_export() && !code.is_import());
+            assert!(code.is_lastgang());
+        }
+
+        // ...and a Bezug series still becomes a Bezug Lastgang.
+        let bezug = zsg(
+            datetime!(2026-06-01 0:00 UTC),
+            Duration::minutes(15),
+            4,
+            Some(ObisCode::STROM_BEZUG_TOTAL),
+        );
+        assert_eq!(
+            to_lastgang(&bezug, &LastgangConfig::strom()).intervals[0].obis_code,
+            Some(ObisCode::STROM_BEZUG_LASTGANG)
+        );
+    }
+
+    /// A register with no Lastgang keeps its own code rather than being forced
+    /// onto a channel that would misdescribe it.
+    #[test]
+    fn a_register_without_a_lastgang_keeps_its_code() {
+        for code in [
+            "1-0:1.8.1".parse::<ObisCode>().unwrap(), // HT — no tariff Lastgang exists
+            ObisCode::GAS_VOLUME_M3,                  // gas — D = 29 means nothing there
+        ] {
+            let readings = zsg(
+                datetime!(2026-06-01 0:00 UTC),
+                Duration::minutes(15),
+                3,
+                Some(code),
+            );
+            let result = to_lastgang(&readings, &LastgangConfig::strom());
+            assert_eq!(result.intervals[0].obis_code, Some(code), "{code}");
+        }
+
+        // Unlabelled readings stay unlabelled — nothing is invented.
+        let bare = zsg(
+            datetime!(2026-06-01 0:00 UTC),
+            Duration::minutes(15),
+            3,
+            None,
+        );
+        assert_eq!(
+            to_lastgang(&bare, &LastgangConfig::strom()).intervals[0].obis_code,
+            None
+        );
+    }
+
+    #[test]
+    fn the_three_result_channels_do_what_they_say() {
+        let readings = zsg(
+            datetime!(2026-06-01 0:00 UTC),
+            Duration::minutes(15),
+            3,
+            Some(ObisCode::STROM_BEZUG_TOTAL),
+        );
+        let label = |cfg: LastgangConfig| to_lastgang(&readings, &cfg).intervals[0].obis_code;
+
+        assert_eq!(
+            label(LastgangConfig::default()),
+            Some(ObisCode::STROM_BEZUG_TOTAL),
+            "Unchanged carries the reading's own code"
+        );
+        assert_eq!(
+            label(LastgangConfig::strom()),
+            Some(ObisCode::STROM_BEZUG_LASTGANG)
+        );
+        assert_eq!(
+            label(LastgangConfig::default().labelled(ObisCode::GAS_VOLUME_M3)),
+            Some(ObisCode::GAS_VOLUME_M3),
+            "Fixed does exactly what it says, including when that is wrong"
+        );
+        assert_eq!(ResultChannel::default(), ResultChannel::Unchanged);
+        assert_eq!(ResultChannel::Derived.label(None), None);
+    }
+
+    /// A reading is a point, so its series' cadence is the spacing of its
+    /// timestamps — the number `with_capacity_kw` needs and that
+    /// `detect_interval_length` cannot supply.
+    #[test]
+    fn the_cadence_comes_from_the_spacing_of_the_readings() {
+        let base = datetime!(2026-06-01 0:00 UTC);
+        for (step, expected) in [
+            (Duration::minutes(15), IntervalResolution::QuarterHour),
+            (Duration::minutes(30), IntervalResolution::HalfHour),
+            (Duration::hours(1), IntervalResolution::Hour),
+        ] {
+            assert_eq!(
+                detect_reading_cadence(&zsg(base, step, 8, None)),
+                Some(expected),
+                "{step:?}"
+            );
+        }
+
+        // Fewer than two readings have no spacing, and duplicates no positive one.
+        assert_eq!(detect_reading_cadence(&[]), None);
+        assert_eq!(
+            detect_reading_cadence(&zsg(base, Duration::ZERO, 1, None)),
+            None
+        );
+        assert_eq!(
+            detect_reading_cadence(&zsg(base, Duration::ZERO, 4, None)),
+            None
+        );
+    }
+
+    /// The median, so a missed transmission does not move the answer, and the
+    /// sort, so an out-of-order series reports its real spacing.
+    #[test]
+    fn the_cadence_is_robust_to_gaps_and_disorder() {
+        let base = datetime!(2026-06-01 0:00 UTC);
+        let mut readings = zsg(base, Duration::minutes(15), 12, None);
+        readings.remove(5); // one missed reading widens a single gap to 30 min
+        assert_eq!(
+            detect_reading_cadence(&readings),
+            Some(IntervalResolution::QuarterHour)
+        );
+
+        readings.reverse();
+        assert_eq!(
+            detect_reading_cadence(&readings),
+            Some(IntervalResolution::QuarterHour),
+            "sorted before differencing"
+        );
+    }
+
+    /// A daily Zählerstandsgang is a **calendar** day, so the cadence survives
+    /// the 23- and 25-hour transitions and the derived cap does not reject the
+    /// long one.
+    #[test]
+    fn a_daily_cadence_is_a_calendar_day() {
+        let readings: Vec<MeterReading> = (0..6)
+            .map(|i| {
+                let day = time::macros::date!(2026 - 10 - 23)
+                    .checked_add(Duration::days(i))
+                    .unwrap();
+                MeterReading::measured(
+                    crate::calendar::day_start_utc(day),
+                    dec!(1000) + Decimal::from(i),
+                )
+            })
+            .collect();
+        assert_eq!(
+            detect_reading_cadence(&readings),
+            Some(IntervalResolution::Day),
+            "not a fixed 86 400 s window"
+        );
+
+        // The cap for a 30 kW connection on a daily grid allows the 25-hour day.
+        let cfg = LastgangConfig::default().with_capacity_kw(dec!(30), IntervalResolution::Day);
+        assert_eq!(cfg.max_delta, Some(dec!(750)), "30 kW × 25 h");
+
+        // 24 h × 30 kW = 720 kWh would have rejected a legitimate long day.
+        let long_day = vec![
+            MeterReading::measured(
+                crate::calendar::day_start_utc(time::macros::date!(2026 - 10 - 25)),
+                dec!(0),
+            ),
+            MeterReading::measured(
+                crate::calendar::day_end_utc(time::macros::date!(2026 - 10 - 25)),
+                dec!(740),
+            ),
+        ];
+        assert!(
+            to_lastgang(&long_day, &cfg).is_clean(),
+            "a 25-hour day at full load must not read as an anomaly"
+        );
+    }
+
+    /// The ceiling and the validation rule describe the same physical fact at
+    /// the two ends of the pipeline: one prevents, the other flags.
+    #[test]
+    fn the_two_capacity_ceilings_agree() {
+        use crate::{ValidationConfig, ValidationRuleId, validate_intervals};
+
+        let capacity = dec!(30);
+        let cfg =
+            LastgangConfig::default().with_capacity_kw(capacity, IntervalResolution::QuarterHour);
+        assert_eq!(cfg.max_delta, Some(dec!(7.5)), "30 kW × 0.25 h");
+
+        // A value just over the ceiling: refused at the difference...
+        let over = vec![
+            MeterReading::measured(datetime!(2026-06-01 0:00 UTC), dec!(0)),
+            MeterReading::measured(datetime!(2026-06-01 0:15 UTC), dec!(8)),
+        ];
+        assert!(to_lastgang(&over, &cfg).intervals.is_empty());
+
+        // ...and flagged if it reached the Lastgang some other way.
+        let already_formed = to_lastgang(&over, &LastgangConfig::default()).intervals;
+        let report = validate_intervals(
+            &already_formed,
+            &ValidationConfig::default().with_plant_capacity_kw(capacity),
+        );
+        assert_eq!(
+            report.by_rule(ValidationRuleId::ImplausiblePower).count(),
+            1,
+            "{:?}",
+            report.issues
+        );
     }
 }

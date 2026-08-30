@@ -1,0 +1,10 @@
+# Check every text file out with LF, on every platform.
+#
+# Two tests read the crate's own source — the coded-enum registry and the
+# wire-format scan — and a `\r` in the middle of a line-shaped pattern makes
+# them report the wrong thing rather than fail loudly. Normalising at checkout
+# removes the class.
+* text=auto eol=lf
+
+# Keep the proptest regression seeds byte-stable: they are read back verbatim.
+*.proptest-regressions text eol=lf

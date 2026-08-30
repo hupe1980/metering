@@ -910,10 +910,6 @@ fn the_hot_types_survive_a_binary_format_and_the_tagged_ones_do_not() {
 /// and nothing fails to round-trip; the format is just inconsistent, which is
 /// the worst kind of wire bug to find later.
 ///
-/// Three fields were missed on the first pass — `BillingPeriod`'s peak instant
-/// and both of `AnnualForecast`'s window bounds — so this reads the crate
-/// source and refuses the omission rather than trusting a careful edit.
-///
 /// This is a test, so it may read files; the no-I/O guarantee is about `src/`.
 #[test]
 fn no_timestamp_field_escapes_the_wire_format() {
@@ -926,32 +922,32 @@ fn no_timestamp_field_escapes_the_wire_format() {
         if path.extension().is_none_or(|e| e != "rs") {
             continue;
         }
-        let text = std::fs::read_to_string(&path).expect("readable source");
         let file = path
             .file_name()
             .unwrap_or_default()
             .to_string_lossy()
             .into_owned();
+        // Normalised, because a Windows checkout hands out `\r\n` and every
+        // line-shaped pattern below would miss.
+        let text = std::fs::read_to_string(&path)
+            .expect("readable source")
+            .replace("\r\n", "\n");
 
-        // Walk struct bodies that derive `Serialize`, keeping each field's
-        // preceding attribute lines with it.
-        let mut rest = text.as_str();
-        while let Some(at) = rest.find("pub struct ") {
-            let (head, tail) = rest.split_at(at);
-            let derives_serde = head
-                .rsplit("\n\n")
-                .next()
-                .is_some_and(|attrs| attrs.contains("Serialize"));
-            let Some(open) = tail.find('{') else { break };
-            let Some(close) = tail.find("\n}") else { break };
-            if derives_serde && open < close {
-                let mut pending_attrs = String::new();
-                for line in tail[open + 1..close].lines() {
-                    let trimmed = line.trim();
-                    if trimmed.starts_with("#[") {
-                        pending_attrs.push_str(trimmed);
-                        continue;
-                    }
+        // A line-by-line walk rather than a search over the whole text: the
+        // question is "which attributes sit directly above this item", and only
+        // adjacency answers it.
+        let mut attrs = String::new();
+        let mut inside_serde_struct = false;
+        for line in text.lines() {
+            let trimmed = line.trim();
+
+            if inside_serde_struct {
+                if trimmed == "}" {
+                    inside_serde_struct = false;
+                    attrs.clear();
+                } else if trimmed.starts_with("#[") {
+                    attrs.push_str(trimmed);
+                } else if !trimmed.starts_with("///") {
                     if let Some(decl) = trimmed.strip_prefix("pub ")
                         && (decl.ends_with(": OffsetDateTime,")
                             || decl.ends_with(": Option<OffsetDateTime>,")
@@ -959,16 +955,23 @@ fn no_timestamp_field_escapes_the_wire_format() {
                             || decl.ends_with(": Option<Date>,"))
                     {
                         checked += 1;
-                        if !pending_attrs.contains("crate::wire") {
+                        if !attrs.contains("crate::wire") {
                             missing.push(format!("{file}: {decl}"));
                         }
                     }
-                    if !trimmed.starts_with("///") && !trimmed.is_empty() {
-                        pending_attrs.clear();
-                    }
+                    attrs.clear();
                 }
+                continue;
             }
-            rest = &tail[close..];
+
+            if trimmed.starts_with("#[") {
+                attrs.push_str(trimmed);
+            } else if trimmed.starts_with("pub struct ") && trimmed.ends_with('{') {
+                inside_serde_struct = attrs.contains("Serialize");
+                attrs.clear();
+            } else if !trimmed.starts_with("//") {
+                attrs.clear();
+            }
         }
     }
 

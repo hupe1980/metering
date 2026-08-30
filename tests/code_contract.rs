@@ -310,7 +310,12 @@ fn no_coded_enum_escapes_this_file() {
         if path.extension().is_none_or(|e| e != "rs") {
             continue;
         }
-        let text = std::fs::read_to_string(&path).expect("readable source");
+        // Normalised: a Windows checkout hands out `\r\n`, and a scan whose
+        // result depends on the line endings is a scan that reports the wrong
+        // thing on one platform.
+        let text = std::fs::read_to_string(&path)
+            .expect("readable source")
+            .replace("\r\n", "\n");
         let mut rest = text.as_str();
         while let Some(start) = rest.find("crate::codes::string_codes! {") {
             let body = &rest[start..];
@@ -343,7 +348,8 @@ fn no_coded_enum_escapes_this_file() {
 
     // Types this file asserts the contract for.
     let this_file = std::fs::read_to_string(root.join("tests/code_contract.rs"))
-        .expect("this test file is readable");
+        .expect("this test file is readable")
+        .replace("\r\n", "\n");
     let asserted: BTreeSet<String> = this_file
         .match_indices("assert_contract!(")
         .filter_map(|(i, m)| {

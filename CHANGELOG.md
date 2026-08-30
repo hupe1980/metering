@@ -332,6 +332,18 @@ Every removal is a hard cut; no deprecated shims.
   of the three overstatements above, and the EN 50160 containment direction that
   turned out to be backwards in the *test*, came out of writing it.
 
+### Build and CI
+
+- **`postcard` is a dev-dependency with `default-features = false`.** Its default
+  `heapless-cas` feature pulls `heapless` 0.7 and with it `atomic-polyfill`,
+  which is unmaintained (RUSTSEC-2023-0089) and which the `cargo audit --deny
+  warnings` lane rejects. Nothing here needs a `heapless::Vec`.
+- **`.gitattributes` normalises every checkout to LF.** Two tests read the
+  crate's own source — the coded-enum registry and the wire-format scan — and
+  both now normalise line endings themselves as well: a `\r` in the middle of a
+  line-shaped pattern makes such a scan report the wrong thing on one platform
+  rather than fail loudly.
+
 ### Removed
 
 - **The enum count in the README.** It said *"all thirty-four enums"*, which

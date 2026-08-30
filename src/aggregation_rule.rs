@@ -174,6 +174,7 @@ pub enum AggregationRule {
         ///
         /// Example: `0.10` for 10%, `0.90` for 90%.
         /// Fractions across all tenants should sum to ≤ 1; the remainder feeds into the grid.
+        #[cfg_attr(feature = "serde", serde(with = "crate::wire::decimal"))]
         fraction: rust_decimal::Decimal,
     },
 

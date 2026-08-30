@@ -52,14 +52,17 @@ pub struct AnnualForecast {
     #[cfg_attr(feature = "serde", serde(with = "crate::wire::rfc3339"))]
     pub observation_to: OffsetDateTime,
     /// Billable energy observed in the window (kWh).
+    #[cfg_attr(feature = "serde", serde(with = "crate::wire::decimal"))]
     pub observed: Decimal,
     /// Berlin calendar days the window spans.
     pub observed_days: u32,
     /// Days in the target year — 366 in a leap year.
     pub target_year_days: u16,
     /// Projected annual consumption (kWh), cut to [`FORECAST_DP`] places.
+    #[cfg_attr(feature = "serde", serde(with = "crate::wire::decimal"))]
     pub projected_annual: Decimal,
     /// Seasonal correction factor; `1` when none was applied.
+    #[cfg_attr(feature = "serde", serde(with = "crate::wire::decimal"))]
     pub seasonal_factor: Decimal,
     /// Whether a seasonal factor could be derived from prior-year data.
     ///
@@ -77,9 +80,11 @@ pub struct AnnualForecast {
     ///
     /// See [`AnnualForecast::prediction_interval_note`] for what it does and
     /// does not claim. `None` when fewer than two whole days were observed.
+    #[cfg_attr(feature = "serde", serde(with = "crate::wire::decimal_option"))]
     pub confidence_lower: Option<Decimal>,
     /// Upper bound of the 95 % prediction interval (kWh), cut to
     /// [`FORECAST_DP`] places.
+    #[cfg_attr(feature = "serde", serde(with = "crate::wire::decimal_option"))]
     pub confidence_upper: Option<Decimal>,
 }
 

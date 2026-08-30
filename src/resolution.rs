@@ -405,8 +405,9 @@ mod tests {
         assert_eq!(IntervalResolution::QuarterHour.fixed_seconds(), Some(900));
     }
 
-    /// The bug this API shape exists to prevent: no fixed second count is right
-    /// for a calendar period, so none is offered.
+    /// No fixed second count is right for a calendar period, so none is
+    /// offered: a caller cannot reach for one that would be wrong twice a
+    /// year.
     #[test]
     fn calendar_resolutions_have_no_fixed_length() {
         for r in [

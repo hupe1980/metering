@@ -422,6 +422,29 @@ fn gas_conversion_section() {
     assert!(kwh > dec!(1000));
 }
 
+/// The *Where the Zustandszahl comes from* section of the gas page.
+#[test]
+fn zustandszahl_section() {
+    use metering::{
+        G685Rounding, ZustandszahlParams, gas_m3_to_kwh_hs_rounded, hoehenzonen_luftdruck_mbar,
+        zustandszahl,
+    };
+
+    // A household connection 253 m up, 22 mbar Effektivdruck.
+    let params = ZustandszahlParams::niederdruck(
+        hoehenzonen_luftdruck_mbar(dec!(253)), // 985.64 mbar
+        dec!(22),
+    )
+    .expect("below one bar, so K = 1");
+
+    let z = zustandszahl(&params).expect("a positive gas state");
+    assert_eq!(z.round_dp(4), dec!(0.9427));
+
+    // 1 874 m³ over the year at an Abrechnungsbrennwert of 11,316 kWh/m³.
+    let kwh = gas_m3_to_kwh_hs_rounded(dec!(1874), dec!(11.316), z, G685Rounding::default());
+    assert_eq!(kwh.round_dp(2), dec!(19991.07));
+}
+
 #[test]
 fn imbalance_section() {
     let saldo = metering::compute_imbalance(dec!(1050), dec!(1000));

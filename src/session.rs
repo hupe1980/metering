@@ -75,6 +75,7 @@ pub struct MeterSample {
     #[cfg_attr(feature = "serde", serde(with = "crate::wire::rfc3339"))]
     pub at: OffsetDateTime,
     /// The cumulative register value at that instant.
+    #[cfg_attr(feature = "serde", serde(with = "crate::wire::decimal"))]
     pub reading: Decimal,
 }
 
@@ -254,10 +255,9 @@ struct Segment {
 /// Place a session's energy on the metering grid.
 ///
 /// `energy` is the session total in the series' own unit — kWh for
-/// [`Sparte::Strom`](crate::Sparte::Strom). OCPP reports Wh; convert at the
+/// [`Sparte::Strom`](crate::Sparte::Strom); OCPP reports Wh, so convert at the
 /// boundary. `samples` are cumulative register readings taken during the
-/// session, in any order, and may be empty — then the whole total is spread
-/// pro rata.
+/// session, in any order, and may be empty — then the whole total is pro-rated.
 ///
 /// One [`MeterInterval`] per grid slot the session touches, contiguous and
 /// ascending, each spanning its **whole** slot rather than only the part the
@@ -281,9 +281,9 @@ struct Segment {
 ///
 /// # Errors
 ///
-/// See [`SessionError`]. All of them are contradictions in the input — an
-/// empty span, a register that ran backwards, a total the samples disagree
-/// with — never a shape this function merely does not handle.
+/// Every [`SessionError`] is a contradiction in the input — an empty span, a
+/// register that ran backwards, a total the samples disagree with — never a
+/// shape this function merely does not handle.
 ///
 /// ```rust
 /// use metering::session::{MeterSample, SessionSplitConfig, split_session};
@@ -309,7 +309,6 @@ struct Segment {
 /// assert_eq!(slots[1].value, dec!(6));
 /// assert_eq!(slots[1].quality, QualityFlag::Measured);
 /// assert_eq!(slots[0].quality, QualityFlag::Estimated);
-///
 /// assert_eq!(slots.iter().map(|s| s.value).sum::<rust_decimal::Decimal>(), dec!(10));
 /// # Ok::<(), metering::session::SessionError>(())
 /// ```

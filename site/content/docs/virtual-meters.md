@@ -23,10 +23,10 @@ further metering: `grid_draw = max(0, r)`, `grid_feed_in = max(0, −r)`,
 
 § 42b Abs. 5 EnWG caps the **pool**:
 
-> die rechnerisch aufteilbare Strommenge [ist] begrenzt […] auf die Strommenge,
-> die innerhalb eines 15-Minuten-Zeitintervalls in der Solaranlage erzeugt oder
-> von allen teilnehmenden Letztverbrauchern verbraucht wird, je nachdem welche
-> dieser Strommengen geringer ist.
+> … wobei die rechnerisch aufteilbare Strommenge begrenzt ist auf die
+> Strommenge, die innerhalb eines 15-Minuten-Zeitintervalls in der Solaranlage
+> erzeugt oder von allen teilnehmenden Letztverbrauchern verbraucht wird, je
+> nachdem welche dieser Strommengen geringer ist.
 
 The **per-tenant** cap — the `max(0, …)`, so no tenant is credited more PV than
 they drew — is the `Pos()` operator of the BDEW *Anwendungshilfe Solarpaket 1*
@@ -149,7 +149,7 @@ assert_eq!(interval.generation, interval.total_allocated() + interval.surplus_to
 § 42b Abs. 5 caps *"die rechnerisch aufteilbare Strommenge … auf die Strommenge,
 die innerhalb eines 15-Minuten-Zeitintervalls in der Solaranlage erzeugt oder
 von allen teilnehmenden Letztverbrauchern verbraucht wird, je nachdem welche
-dieser Strommengen geringer ist."*
+dieser Strommengen geringer ist."* — the pool, not the individual share.
 
 The function does not clamp to that figure, because it does not have to: with
 fractions summing to at most 1, the per-participant `Pos()` cap already implies

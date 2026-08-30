@@ -110,6 +110,7 @@ pub struct MeterReading {
     #[cfg_attr(feature = "serde", serde(with = "crate::wire::rfc3339"))]
     pub at: OffsetDateTime,
     /// The register value. Cumulative and, absent a rollover, non-decreasing.
+    #[cfg_attr(feature = "serde", serde(with = "crate::wire::decimal"))]
     pub value: Decimal,
     /// Quality of this reading.
     pub quality: QualityFlag,
@@ -165,12 +166,16 @@ pub struct Rollover {
     #[cfg_attr(feature = "serde", serde(with = "crate::wire::rfc3339"))]
     pub to: OffsetDateTime,
     /// Register value before the wrap.
+    #[cfg_attr(feature = "serde", serde(with = "crate::wire::decimal"))]
     pub previous: Decimal,
     /// Register value after it.
+    #[cfg_attr(feature = "serde", serde(with = "crate::wire::decimal"))]
     pub current: Decimal,
     /// The register's capacity, `10^digits`.
+    #[cfg_attr(feature = "serde", serde(with = "crate::wire::decimal"))]
     pub register_capacity: Decimal,
     /// Consumption across the wrap.
+    #[cfg_attr(feature = "serde", serde(with = "crate::wire::decimal"))]
     pub delta: Decimal,
 }
 
@@ -201,8 +206,10 @@ pub struct Anomaly {
     /// Why the difference was refused.
     pub kind: AnomalyKind,
     /// The earlier register value.
+    #[cfg_attr(feature = "serde", serde(with = "crate::wire::decimal"))]
     pub previous: Decimal,
     /// The later register value.
+    #[cfg_attr(feature = "serde", serde(with = "crate::wire::decimal"))]
     pub current: Decimal,
 }
 

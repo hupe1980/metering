@@ -1,7 +1,7 @@
 [package]
 name         = "metering"
 description  = "German energy metering domain library — DST-correct Europe/Berlin calendar arithmetic on both the Liefertag and the 06:00 Gastag, gas m3→kWh_Hs conversion, SigLinDe gas SLP, billing-period aggregation, Ersatzwertbildung, a robust validation engine, para 14a netzorientierte Steuerung and Modul 3 registers, conservation-checked allocation for para 42b/42c, charging sessions onto the settlement grid, check-digit-validated MaLo-IDs and EICs, and SLP/RLM/iMSys classification. Zero I/O, no async, no clock, exact decimal quantities."
-version      = "0.21.0"
+version      = "0.22.0"
 authors      = ["hupe1980"]
 edition      = "2024"
 license      = "MIT OR Apache-2.0"
@@ -20,38 +20,31 @@ time-tz      = { version = "2", features = ["db"] }
 
 [features]
 default = []
-# `rust_decimal/serde-str`, not plain `serde`. The JSON is identical — a
-# `Decimal` already travelled as its exact string — but the *deserialiser*
-# changes from `deserialize_any` to `deserialize_str`, and `deserialize_any` is
-# what a non-self-describing format cannot answer. Without it `MeterInterval`
-# could not round-trip through postcard or bincode at all, which is precisely
-# the claim the crate made about its hot types.
+# Enable no `rust_decimal` feature here. Cargo features are additive and global
+# to a build graph: `serde-str` would change how every `Decimal` in the
+# consumer's workspace deserialises, in crates that never named `metering`, and
+# `serde-float` set by anyone else would decide how this crate's quantities
+# serialise. `src/wire.rs` states the representation per field instead.
 #
-# `time/serde` is listed here rather than in `[dependencies]` so that a build
-# of this crate that did not ask for serde does not compile `time`'s either.
-# It used to arrive unconditionally through `serde-well-known`, whose only
-# contribution was the `time::serde::rfc3339` module that nothing here used.
-# How instants and dates actually travel is `src/wire.rs`.
-serde   = ["dep:serde", "rust_decimal/serde-str", "time/serde"]
+# `time/serde` sits here rather than in `[dependencies]`, so a build that did
+# not ask for serde does not compile `time`'s either.
+serde   = ["dep:serde", "time/serde"]
 
-# docs.rs builds with default features unless told otherwise, which would hide
-# every `serde` impl — including the wire representation this crate documents as
-# semver-covered. Feature labels on the gated items come from `doc_auto_cfg`,
-# which is automatic since Rust 1.92 and so needs no rustdoc flag at our MSRV.
+# Default features would hide every `serde` impl on docs.rs, including the wire
+# representation this crate covers by semver. The labels on gated items come
+# from `doc_auto_cfg`, automatic since Rust 1.92, so no rustdoc flag is needed.
 [package.metadata.docs.rs]
 all-features = true
 targets      = ["x86_64-unknown-linux-gnu"]
 
 [dev-dependencies]
-# `postcard` is here to prove one claim: that a timestamp is RFC 3339 in JSON
-# and stays `time`'s compact tuple in a binary format. `src/wire.rs` splits on
-# `is_human_readable`, and a split nothing exercises is a split that rots.
+# `postcard` exercises `src/wire.rs` against a format that is neither
+# self-describing nor human-readable. A split on `is_human_readable` that
+# nothing tests is a split that rots.
 #
-# `default-features = false` matters: the default `heapless-cas` feature pulls
-# `heapless` 0.7 and with it `atomic-polyfill`, which is unmaintained
-# (RUSTSEC-2023-0089) and which `cargo audit --deny warnings` rejects. Nothing
-# here needs a `heapless::Vec` — `to_allocvec` and `from_bytes` come from
-# `use-std`.
+# `default-features = false`: the default `heapless-cas` pulls `heapless` 0.7
+# and `atomic-polyfill`, unmaintained (RUSTSEC-2023-0089) and rejected by
+# `cargo audit --deny warnings`. `use-std` supplies `to_allocvec`/`from_bytes`.
 postcard   = { version = "1", default-features = false, features = ["use-std"] }
 proptest   = "1"
 serde_json = "1"

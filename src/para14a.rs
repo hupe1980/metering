@@ -134,6 +134,7 @@ pub struct SteuVe {
     pub fallgruppe: SteuVeFallgruppe,
     /// Netzanschlussleistung in kW — grouped per Ziff. 2.4.2 where that
     /// applies.
+    #[cfg_attr(feature = "serde", serde(with = "crate::wire::decimal"))]
     pub netzanschlussleistung_kw: Decimal,
 }
 
@@ -251,10 +252,13 @@ pub fn gleichzeitigkeitsfaktor(n_steuve: u32) -> Option<Decimal> {
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct Para14aConfig {
     /// The flat floor per steuVE, kW. Ziff. 4.5.1 Satz 1: 4,2.
+    #[cfg_attr(feature = "serde", serde(with = "crate::wire::decimal"))]
     pub mindestleistung_kw: Decimal,
     /// The Netzanschlussleistung above which b/c scale instead, kW: 11.
+    #[cfg_attr(feature = "serde", serde(with = "crate::wire::decimal"))]
     pub skalierung_schwelle_kw: Decimal,
     /// The Skalierungsfaktor: 0,4.
+    #[cfg_attr(feature = "serde", serde(with = "crate::wire::decimal"))]
     pub skalierungsfaktor: Decimal,
 }
 
@@ -360,7 +364,7 @@ pub fn mindestleistung_direktansteuerung(
 /// Two traps. The first term of the upper branch is a **maximum of two group
 /// sums**, not `0,4 ×` everything: `P_Summe WP` sums Fallgruppe b, `P_Summe
 /// Klima` sums Fallgruppe c, and the larger scaled sum wins. And `n_steuVE` is
-/// *"Anzahl aller steuerbaren Verbrauchseinrichtungen, die nach Ziffer 4.4.b
+/// *"Anzahl aller steuerbarer Verbrauchseinrichtungen, die nach Ziffer 4.4.b
 /// angesteuert werden"* — **all** of them, not only the scaled ones. Either
 /// mistake overstates the floor, which denies the Netzbetreiber reduction
 /// headroom it is entitled to.
@@ -434,8 +438,9 @@ pub fn mindestleistung_ems(devices: &[SteuVe], config: &Para14aConfig) -> Option
 ///
 /// Anlage 1 Ziff. 2.3 defines the netzwirksamer Leistungsbezug as *"derjenige
 /// Anteil der über den Netzanschluss aus einem Elektrizitätsverteilernetz der
-/// allgemeinen Versorgung entnommenen Leistung, der zeitgleich durch eine oder
-/// mehrere steuerbare Verbrauchseinrichtungen verursacht wird"* — and stops
+/// allgemeinen Versorgung entnommenen elektrischen Leistung, der zeitgleich
+/// durch eine oder mehrere steuerbare Verbrauchseinrichtungen verursacht
+/// wird"* — and stops
 /// there. When local generation covers part of the load, *which* part of the
 /// remaining grid draw the steuVE caused is an apportionment the Festlegung
 /// does not perform, so it is named here rather than assumed.

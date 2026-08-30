@@ -76,6 +76,7 @@ pub struct ResampledBucket {
     #[cfg_attr(feature = "serde", serde(with = "crate::wire::rfc3339"))]
     pub to: OffsetDateTime,
     /// Sum of all `value` from contributing intervals.
+    #[cfg_attr(feature = "serde", serde(with = "crate::wire::decimal"))]
     pub total: Decimal,
     /// Peak demand in kW across contributing intervals.
     ///
@@ -86,6 +87,7 @@ pub struct ResampledBucket {
     /// caveat as [`MeterInterval::demand_kw`](crate::MeterInterval::demand_kw).
     /// On a `Sparte::Wasser` series, whose values are cubic metres, this is a
     /// flow rate in m³/h wearing a `_kw` name.
+    #[cfg_attr(feature = "serde", serde(with = "crate::wire::decimal_option"))]
     pub peak_kw: Option<Decimal>,
     /// Number of intervals that contributed to this bucket.
     pub interval_count: u32,
@@ -361,8 +363,10 @@ mod tests {
         assert_eq!(result[0].is_complete(), Some(true));
     }
 
-    /// The bug that motivated calendar bucketing: a UTC-day grouping would split
-    /// these 96 intervals across two buckets and report both as incomplete.
+    /// Buckets are Berlin calendar days, not UTC days.
+    ///
+    /// A UTC-day grouping splits one complete German day across two buckets and
+    /// reports both as incomplete — for data that is exactly right.
     #[test]
     fn a_utc_day_is_not_a_german_day() {
         let base = datetime!(2026-03-15 00:00 UTC); // 01:00 CET — one hour late

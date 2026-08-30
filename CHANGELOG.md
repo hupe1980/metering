@@ -4,6 +4,188 @@ All notable changes to `metering` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the crate follows
 semver, with the `serde` representation explicitly in scope (see the crate docs).
 
+## [0.22.0] — 2026-08-31
+
+A consumer-feedback round from a workspace that upgraded `metering` 0.19 → 0.21
+alongside `meterstore` 0.6 → 0.8. One report, and it is the kind a library
+should take seriously: **`metering/serde` was changing a serde contract for
+crates that never named `metering`.**
+
+Cargo features are additive and global to a build graph. The `serde` feature
+here enabled `rust_decimal/serde-str`, which replaces the *global*
+`Deserialize` impl for `rust_decimal::Decimal` — so switching this crate on
+made `{"price": 30.0}` stop deserialising in unrelated services in the same
+workspace. In the reporting workspace, a crate with no dependency on `metering`
+at all passed its own `cargo test -p …` and failed the workspace run, and the
+deployed binary would have accepted a float that CI said it refused.
+
+The mirror image was the worse half and nobody had hit it yet:
+`rust_decimal/serde-float` enabled by **any** crate in the graph would have
+turned this crate's quantities into `f64` on the way out — silently, in a
+library whose entire claim is exact arithmetic.
+
+Both are gone. `metering` now enables **no `rust_decimal` feature at all** and
+writes the representation on its own fields.
+
+A self-audit ran alongside it. Every German passage the crate quotes as
+verbatim source text was re-checked against the published PDF, character by
+character; six did not match, and one of those turned out to be two different
+sentences from two different sections of the same document, spliced. The
+Zustandszahl — the one link in the gas chain the crate demanded from its caller
+without offering a way to derive it — is now computed. And the two
+documentation conventions that were enforced by review became a test.
+
+### Changed — breaking
+
+- **The `serde` feature is `["dep:serde", "time/serde"]`.** It no longer
+  enables `rust_decimal/serde-str`, or any other `rust_decimal` feature.
+
+  Every `Decimal` field of every `serde` type in this crate carries
+  `serde(with = "crate::wire::decimal")` (and the `_option`, `_vec`, `_array`,
+  `_map` forms for the container-shaped ones). The bytes are unchanged — a
+  quantity was already its exact decimal string, in JSON and in postcard — and
+  they are now the same bytes under **every** feature combination anyone in the
+  build graph can select, in both directions.
+
+  *What this changes for you.* If you relied on `metering/serde` to make a
+  **bare** `rust_decimal::Decimal` — one on your own type, not on a metering
+  type — round-trip through bincode or postcard, or to refuse a JSON number,
+  that no longer happens by accident. Enable `rust_decimal/serde-str` on your
+  own workspace pin, where the decision is visible and yours. This crate's own
+  types are unaffected: they behaved that way before and behave that way now.
+
+- **Quantities are parsed exactly.** The deserialiser is
+  `Decimal::from_str_exact`, so a string carrying more digits than a `Decimal`
+  can hold is an error rather than a silent rounding, and scientific notation
+  is no longer accepted. Anything this crate has ever written reads back — a
+  proptest over the mantissa and scale extremes holds that in both formats,
+  sign and reported precision included.
+
+- **`TryFrom<String>` for `MaloId`, `MeloId`, `BdewCode` and `Eic`.** A generic
+  `impl TryInto<BdewCode>` bound is satisfied by the caller's own type, not by
+  a deref of it, so a caller holding a `String` had to write `.as_str()` at an
+  `impl TryInto<…>` call site and `.parse()?` at the next one for the very same
+  value. All four corners — `FromStr`, `TryFrom<&str>`, `TryFrom<String>`,
+  `From<T> for String` — now exist on all four identifiers.
+
+### Added
+
+- **`conversion::zustandszahl` — the G 685-3 Zustandszahl, computed.** The
+  Brennwert is operator data and this crate still refuses to invent one; `z` is
+  a different thing, because it is *computable* from four inputs the rule names
+  and two constants DIN 1343 fixes:
+
+  ```text
+  z = (T_n ÷ T_eff) × ((p_amb + p_eff) ÷ p_n) × (1 ÷ K)
+  ```
+
+  `ZustandszahlParams` carries the four, `hoehenzonen_luftdruck_mbar` is the
+  `1016 − 0,12 × H` mbar of a Höhenzone, and `NORMTEMPERATUR_K`,
+  `NORMDRUCK_MBAR` and `ABRECHNUNGSTEMPERATUR_C` are the fixed values.
+  `ZustandszahlParams::niederdruck` fills in the two G 685-3 *fixes* rather than
+  choices — `T_eff = 15 °C` and `K = 1` — and returns `None` at or above one
+  bar, where `K = 1` stops being safe and G 685-6 has to be consulted: an
+  assumption with a stated limit should refuse to be used past it.
+
+  Evaluated as the single quotient `(T_n × p) ÷ (T_eff × p_n × K)`, so the
+  products stay exact and there is one rounding instead of three, and returned
+  **unrounded**: the four places `z` is quoted to are the market's rounding and
+  `gas_m3_to_kwh_hs_rounded` already applies them at the point of use. Rounding
+  here as well would round the same number twice, in the same direction, on
+  every invoice in the Höhenzone.
+
+  The worked example every Netzbetreiber Merkblatt prints is a test, end to
+  end: 253 m, 22 mbar → `z = 0,9427`; 1 874 m³ at 11,316 kWh/m³ → 19 991,07 kWh.
+  A proptest holds the direction in all three arguments, which is what a sign
+  or a reciprocal in the wrong place would break while still producing a
+  plausible number near 1.
+
+### Fixed — documentation
+
+Six passages quoted as verbatim source text did not match the source. Each was
+re-checked against the published PDF and corrected; none changed any
+computation, and one of them is a scope difference worth knowing about.
+
+- **Allgemeine Festlegungen Kap. 3** reads *"ergeb**en**en Zeitpunkte"*, not
+  *"ergebenden"*. A quotation a reader cannot find by searching the PDF is not
+  doing its job.
+- **BK6-22-300 Anlage 1 Ziff. 2.3** reads *"entnommenen **elektrischen**
+  Leistung"* — a word was missing from the definition of the netzwirksamer
+  Leistungsbezug.
+- **BK6-22-300 Anlage 1 Ziff. 4.5.2** reads *"Anzahl aller **steuerbarer**
+  Verbrauchseinrichtungen"*.
+- **§ 42b Abs. 5 EnWG** reads *"wobei die rechnerisch aufteilbare Strommenge
+  begrenzt ist auf die Strommenge…"*. The crate had reordered it into
+  *"…Strommenge \[ist\] begrenzt …"*, which marks an insertion that was not one
+  and hides a reordering that was.
+- **BDEW AWH Modul 3** states the two-quarter rule **twice**, and the crate had
+  spliced one sentence from each into a single quotation. They differ in scope:
+  the overview says *"die drei Netzentgelttarife"*, the operative
+  *Rahmenbedingungen* section says *"die Zeitfenster und Preisstufen für HT und
+  NT"*. Both are now quoted where they stand.
+- **BDEW AWH Modul 3**, again: *"Die Preisstufen und Zeitfenster müssen
+  ganzjährig identisch sein"* is not the end of the sentence — it continues
+  *", d. h. sie dürfen zwischen den einzelnen Quartalen nicht variieren."*
+
+### Documentation
+
+- **§ 25 Nr. 7 MessEV is now stated as the basis for the whole crate, not just
+  for gas.** Almost nothing here is a measured value — a billing period is a
+  sum, a register delta a difference, a gas kWh a product, an allocation share
+  a quotient — and § 33 Abs. 1 MessEG would forbid all four. § 25 Nr. 7 is the
+  exception that permits them, *"sofern die Art der Berechnung und die
+  verwendeten Werte für den vorgesehenen Verwendungszweck geeignet sind"*. That
+  closing clause is the reason `GasConversionParams` has no `Default`, a
+  `QualityFlag` travels with every interval, `substitute` writes an audit trail,
+  a validation result reports which rules ran, and a Netzbetreiber's rounding is
+  a parameter. It was a footnote in one module; it is now in the crate docs and
+  on the *Regulatory basis* page.
+- DVGW G 685 is cited by **part** where a part is meant: Teil 2 Brennwert,
+  Teil 3 Volumen im Normzustand, Teil 6 Kompressibilitätszahl (which absorbed
+  G 486 in the 2020 restructuring).
+- The crate docs link to the guides. There was no pointer from docs.rs to the
+  documentation site at all, in a crate whose convention is that the long-form
+  explanation lives there.
+- `Eic::object_type` says what a caller does when their *own* downstream
+  rejects an unlisted type letter: gate on `object_type().is_none()` and report
+  it there. The parse stays tolerant — the type list is ENTSO-E's to extend —
+  and the crate does not make that call in either direction on a consumer's
+  behalf. Worth stating, because an EIC now commonly passes through two parsers
+  in one process and the strict one runs first.
+
+### Tests
+
+- `tests/serde_representation.rs` grew three mechanical guards, replacing a
+  scan that only walked `struct` bodies:
+  - `no_timestamp_field_escapes_the_wire_format` and
+    `no_decimal_field_escapes_the_wire_format` share one source scan that walks
+    **enum variants too** and handles multi-line attributes. A `Decimal` in an
+    enum variant was invisible to the old scan; `AggregationRule::fraction` is
+    one, and both scans were mutation-checked against a removed attribute.
+  - `the_crate_reaches_for_no_rust_decimal_serde_feature` reads `Cargo.toml`
+    and fails if a `rust_decimal/serde*` feature comes back. The comment that
+    used to explain why became a mechanism.
+- `a_quantity_is_a_string_and_a_json_number_is_refused` and
+  `quantities_in_containers_are_strings_too` pin the representation for the
+  scalar, `Option`, sequence, fixed array and map shapes.
+- `every_quantity_round_trips_through_json_and_postcard` is a proptest over the
+  full mantissa range and every scale: a strict reader that cannot read its own
+  writer is worse than a lenient one, and hand-picked values do not reach the
+  extremes where an exact parse would fail.
+- **`tests/doc_conventions.rs`** makes two documentation conventions mechanical
+  that were enforced by review alone:
+  - `no_item_doc_grows_into_a_chapter` — no `///` block over 60 lines. A block
+    long enough to bury the item after it has stopped being documentation; the
+    guides are where a chapter goes. Two blocks were over and are now trimmed.
+  - `reference_docs_are_not_a_changelog` — no *"used to be"*, *"an earlier
+    version"*, *"the bug that"* or release number in a reference doc, across
+    `src/`, `tests/`, the site pages and the README. History belongs in this
+    file. The one exception is `tests/serde_representation.rs`, where *which
+    release a tag arrived in* is the fact being recorded.
+
+  Four test doc comments named the defect they were written for rather than the
+  property they guard, and are rewritten in the present tense.
+
 ## [0.21.0] — 2026-08-30
 
 A round of consumer feedback from a workspace that allocates the

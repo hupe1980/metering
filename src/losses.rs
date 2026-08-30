@@ -22,15 +22,19 @@ use rust_decimal::Decimal;
 pub struct NetworkLosses {
     /// Total energy fed into the grid area (kWh) — generation feed-in plus
     /// imports over Übergabezählpunkte.
+    #[cfg_attr(feature = "serde", serde(with = "crate::wire::decimal"))]
     pub einspeisung_kwh: Decimal,
     /// Total energy taken out of the grid area (kWh) — customer offtake plus
     /// exports.
+    #[cfg_attr(feature = "serde", serde(with = "crate::wire::decimal"))]
     pub entnahme_kwh: Decimal,
     /// `einspeisung − entnahme`. Positive = physical losses (plus any
     /// unmetered offtake); negative = metering-coverage gap on the infeed
     /// side.
+    #[cfg_attr(feature = "serde", serde(with = "crate::wire::decimal"))]
     pub verlust_kwh: Decimal,
     /// Loss share of the infeed in percent, `None` when nothing was fed in.
+    #[cfg_attr(feature = "serde", serde(with = "crate::wire::decimal_option"))]
     pub verlust_prozent: Option<Decimal>,
 }
 

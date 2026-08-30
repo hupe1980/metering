@@ -9,6 +9,41 @@ recently in August 2026, against the EDI@Energy versions binding since
 1 April 2026. Where a claim cannot be verified, the library says so rather than
 asserting it.
 
+*Allgemeine Festlegungen* v6.1d becomes binding on 1 October 2026 and carries
+every passage cited here unchanged, so the v6.1c references below stay accurate
+until then.
+
+## Almost nothing here is a measured value
+
+A billing period is a sum, a register delta a difference, a gas kWh a product,
+an allocation share a quotient. § 33 Abs. 1 MessEG permits a value for a
+Messgröße only if a Messgerät determined it, so every one of those would be
+unusable — and **§ 25 Nr. 7 MessEV** is the exception the German energy market
+bills on:
+
+> Messgrößen im Bereich der leitungsgebundenen Energieversorgung mit
+> Elektrizität und Gas und anderen Energieträgern, deren Werte als Summe,
+> Differenz, Produkt oder Quotient oder Kombinationen davon aus Messwerten
+> gebildet werden, die mit einem dem Mess- und Eichgesetz und dieser Verordnung
+> entsprechendem Messgerät ermittelt worden sind und sofern die Art der
+> Berechnung und die verwendeten Werte für den vorgesehenen Verwendungszweck
+> geeignet sind
+
+The closing clause is the specification: the *method* and the *values used* must
+be fit for the purpose, which means they must be stateable. That is behind most
+of the [design constraints](@/docs/design.md):
+`GasConversionParams` has no `Default` and invents no Brennwert; a `QualityFlag`
+travels with every interval; `substitute` writes an audit trail; a validation
+result reports which rules actually ran; a Netzbetreiber's rounding is a
+parameter rather than a constant. Every number the library returns can be
+re-derived from what it was handed.
+
+§ 25 Nr. 4 is the narrower sibling that permits the Brennwert itself, *"wenn sie
+nach den anerkannten Regeln der Technik ermittelt worden sind und die dafür
+verwendeten Messwerte mit einem dem Mess- und Eichgesetz und dieser Verordnung
+entsprechendem Messgerät ermittelt worden sind"* — DVGW G 685 being the
+anerkannte Regel in question.
+
 | Topic | Basis |
 |---|---|
 | Ersatzwertbildung, Datenübermittlung | § 60 Abs. 1, 2 MsbG; procedures per BNetzA BK6-24-174, VDE-AR-N 4400 |
@@ -26,7 +61,8 @@ asserting it.
 | Gemeinschaftliche Gebäudeversorgung | § 42b EnWG + BDEW Anwendungshilfe Solarpaket 1 (v1.0, 25.01.2024) |
 | Energy Sharing | § 42c EnWG — in force **22 December 2025** (BGBl. 2025 I Nr. 347); the Netzbetreiber duty of Abs. 4 from 1 June 2026, adjacent Bilanzierungsgebiete from 1 June 2028 |
 | Dynamische Tarife | § 41a Abs. 2 EnWG — a duty on large **suppliers**, not a metering mandate |
-| Gas m³ → kWh | § 33 MessEG; § 25 Nr. 4 and Nr. 7 MessEV; DVGW G 685, G 260 |
+| Gas m³ → kWh | § 33 MessEG; § 25 Nr. 4 and Nr. 7 MessEV; DVGW G 685 Teil 2 (Brennwert), Teil 3 (Volumen im Normzustand), Teil 6 (K-Zahl); G 260 |
+| Normzustand, Zustandszahl, Höhenzonen | DIN 1343 (`T_n` = 273,15 K, `p_n` = 1013,25 mbar); DVGW G 685-3 — `T_eff` = 15 °C als Festwert, `p_amb = 1016 − 0,12 × H`, Zonenhöhe max. 50 m von der Zonengrenze |
 | Gas-SLP (SigLinDe), Allokationstemperatur, Kundenwert | BDEW/VKU/GEODE Leitfaden *Abwicklung von Standardlastprofilen Gas*, KoV XV, Stand 27.03.2026, Anlage 6 — published in full, quoted verbatim |
 | Gas-SLP-Codes (15 Typen, inkl. `GHD`) | EDI@Energy *Codeliste TUM- und BDEW-SLP Gas* v1.1, §6.1–6.3 |
 | Gastag 06:00–06:00 | GaBi Gas / Art. 3 Nr. 6 VO (EU) 312/2014; temperature averaging per the SLP-Gas Leitfaden |

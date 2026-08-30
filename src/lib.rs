@@ -8,6 +8,9 @@
 //! tariff-rate type here. What leaves this crate is kWh, m³ and kW, which a
 //! billing layer then prices.
 //!
+//! Regulatory sources quoted in full and the longer worked examples are in the
+//! [guides](https://hupe1980.github.io/metering); these docs link out to them.
+//!
 //! # Modules
 //!
 //! | Module | Contents |
@@ -19,7 +22,7 @@
 //! | [`calendar`] | Europe/Berlin days, months, years **and the 06:00 Gastag** — DST-correct; `DayBoundary` |
 //! | [`holiday`] | Bundesland statutory holidays; SLP day typing |
 //! | [`resolution`] | `IntervalResolution` — fixed vs calendar lengths |
-//! | [`conversion`] | Gas m³ → kWh_Hs, unit normalisation, HeizkostenV warm water |
+//! | [`conversion`] | Gas m³ → kWh_Hs and the G 685-3 Zustandszahl, unit normalisation, HeizkostenV warm water |
 //! | [`aggregation`] | Billing period: Arbeitsmenge, Spitzenleistung, coverage; the directional balance |
 //! | [`zaehlzeit`] | Tariff registers — HT/NT and § 14a Modul 3, with a conformance check |
 //! | [`para14a`] | § 14a netzorientierte Steuerung — `P_min,14a` and the netzwirksamer Leistungsbezug |
@@ -102,6 +105,21 @@
 //! doubling every reading doubles a projection to within `2 × 10⁻³` kWh, not
 //! exactly, because `round(2x)` and `2·round(x)` differ at a rounding boundary.
 //!
+//! ## Why a derived quantity carries its method
+//!
+//! Almost nothing here is a *measured* value: a billing period is a sum, a
+//! register delta a difference, a gas kWh a product, an allocation share a
+//! quotient. § 25 Nr. 7 MessEV is what permits billing on any of them, and it
+//! attaches a condition — *"sofern die Art der Berechnung und die verwendeten
+//! Werte für den vorgesehenen Verwendungszweck geeignet sind"*. The method and
+//! the inputs must be stateable, so they are: [`GasConversionParams`] has no
+//! `Default`, a [`QualityFlag`] travels with every interval, [`substitute`]
+//! writes an audit trail, [`ValidationResult::evaluated`] reports which rules
+//! ran, and a Netzbetreiber's rounding is a parameter ([`G685Rounding`]).
+//! Every number here can be re-derived from what it was given — the
+//! [regulatory basis](https://hupe1980.github.io/metering/docs/regulatory-basis/)
+//! quotes the provision in full.
+//!
 //! # Determinism
 //!
 //! **No function in this crate reads the system clock, the filesystem, the
@@ -145,7 +163,7 @@
 //! *"Die Angabe von Zeiten in einer EDIFACT Nachricht erfolgt in koordinierter
 //! Weltzeit (Coordinated Universal Time, UTC). … Alle in den Prozessen
 //! genannten Zeitpunkte (inkl. der sich unter Berücksichtigung von Fristen
-//! ergebenden Zeitpunkte) nutzen die gesetzliche deutsche Zeit."*
+//! ergebenen Zeitpunkte) nutzen die gesetzliche deutsche Zeit."*
 //!
 //! Because a calendar period has no fixed second count,
 //! [`IntervalResolution::fixed_seconds`] returns `None` for `Day`, `Month` and
@@ -265,6 +283,20 @@
 //! a format chosen for its packing. `serde` is asked which kind of format it is
 //! and the answer decides — see the private `wire` module.
 //!
+//! ## Quantities are exact decimal strings
+//!
+//! A quantity travels as `"12.345"` — the characters its `Display` writes — in
+//! every format, readable or binary; a decimal string is already the compact
+//! form. Reading one back asks for a **string**, so a JSON number is a type
+//! error rather than a silent trip through `f64`, and more digits than a
+//! `Decimal` holds are refused rather than rounded away.
+//!
+//! Each field states this itself rather than borrowing `rust_decimal`'s
+//! feature-gated impls, because those features are global to a build graph:
+//! `serde-str` here would change how every `Decimal` deserialises in crates
+//! that never named `metering`, and `serde-float` set by any of them would
+//! decide how *these* quantities serialise.
+//!
 //! ## The hot types survive a non-self-describing format
 //!
 //! `MeterInterval`, `ObisCode`, [`MeterReading`] and the identifiers round-trip
@@ -273,10 +305,10 @@
 //! discriminator at a fixed, queryable path is worth more for configuration
 //! stored once per delivery point than binary compactness is.
 //!
-//! Both halves are pinned by a test. The `rust_decimal/serde-str` feature is
-//! what makes the first half hold: the default deserialiser asks
-//! `deserialize_any`, which is the one question a format without a
-//! self-describing wire cannot answer.
+//! Both halves are pinned by a test. Asking for a string is what makes the
+//! first half hold: `deserialize_any` is the one question a format without a
+//! self-describing wire cannot answer, and it is what an inherited `Decimal`
+//! impl asks.
 //!
 //! # A clean report is not the same as a clean series
 //!
@@ -467,8 +499,8 @@ pub use calendar::{
 pub use classification::{Messtyp, SeriesOrigin, classify_messtyp, detect_interval_length};
 pub use conversion::{
     ConversionError, G685FinalRounding, G685Rounding, GasConversionParams, WarmWaterAdjustments,
-    gas_m3_to_kwh_hs, gas_m3_to_kwh_hs_rounded, normalize_to_kwh, warm_water_heat_kwh,
-    warm_water_heat_kwh_unmetered,
+    ZustandszahlParams, gas_m3_to_kwh_hs, gas_m3_to_kwh_hs_rounded, hoehenzonen_luftdruck_mbar,
+    normalize_to_kwh, warm_water_heat_kwh, warm_water_heat_kwh_unmetered, zustandszahl,
 };
 pub use error::ParseError;
 pub use forecast::{AnnualForecast, FORECAST_DP, project_annual_consumption};

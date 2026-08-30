@@ -990,13 +990,10 @@ fn timestamps_round_trip_through_json_and_postcard() {
 /// The hot types round-trip through a **non-self-describing** binary format,
 /// and the internally-tagged configuration types deliberately do not.
 ///
-/// The crate states that trade-off — *"no bincode/postcard for that type; the
-/// hot types are unaffected"* — and it was not true. `MeterInterval` carries a
-/// `Decimal`, whose default `Deserialize` calls `deserialize_any`, and
-/// `deserialize_any` is the one question a format without a self-describing
-/// wire cannot answer. Enabling `rust_decimal/serde-str` moves it to
-/// `deserialize_str`, changing nothing in JSON — a `Decimal` already travelled
-/// as its exact string — and making the claim true.
+/// `deserialize_any` is the one question postcard and bincode cannot answer, so
+/// every field of a hot type names its own representation through
+/// `crate::wire`. An internal tag needs `deserialize_any` by construction — the
+/// documented price of a discriminator at a fixed, queryable path.
 #[test]
 fn the_hot_types_survive_a_binary_format_and_the_tagged_ones_do_not() {
     use metering::{AggregationRule, AllocationKey};
@@ -1019,12 +1016,19 @@ fn the_hot_types_survive_a_binary_format_and_the_tagged_ones_do_not() {
     let bytes = postcard::to_allocvec(&code).expect("serialises");
     assert_eq!(postcard::from_bytes::<ObisCode>(&bytes).unwrap(), code);
 
-    // A bare Decimal, which is what actually blocked the whole hot path.
-    let value = dec!(-12345.6789);
-    let bytes = postcard::to_allocvec(&value).expect("serialises");
+    // A quantity travels as a string in a binary format too, and the sign and
+    // the scale survive it. The field says so itself — a *bare*
+    // `rust_decimal::Decimal` still deserialises however the consumer's own
+    // feature selection says, which is the point: this crate does not reach
+    // across the build graph to decide that.
+    let negative = metering::reading::MeterReading::measured(
+        datetime!(2026-06-01 0:00 UTC),
+        dec!(-12345.6789),
+    );
+    let bytes = postcard::to_allocvec(&negative).expect("serialises");
     assert_eq!(
-        postcard::from_bytes::<rust_decimal::Decimal>(&bytes).unwrap(),
-        value
+        postcard::from_bytes::<metering::reading::MeterReading>(&bytes).expect("reads back"),
+        negative,
     );
 
     // Configuration: internal tagging needs a self-describing format, which is
@@ -1046,20 +1050,27 @@ fn the_hot_types_survive_a_binary_format_and_the_tagged_ones_do_not() {
     assert!(postcard::from_bytes::<AllocationKey>(&bytes).is_err());
 }
 
-/// No timestamp field escapes the wire format.
+// ── the source scans ─────────────────────────────────────────────────────────
+
+/// One field of a `serde`-derived type in `src/`.
+struct ScannedField {
+    /// `file.rs: pub value: Decimal,` — enough to find it by eye.
+    location: String,
+    /// The declared type, with `pub` and the trailing comma stripped.
+    ty: String,
+    /// Every attribute sitting directly above the field, concatenated.
+    attrs: String,
+}
+
+/// Every field of every `serde`-derived `struct` and `enum` under `src/`.
 ///
-/// `src/wire.rs` only applies where a field asks for it, and a field that
-/// forgets falls silently back to `time`'s ordinal tuple — in JSON, in one
-/// struct, next to siblings that are RFC 3339 strings. Nothing fails to compile
-/// and nothing fails to round-trip; the format is just inconsistent, which is
-/// the worst kind of wire bug to find later.
-///
-/// This is a test, so it may read files; the no-I/O guarantee is about `src/`.
-#[test]
-fn no_timestamp_field_escapes_the_wire_format() {
+/// A line-by-line walk, because the question is *which attributes sit directly
+/// above this field* and only adjacency answers it. Enum variants are walked
+/// too: a `Decimal` in one travels the same wire. Sources are normalised
+/// because a Windows checkout hands out `\r\n`.
+fn scan_serde_fields() -> Vec<ScannedField> {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    let mut missing: Vec<String> = Vec::new();
-    let mut checked = 0usize;
+    let mut found = Vec::new();
 
     for entry in std::fs::read_dir(root.join("src")).expect("src/ is readable") {
         let path = entry.expect("readable entry").path();
@@ -1071,61 +1082,305 @@ fn no_timestamp_field_escapes_the_wire_format() {
             .unwrap_or_default()
             .to_string_lossy()
             .into_owned();
-        // Normalised, because a Windows checkout hands out `\r\n` and every
-        // line-shaped pattern below would miss.
         let text = std::fs::read_to_string(&path)
             .expect("readable source")
             .replace("\r\n", "\n");
 
-        // A line-by-line walk rather than a search over the whole text: the
-        // question is "which attributes sit directly above this item", and only
-        // adjacency answers it.
         let mut attrs = String::new();
-        let mut inside_serde_struct = false;
+        let mut depth = 0usize;
+        let mut item_is_serde = false;
+
         for line in text.lines() {
             let trimmed = line.trim();
 
-            if inside_serde_struct {
-                if trimmed == "}" {
-                    inside_serde_struct = false;
+            // An attribute may span several lines; it is finished when its
+            // parentheses balance. Without this, the second line of a
+            // multi-line `cfg_attr` reads as an ordinary statement and discards
+            // the `derive` above it.
+            let attrs_open = attrs.matches('(').count() != attrs.matches(')').count();
+            if trimmed.starts_with("#[") || attrs_open {
+                attrs.push_str(trimmed);
+                continue;
+            }
+
+            if depth == 0 {
+                let is_item = (trimmed.starts_with("pub struct ")
+                    || trimmed.starts_with("pub enum ")
+                    || trimmed.starts_with("struct ")
+                    || trimmed.starts_with("enum "))
+                    && trimmed.ends_with('{');
+                if is_item {
+                    item_is_serde = attrs.contains("Serialize");
+                    depth = 1;
+                } else if !trimmed.starts_with("//") {
                     attrs.clear();
-                } else if trimmed.starts_with("#[") {
-                    attrs.push_str(trimmed);
-                } else if !trimmed.starts_with("///") {
-                    if let Some(decl) = trimmed.strip_prefix("pub ")
-                        && (decl.ends_with(": OffsetDateTime,")
-                            || decl.ends_with(": Option<OffsetDateTime>,")
-                            || decl.ends_with(": Date,")
-                            || decl.ends_with(": Option<Date>,"))
-                    {
-                        checked += 1;
-                        if !attrs.contains("crate::wire") {
-                            missing.push(format!("{file}: {decl}"));
-                        }
-                    }
+                }
+                if is_item {
                     attrs.clear();
                 }
                 continue;
             }
 
-            if trimmed.starts_with("#[") {
-                attrs.push_str(trimmed);
-            } else if trimmed.starts_with("pub struct ") && trimmed.ends_with('{') {
-                inside_serde_struct = attrs.contains("Serialize");
+            if !trimmed.starts_with("//") {
+                if item_is_serde && let Some((name, ty)) = field_decl(trimmed) {
+                    found.push(ScannedField {
+                        location: format!("{file}: {name}: {ty}"),
+                        ty: ty.to_owned(),
+                        attrs: attrs.clone(),
+                    });
+                }
                 attrs.clear();
-            } else if !trimmed.starts_with("//") {
+            }
+
+            depth = depth + trimmed.matches('{').count() - trimmed.matches('}').count();
+            if depth == 0 {
+                item_is_serde = false;
                 attrs.clear();
             }
         }
     }
 
+    found
+}
+
+/// `name: Type,` split into its two halves, or `None` for any other line.
+fn field_decl(trimmed: &str) -> Option<(&str, &str)> {
+    let decl = trimmed
+        .strip_prefix("pub(crate) ")
+        .or_else(|| trimmed.strip_prefix("pub(super) "))
+        .or_else(|| trimmed.strip_prefix("pub "))
+        .unwrap_or(trimmed);
+    let body = decl.strip_suffix(',')?;
+    let (name, ty) = body.split_once(": ")?;
+    let is_ident = !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    is_ident.then_some((name, ty))
+}
+
+/// No timestamp field escapes the wire format.
+///
+/// `src/wire.rs` only applies where a field asks for it, and a field that
+/// forgets falls silently back to `time`'s ordinal tuple — in JSON, in one
+/// struct, next to siblings that are RFC 3339 strings. Nothing fails to compile
+/// and nothing fails to round-trip; the format is just inconsistent, which is
+/// the worst kind of wire bug to find later.
+#[test]
+fn no_timestamp_field_escapes_the_wire_format() {
+    let fields = scan_serde_fields();
+    let timestamps: Vec<&ScannedField> = fields
+        .iter()
+        .filter(|f| {
+            matches!(
+                f.ty,
+                ref t if t == "OffsetDateTime"
+                    || t == "Option<OffsetDateTime>"
+                    || t == "Date"
+                    || t == "Option<Date>"
+            )
+        })
+        .collect();
+    let missing: Vec<&str> = timestamps
+        .iter()
+        .filter(|f| !f.attrs.contains("crate::wire"))
+        .map(|f| f.location.as_str())
+        .collect();
+
     assert!(
-        checked > 15,
-        "the scan found only {checked} timestamp fields — it has stopped working, not the crate",
+        timestamps.len() > 15,
+        "the scan found only {} timestamp fields — it has stopped working, not the crate",
+        timestamps.len(),
     );
     assert!(
         missing.is_empty(),
         "timestamp fields with no wire format, so they travel as `time`'s \
          ordinal tuple while their siblings are RFC 3339: {missing:#?}",
     );
+}
+
+/// No quantity escapes the wire format either.
+///
+/// A `Decimal` field with no `serde(with)` travels however `rust_decimal`'s
+/// features happened to unify in the consumer's build — including as an `f64`,
+/// chosen by a crate that never named `metering`.
+#[test]
+fn no_decimal_field_escapes_the_wire_format() {
+    let fields = scan_serde_fields();
+    let quantities: Vec<&ScannedField> =
+        fields.iter().filter(|f| f.ty.contains("Decimal")).collect();
+    let missing: Vec<&str> = quantities
+        .iter()
+        .filter(|f| !f.attrs.contains("crate::wire::decimal"))
+        .map(|f| f.location.as_str())
+        .collect();
+
+    assert!(
+        quantities.len() > 70,
+        "the scan found only {} quantity fields — it has stopped working, not the crate",
+        quantities.len(),
+    );
+    assert!(
+        missing.is_empty(),
+        "quantity fields with no wire format, so their representation is \
+         whatever `rust_decimal` features the consumer's graph unified to: {missing:#?}",
+    );
+}
+
+/// The crate enables no `rust_decimal` `serde` feature — the mechanism behind
+/// the scan above.
+///
+/// Cargo features are global to a build graph, so one enabled here decides how
+/// `Decimal` behaves in crates that never named `metering`. `src/wire.rs`
+/// states the representation per field instead.
+#[test]
+fn the_crate_reaches_for_no_rust_decimal_serde_feature() {
+    let manifest = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml"),
+    )
+    .expect("readable manifest")
+    .replace("\r\n", "\n");
+
+    let offenders: Vec<&str> = manifest
+        .lines()
+        .filter(|line| !line.trim_start().starts_with('#'))
+        .filter(|line| line.contains("rust_decimal/serde"))
+        .collect();
+
+    assert!(
+        offenders.is_empty(),
+        "enabling a `rust_decimal` serde feature changes how `Decimal` \
+         deserialises for every crate in the consumer's build graph: {offenders:#?}",
+    );
+}
+
+/// A quantity is its exact decimal string, and a JSON **number** is refused.
+///
+/// `0.1` is not representable in binary floating point, so accepting the number
+/// would mean rounding it and carrying that through every conservation identity
+/// the crate advertises. The scale survives too: `"2.50"` is a quantity
+/// reported to two decimal places and stays one.
+#[test]
+fn a_quantity_is_a_string_and_a_json_number_is_refused() {
+    let interval = MeterInterval {
+        from: datetime!(2026-06-01 12:00 UTC),
+        to: datetime!(2026-06-01 12:15 UTC),
+        value: dec!(2.50),
+        quality: QualityFlag::Measured,
+        obis_code: None,
+    };
+    let encoded = json(&interval);
+    assert!(encoded.contains(r#""value":"2.50""#), "{encoded}");
+    let back: MeterInterval = serde_json::from_str(&encoded).expect("reads back");
+    assert_eq!(back.value.scale(), 2, "the reported precision survives");
+    assert_eq!(back, interval);
+
+    let as_number = encoded.replace(r#""value":"2.50""#, r#""value":2.50"#);
+    let refused = serde_json::from_str::<MeterInterval>(&as_number)
+        .expect_err("a float cannot hold an exact quantity");
+    assert!(
+        refused.to_string().contains("string"),
+        "the message should say what was expected: {refused}",
+    );
+
+    // More digits than a `Decimal` holds are refused rather than rounded away.
+    let too_precise = encoded.replace(r#""2.50""#, r#""2.5000000000000000000000000000001""#);
+    assert!(
+        serde_json::from_str::<MeterInterval>(&too_precise).is_err(),
+        "silently dropping digits is how a conservation identity stops holding",
+    );
+}
+
+/// The same representation inside a sequence, an array and a map.
+///
+/// `serde(with)` names functions over the field's own type, so a container
+/// needs its own module or its elements fall back to the inherited impl. These
+/// three are the crate's only container-shaped quantities.
+#[test]
+fn quantities_in_containers_are_strings_too() {
+    use metering::gas_slp::WeekdayFactors;
+    use metering::load_profile::{DynamicSlpProfile, SlpDayType};
+    use metering::virtual_meter::AllocationKey;
+
+    let mut profile = DynamicSlpProfile::default();
+    profile
+        .values
+        .insert((1, SlpDayType::Werktag), vec![dec!(0.25), dec!(0.125)]);
+    assert!(
+        json(&profile).contains(r#""values":["0.25","0.125"]"#),
+        "{}",
+        json(&profile)
+    );
+
+    let factors = WeekdayFactors::new([
+        dec!(1.0253),
+        dec!(1.0253),
+        dec!(1.0253),
+        dec!(1.0253),
+        dec!(1.0253),
+        dec!(0.9235),
+        dec!(0.9500),
+    ]);
+    let factors = factors.expect("the seven factors sum to seven");
+    let encoded = json(&factors);
+    assert!(encoded.contains(r#""1.0253""#), "{encoded}");
+    assert_eq!(
+        serde_json::from_str::<WeekdayFactors>(&encoded).expect("reads back"),
+        factors,
+    );
+
+    // An array is a tuple to `serde` and a sequence is not, so the two halves
+    // of `decimal_array` have to agree about the length prefix. Only a format
+    // that omits it can tell the difference.
+    let bytes = postcard::to_allocvec(&factors).expect("serialises");
+    assert_eq!(
+        postcard::from_bytes::<WeekdayFactors>(&bytes).expect("reads back"),
+        factors,
+    );
+
+    let key = AllocationKey::Constant {
+        fractions: [("T1".to_owned(), dec!(0.10)), ("T2".to_owned(), dec!(0.90))]
+            .into_iter()
+            .collect(),
+    };
+    let encoded = json(&key);
+    assert!(encoded.contains(r#""T1":"0.10""#), "{encoded}");
+    assert_eq!(
+        serde_json::from_str::<AllocationKey>(&encoded).expect("reads back"),
+        key,
+    );
+}
+
+/// Every `Decimal` this crate can hold survives both wire formats, exactly.
+///
+/// The deserialiser is strict, and a strict reader that cannot read its own
+/// writer is worse than a lenient one. Asserted over the *content* — sign and
+/// scale included — because a hand-picked value does not reach the mantissa and
+/// scale extremes where an exact parse would fail.
+#[test]
+fn every_quantity_round_trips_through_json_and_postcard() {
+    use proptest::prelude::*;
+    use rust_decimal::Decimal;
+
+    let quantity = (
+        proptest::num::i128::ANY.prop_map(|m| m % (1i128 << 96)),
+        0u32..=28,
+    )
+        .prop_map(|(mantissa, scale)| Decimal::from_i128_with_scale(mantissa, scale));
+
+    proptest!(|(value in quantity)| {
+        let reading = metering::reading::MeterReading::measured(
+            datetime!(2026-06-01 0:00 UTC),
+            value,
+        );
+
+        let encoded = json(&reading);
+        let back: metering::reading::MeterReading =
+            serde_json::from_str(&encoded).expect("JSON reads back");
+        prop_assert_eq!(back.value, value);
+        prop_assert_eq!(back.value.scale(), value.scale(), "the reported precision survives");
+
+        let bytes = postcard::to_allocvec(&reading).expect("serialises");
+        let back: metering::reading::MeterReading =
+            postcard::from_bytes(&bytes).expect("postcard reads back");
+        prop_assert_eq!(back.value, value);
+        prop_assert_eq!(back.value.scale(), value.scale());
+    });
 }

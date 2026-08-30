@@ -16,9 +16,10 @@ use metering::session::{MeterSample, SessionSplitConfig, merge_sessions, split_s
 use metering::{
     AggregationConfig, AllocationBasis, AllocationPart, FillGapsConfig, G685FinalRounding,
     G685Rounding, GasConversionParams, IntervalResolution, MeasurementUnit, MeterInterval,
-    QualityFlag, ResampleConfig, SubstituteMethod, Zaehlzeitdefinition, aggregate, allocate,
-    compute_imbalance, fill_gaps, gas_m3_to_kwh_hs, gas_m3_to_kwh_hs_rounded, network_losses,
-    normalize_to_kwh, project_annual_consumption, resample, sum_by_direction,
+    QualityFlag, ResampleConfig, SubstituteMethod, Zaehlzeitdefinition, ZustandszahlParams,
+    aggregate, allocate, compute_imbalance, fill_gaps, gas_m3_to_kwh_hs, gas_m3_to_kwh_hs_rounded,
+    hoehenzonen_luftdruck_mbar, network_losses, normalize_to_kwh, project_annual_consumption,
+    resample, sum_by_direction, zustandszahl,
 };
 use proptest::prelude::*;
 use rust_decimal::Decimal;
@@ -365,6 +366,42 @@ proptest! {
         prop_assert_eq!(
             normalize_to_kwh(m3, "m3", Some(&norm), None).unwrap(),
             m3 * hs,
+        );
+    }
+
+    /// The Zustandszahl moves the way the gas law says, in all three arguments.
+    ///
+    /// It rises with absolute pressure and falls with temperature and with the
+    /// K-Zahl. A sign or a reciprocal in the wrong place still produces a
+    /// plausible number near 1 — the ratios are all close to unity — so the
+    /// direction is what a test has to hold, on every input rather than on one.
+    #[test]
+    fn the_zustandszahl_follows_the_gas_law(
+        hoehe in (0i64..2_000).prop_map(Decimal::from),
+        p_eff in (0i64..900).prop_map(Decimal::from),
+        t_c in (-20i64..60).prop_map(Decimal::from),
+        k in (800i64..1_200).prop_map(|n| Decimal::new(n, 3)),
+        step in (1i64..500).prop_map(Decimal::from),
+    ) {
+        let luftdruck = hoehenzonen_luftdruck_mbar(hoehe);
+        let at = |p_eff, t_c, k| {
+            zustandszahl(&ZustandszahlParams::new(luftdruck, p_eff, t_c, k))
+                .expect("a positive gas state")
+        };
+        let base = at(p_eff, t_c, k);
+        prop_assert!(base > Decimal::ZERO, "a Zustandszahl is a positive factor");
+
+        // More absolute pressure packs more gas into the same volume.
+        prop_assert!(at(p_eff + step, t_c, k) > base);
+        // Warmer gas is thinner.
+        prop_assert!(at(p_eff, t_c + Decimal::ONE, k) < base);
+        // A larger K-Zahl divides a larger denominator.
+        prop_assert!(at(p_eff, t_c, k + Decimal::new(1, 3)) < base);
+
+        // A Höhenzone is a straight line in the height, with no rounding.
+        prop_assert_eq!(
+            hoehenzonen_luftdruck_mbar(hoehe + step),
+            luftdruck - Decimal::new(12, 2) * step,
         );
     }
 

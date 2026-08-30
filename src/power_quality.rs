@@ -75,36 +75,46 @@ pub struct PowerQualityInterval {
     pub to: OffsetDateTime,
 
     /// L1 phase voltage in Volt, mean over the interval.
+    #[cfg_attr(feature = "serde", serde(with = "crate::wire::decimal_option"))]
     pub voltage_l1_v: Option<Decimal>,
     /// L2 phase voltage in Volt. `None` on a single-phase meter.
+    #[cfg_attr(feature = "serde", serde(with = "crate::wire::decimal_option"))]
     pub voltage_l2_v: Option<Decimal>,
     /// L3 phase voltage in Volt. `None` on a single-phase meter.
+    #[cfg_attr(feature = "serde", serde(with = "crate::wire::decimal_option"))]
     pub voltage_l3_v: Option<Decimal>,
 
     /// L1 phase current in Ampere, mean over the interval.
+    #[cfg_attr(feature = "serde", serde(with = "crate::wire::decimal_option"))]
     pub current_l1_a: Option<Decimal>,
     /// L2 phase current in Ampere.
+    #[cfg_attr(feature = "serde", serde(with = "crate::wire::decimal_option"))]
     pub current_l2_a: Option<Decimal>,
     /// L3 phase current in Ampere.
+    #[cfg_attr(feature = "serde", serde(with = "crate::wire::decimal_option"))]
     pub current_l3_a: Option<Decimal>,
 
     /// Grid frequency in Hz, mean over the interval. Nominal 50.00 Hz.
+    #[cfg_attr(feature = "serde", serde(with = "crate::wire::decimal_option"))]
     pub frequency_hz: Option<Decimal>,
 
     /// Power factor (cos φ), dimensionless.
     ///
     /// Not an EN 50160 parameter — the standard says nothing about it. It is
     /// here because Blindstrom surcharges in industrial NNE tariffs turn on it.
+    #[cfg_attr(feature = "serde", serde(with = "crate::wire::decimal_option"))]
     pub power_factor: Option<Decimal>,
 
     /// Total harmonic distortion of the voltage, in percent.
     ///
     /// EN 50160 sums harmonics up to order 40.
+    #[cfg_attr(feature = "serde", serde(with = "crate::wire::decimal_option"))]
     pub thd_voltage_pct: Option<Decimal>,
     /// Total harmonic distortion of the current, in percent.
     ///
     /// Not an EN 50160 parameter: the standard characterises the *supply*, and
     /// current distortion is a property of the installation drawing it.
+    #[cfg_attr(feature = "serde", serde(with = "crate::wire::decimal_option"))]
     pub thd_current_pct: Option<Decimal>,
 }
 
@@ -204,20 +214,26 @@ impl PowerQualityInterval {
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct En50160Limits {
     /// Declared supply voltage `Un`, phase to neutral.
+    #[cfg_attr(feature = "serde", serde(with = "crate::wire::decimal"))]
     pub nominal_voltage_v: Decimal,
     /// Band the 95 % share of voltage means must sit inside, as ± percent.
+    #[cfg_attr(feature = "serde", serde(with = "crate::wire::decimal"))]
     pub voltage_band_pct: Decimal,
     /// Share of voltage means required inside the band, in percent.
     pub voltage_share_pct: f64,
     /// Upper bound every voltage mean must respect, as + percent.
+    #[cfg_attr(feature = "serde", serde(with = "crate::wire::decimal"))]
     pub voltage_absolute_upper_pct: Decimal,
     /// Lower bound every voltage mean must respect, as − percent.
+    #[cfg_attr(feature = "serde", serde(with = "crate::wire::decimal"))]
     pub voltage_absolute_lower_pct: Decimal,
     /// Band the frequency means must sit inside, as ± percent of 50 Hz.
+    #[cfg_attr(feature = "serde", serde(with = "crate::wire::decimal"))]
     pub frequency_band_pct: Decimal,
     /// Share of frequency means required inside the band, in percent.
     pub frequency_share_pct: f64,
     /// Maximum total harmonic distortion of the voltage, in percent.
+    #[cfg_attr(feature = "serde", serde(with = "crate::wire::decimal"))]
     pub thd_max_pct: Decimal,
     /// Share of THD means required at or below the maximum, in percent.
     pub thd_share_pct: f64,
@@ -265,6 +281,7 @@ pub struct LimitOutcome {
     /// `true` when [`share_pct`](Self::share_pct) meets the requirement.
     pub compliant: bool,
     /// The sample furthest outside the limit, when there was one.
+    #[cfg_attr(feature = "serde", serde(with = "crate::wire::decimal_option"))]
     pub worst: Option<Decimal>,
 }
 
@@ -609,10 +626,13 @@ pub const UNSYMMETRIE_LIMIT_KVA: Decimal = Decimal::from_parts(46, 0, 0, false, 
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct PhaseApparentPower {
     /// Apparent power on L1, kVA.
+    #[cfg_attr(feature = "serde", serde(with = "crate::wire::decimal"))]
     pub l1_kva: Decimal,
     /// Apparent power on L2, kVA.
+    #[cfg_attr(feature = "serde", serde(with = "crate::wire::decimal"))]
     pub l2_kva: Decimal,
     /// Apparent power on L3, kVA.
+    #[cfg_attr(feature = "serde", serde(with = "crate::wire::decimal"))]
     pub l3_kva: Decimal,
 }
 

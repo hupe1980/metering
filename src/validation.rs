@@ -399,6 +399,7 @@ pub struct ValidationIssue {
     #[cfg_attr(feature = "serde", serde(with = "crate::wire::rfc3339_option"))]
     pub affected_from: Option<OffsetDateTime>,
     /// The measured value at the affected interval, when there is one.
+    #[cfg_attr(feature = "serde", serde(with = "crate::wire::decimal_option"))]
     pub affected_value: Option<Decimal>,
 }
 

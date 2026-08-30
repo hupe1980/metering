@@ -156,7 +156,7 @@ it. It asserts its own invariants, so CI runs it as a test.
 | **Ersatzwerte** | Four methods, calendar-aware grid, audit trail of what actually ran | [→](https://hupe1980.github.io/metering/docs/substitute-values/) |
 | **Tariff registers** | HT/NT and §14a Modul 3 in one mechanism, plus a Modul 3 conformance check for curated DSO calendars | [→](https://hupe1980.github.io/metering/docs/tariff-registers/) |
 | **§14a steering** | `P_min,14a` with the published Gleichzeitigkeitsfaktor table, and the netzwirksamer Leistungsbezug | [→](https://hupe1980.github.io/metering/docs/paragraph-14a/) |
-| **Gas & units** | m³→kWh_Hs, G 685 rounding, the SigLinDe gas SLP, exact-rational unit normalisation | [→](https://hupe1980.github.io/metering/docs/gas-and-units/) |
+| **Gas & units** | m³→kWh_Hs, the G 685-3 Zustandszahl and G 685 rounding, the SigLinDe gas SLP, exact-rational unit normalisation | [→](https://hupe1980.github.io/metering/docs/gas-and-units/) |
 | **Power quality** | EN 50160 as the statistical test it actually is; VDE-AR-N 4100 Unsymmetrieleistung | [→](https://hupe1980.github.io/metering/docs/power-quality/) |
 | **Virtual meters** | Sum, Residual, GGV allocation (§42b EnWG) — per tenant and per community, with the §42b Abs. 5 pool ceiling | [→](https://hupe1980.github.io/metering/docs/virtual-meters/) |
 | **Sessions & allocation** | A charging session or device log placed on the grid without losing a kWh, and several of them merged onto it; one pool split across many claims with the residual reported; the import/export balance of a bidirectional Zählpunkt | [→](https://hupe1980.github.io/metering/docs/sessions-and-allocation/) |
@@ -221,9 +221,9 @@ waiting on EU state-aid approval.
 - **Order in, order out.** `aggregate`, `resample`, `validate_intervals`,
   `fill_gaps`, `split_energy`, `to_lastgang`, `allocate`, `split_session` and
   `sum_by_direction` all give the same answer for a shuffled input, and a
-  proptest suite asserts it rather than the docs promising it. Two defects hid
-  behind that promise until the suite existed, and both needed a *tie* to
-  surface.
+  proptest suite asserts it rather than the docs promising it. Order dependence
+  only shows on a **tie**, so the generator draws half its series from a coarse
+  value grid where ties are the norm.
 - **Nothing created, nothing lost.** A session total placed on the grid sums
   back to itself; a pool split across claims satisfies
   `Σ allocated + residual = total`. Both identities are theorems rather than
@@ -238,7 +238,10 @@ waiting on EU state-aid approval.
   resolved in silence.
 - **Serde tags are semver-covered**, pinned literally by a test. Instants
   travel as RFC 3339 and dates as ISO 8601 in JSON, and keep `time`'s compact
-  tuple in bincode and postcard, where the hot types round-trip.
+  tuple in bincode and postcard, where the hot types round-trip. Quantities are
+  exact decimal strings in every format, written on each field rather than
+  inherited from a `rust_decimal` feature — so enabling `metering/serde` cannot
+  change how a `Decimal` behaves in a crate that never named this one.
 - **Domain enums are exhaustive**; only error enums are `#[non_exhaustive]`.
 - **Unknown is not good.** Where a quantity cannot be determined the API says
   so — an `Option`, or an error — rather than returning a benign-looking
@@ -282,7 +285,9 @@ Beyond the unit tests:
   returns `n`
 - `tests/string_canonicalisation.rs` — proptest: stability, totality,
   idempotence, injectivity of every string form
-- `tests/serde_representation.rs` — every wire tag pinned literally
+- `tests/serde_representation.rs` — every wire tag pinned literally, plus
+  source scans holding that no timestamp or quantity field escapes the wire
+  format and that the manifest enables no `rust_decimal/serde*` feature
 - `tests/proptest_validation.rs` — validation invariants under random input
 - `tests/order_independence.rs` — proptest: a shuffled series gives an
   identical result from every entry point that promises one
@@ -295,6 +300,8 @@ Beyond the unit tests:
 - `tests/regulatory_showcase.rs` — worked examples from the published sources
 - `tests/doc_samples.rs` — every code block in this README and on the
   documentation site, compiled and run
+- `tests/doc_conventions.rs` — no item doc over 60 lines, and no changelog
+  prose in a reference doc
 
 ---
 

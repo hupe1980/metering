@@ -9,9 +9,16 @@
 //!   determined with a Messgerät.
 //! - **§25 Nr. 4 MessEV**: permits Brennwert values *"wenn sie nach den
 //!   anerkannten Regeln der Technik ermittelt worden sind"*.
-//! - **§25 Nr. 7 MessEV**: permits a value formed as a *"Produkt"* of measured
-//!   values, which is what V × Z × Hs is.
+//! - **§25 Nr. 7 MessEV**: permits a value formed as a *"Summe, Differenz,
+//!   Produkt oder Quotient"* of measured values — `V × Z × Hs` is the product
+//!   case. The same exception carries every other derived quantity in this
+//!   crate, under the condition that *"die Art der Berechnung und die
+//!   verwendeten Werte für den vorgesehenen Verwendungszweck geeignet sind"*;
+//!   see the crate-level docs.
 //! - **DVGW G 685**: the anerkannte Regel der Technik referenced by §25 Nr. 4.
+//!   Restructured in 2020 into parts, of which three matter here: **Teil 2**
+//!   *Brennwert*, **Teil 3** *Volumen im Normzustand* (the Zustandszahl), and
+//!   **Teil 6** *Kompressibilitätszahl (K-Zahl)*, which absorbed G 486.
 //! - **DVGW G 260**: Gasbeschaffenheit, Hs-Bereich für Erdgas H/L.
 //!
 //! ## Formula
@@ -27,8 +34,10 @@
 //! - `Hs_kWh_per_m3` — superior calorific value (Brennwert Ho / Hs) in kWh/m³
 //!   as determined by the gas distributor for the supply area. OBIS
 //!   `7-0:54.0.ee`, where E selects the averaging period.
-//! - `Zustandszahl` — volume conversion factor (dimensionless, typically 0.95–1.05)
-//!   accounting for pressure and temperature at the meter. OBIS `7-0:52.0.22`.
+//! - `Zustandszahl` — volume conversion factor (dimensionless, typically
+//!   0.95–1.05) accounting for pressure and temperature at the meter. OBIS
+//!   `7-0:52.0.22`. Either read off the Netzbetreiber's Höhenzonen table or
+//!   computed with [`zustandszahl`] from the four inputs G 685-3 names.
 //!
 //! **Pass a Betriebsvolumen, not a Normvolumen.** `7-0:13.2.0` (Normvolumen
 //! umgewertet) and `7-0:3.2.0` (Normvolumen gemessen) have already been
@@ -50,7 +59,7 @@
 //! Never use `f64` for energy quantities — a 0.001% billing error on a 10 GWh/year
 //! industrial customer is 100 kWh/year or ~EUR 10.
 
-use rust_decimal::Decimal;
+use rust_decimal::{Decimal, dec};
 
 use crate::interval::MeasurementUnit;
 
@@ -70,12 +79,15 @@ pub struct GasConversionParams {
     /// Published by the gas distributor per supply area — OBIS `7-0:54.0.ee`,
     /// where E selects the averaging period (16 hourly, 20 daily, 22 monthly).
     /// German Erdgas H runs roughly 9.5–12.0 kWh/m³.
+    #[cfg_attr(feature = "serde", serde(with = "crate::wire::decimal"))]
     pub hs_kwh_per_m3: Decimal,
     /// Volume conversion factor (Zustandszahl, dimensionless).
     ///
     /// Accounts for pressure and temperature at the meter — OBIS `7-0:52.0.22`,
-    /// typically 0.92–1.06. Use [`already_converted`](Self::already_converted)
-    /// for a volume a Mengenumwerter has already state-converted.
+    /// typically 0.92–1.06. From the Netzbetreiber's Höhenzonen table, or
+    /// [`zustandszahl`]. Use [`already_converted`](Self::already_converted) for
+    /// a volume a Mengenumwerter has already state-converted.
+    #[cfg_attr(feature = "serde", serde(with = "crate::wire::decimal"))]
     pub zustandszahl: Decimal,
 }
 
@@ -235,6 +247,178 @@ pub fn gas_m3_to_kwh_hs_rounded(
     }
 }
 
+// ── Zustandszahl (DVGW G 685-3) ───────────────────────────────────────────────
+
+/// Normzustand temperature: **273,15 K** (0 °C).
+///
+/// A defined value, not a measurement — DIN 1343, carried into DVGW G 685-3
+/// *Gasabrechnung – Volumen im Normzustand*.
+pub const NORMTEMPERATUR_K: Decimal = dec!(273.15);
+
+/// Normzustand pressure: **1013,25 mbar**.
+///
+/// The other half of the Normzustand, and equally a defined value.
+pub const NORMDRUCK_MBAR: Decimal = dec!(1013.25);
+
+/// The Abrechnungstemperatur G 685-3 fixes for gas billing: **15 °C**.
+///
+/// A *Festwert*, not the temperature of any particular gas: the meter is not
+/// obliged to measure one, so the rule fixes it and the Netzbetreiber does not
+/// get to choose. `T_eff = 288,15 K`.
+pub const ABRECHNUNGSTEMPERATUR_C: Decimal = dec!(15);
+
+/// Highest gauge pressure at which `K = 1` may be assumed.
+///
+/// Below 1 bar the Kompressibilitätszahl of natural gas is within the
+/// rounding of the Zustandszahl, which is why every Netzbetreiber Merkblatt for
+/// household connections prints `K = 1`. Above it, K comes from G 685-6
+/// (formerly G 486) and is an input like any other.
+pub const K_EINS_GRENZE_MBAR: Decimal = dec!(1000);
+
+/// What a [`zustandszahl`] is computed from.
+///
+/// Four inputs, none of them defaulted: the Zustandszahl multiplies a billed
+/// quantity, so a wrong one is a percentage error on every invoice in the
+/// Höhenzone. Two of the four are fixed by G 685-3 rather than chosen
+/// ([`ABRECHNUNGSTEMPERATUR_C`], and `K = 1` below
+/// [`K_EINS_GRENZE_MBAR`]), which is what [`niederdruck`](Self::niederdruck)
+/// fills in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct ZustandszahlParams {
+    /// Mean air pressure of the Höhenzone at the meter, in mbar — `p_amb`.
+    ///
+    /// From [`hoehenzonen_luftdruck_mbar`], or measured by the Netzbetreiber
+    /// in agreement with the Eichbehörde.
+    #[cfg_attr(feature = "serde", serde(with = "crate::wire::decimal"))]
+    pub luftdruck_mbar: Decimal,
+    /// Gauge pressure of the gas inside the meter, in mbar — `p_eff`.
+    ///
+    /// The Netzbetreiber's value for the pressure stage; 22 mbar is the usual
+    /// figure for a household Niederdruck connection.
+    #[cfg_attr(feature = "serde", serde(with = "crate::wire::decimal"))]
+    pub effektivdruck_mbar: Decimal,
+    /// Abrechnungstemperatur in °C — `t`. See [`ABRECHNUNGSTEMPERATUR_C`].
+    #[cfg_attr(feature = "serde", serde(with = "crate::wire::decimal"))]
+    pub abrechnungstemperatur_c: Decimal,
+    /// Kompressibilitätszahl `K`, from DVGW G 685-6.
+    #[cfg_attr(feature = "serde", serde(with = "crate::wire::decimal"))]
+    pub kompressibilitaetszahl: Decimal,
+}
+
+impl ZustandszahlParams {
+    /// The two pressures, with the values G 685-3 fixes for a Niederdruck
+    /// connection: `t = 15 °C` and `K = 1`.
+    ///
+    /// `None` at or above [`K_EINS_GRENZE_MBAR`], where `K = 1` stops being a
+    /// safe assumption and G 685-6 has to be consulted — use [`new`](Self::new)
+    /// with the K-Zahl for that case.
+    #[must_use]
+    pub fn niederdruck(luftdruck_mbar: Decimal, effektivdruck_mbar: Decimal) -> Option<Self> {
+        (effektivdruck_mbar < K_EINS_GRENZE_MBAR).then_some(Self {
+            luftdruck_mbar,
+            effektivdruck_mbar,
+            abrechnungstemperatur_c: ABRECHNUNGSTEMPERATUR_C,
+            kompressibilitaetszahl: Decimal::ONE,
+        })
+    }
+
+    /// All four inputs stated.
+    #[must_use]
+    pub const fn new(
+        luftdruck_mbar: Decimal,
+        effektivdruck_mbar: Decimal,
+        abrechnungstemperatur_c: Decimal,
+        kompressibilitaetszahl: Decimal,
+    ) -> Self {
+        Self {
+            luftdruck_mbar,
+            effektivdruck_mbar,
+            abrechnungstemperatur_c,
+            kompressibilitaetszahl,
+        }
+    }
+
+    /// Absolute pressure at the meter: `p_amb + p_eff`, in mbar.
+    ///
+    /// The Effektivdruck is a *gauge* pressure — the amount by which the gas
+    /// exceeds the surrounding air — so the absolute pressure the gas law wants
+    /// is the sum, not either one.
+    #[must_use]
+    pub fn absolutdruck_mbar(&self) -> Decimal {
+        self.luftdruck_mbar + self.effektivdruck_mbar
+    }
+}
+
+/// Mean air pressure of a Höhenzone, in mbar: `1016 − 0,12 × H`.
+///
+/// G 685-3 has the Netzbetreiber divide the network into **Höhenzonen** and
+/// bill each on one mean pressure, so that neighbouring customers are not
+/// settled on different constants. A zone's stated mean height may not be more
+/// than 50 m from its outermost boundary, which bounds the error this linear
+/// approximation of the barometric formula can introduce.
+///
+/// ```rust
+/// use metering::conversion::hoehenzonen_luftdruck_mbar;
+/// use rust_decimal::dec;
+///
+/// assert_eq!(hoehenzonen_luftdruck_mbar(dec!(253)), dec!(985.64));
+/// assert_eq!(hoehenzonen_luftdruck_mbar(dec!(0)), dec!(1016));
+/// ```
+#[must_use]
+pub fn hoehenzonen_luftdruck_mbar(hoehe_m: Decimal) -> Decimal {
+    dec!(1016) - dec!(0.12) * hoehe_m
+}
+
+/// The **Zustandszahl** `z`, which turns a Betriebsvolumen into a Normvolumen.
+///
+/// ```text
+///        T_n           p_amb + p_eff        1
+/// z =  ───────  ×  ───────────────────  ×  ───
+///       T_eff             p_n               K
+/// ```
+///
+/// Computed as the single quotient `(T_n × p) ÷ (T_eff × p_n × K)`, so the
+/// products are exact and there is **one** rounding rather than three. `None`
+/// when a denominator is not positive — an absolute zero or below, or a
+/// non-positive K-Zahl, is not a gas state.
+///
+/// The result is at full width on purpose. The market's rounding of `z` is
+/// [`G685Rounding::zustandszahl_dp`], and
+/// [`gas_m3_to_kwh_hs_rounded`] applies it at the point of use; rounding here
+/// as well would round twice, systematically.
+///
+/// ```rust
+/// use metering::conversion::{
+///     G685Rounding, ZustandszahlParams, gas_m3_to_kwh_hs_rounded,
+///     hoehenzonen_luftdruck_mbar, zustandszahl,
+/// };
+/// use rust_decimal::dec;
+///
+/// // A household connection 253 m above sea level, 22 mbar Effektivdruck.
+/// let params = ZustandszahlParams::niederdruck(
+///     hoehenzonen_luftdruck_mbar(dec!(253)),
+///     dec!(22),
+/// ).expect("below one bar, so K = 1");
+///
+/// let z = zustandszahl(&params).expect("a positive gas state");
+/// assert_eq!(z.round_dp(4), dec!(0.9427));
+///
+/// // 1 874 m³ over the year at an Abrechnungsbrennwert of 11,316 kWh/m³.
+/// let kwh = gas_m3_to_kwh_hs_rounded(dec!(1874), dec!(11.316), z, G685Rounding::default());
+/// assert_eq!(kwh.round_dp(2), dec!(19991.07));
+/// ```
+#[must_use]
+pub fn zustandszahl(params: &ZustandszahlParams) -> Option<Decimal> {
+    let t_eff = NORMTEMPERATUR_K + params.abrechnungstemperatur_c;
+    let denominator = t_eff * NORMDRUCK_MBAR * params.kompressibilitaetszahl;
+    let numerator = NORMTEMPERATUR_K * params.absolutdruck_mbar();
+    (t_eff > Decimal::ZERO
+        && params.kompressibilitaetszahl > Decimal::ZERO
+        && numerator > Decimal::ZERO)
+        .then(|| numerator / denominator)
+}
+
 /// Normalize a raw meter reading to kWh.
 ///
 /// Handles the three shapes an ingest path actually receives:
@@ -352,6 +536,85 @@ mod tests {
     #[test]
     fn gas_conversion_zero_volume() {
         assert_eq!(gas_m3_to_kwh_hs(dec!(0), dec!(10.55), dec!(1.0)), dec!(0));
+    }
+
+    /// The Normzustand is its own fixed point: at 0 °C and 1013,25 mbar
+    /// absolute, with `K = 1`, the Betriebsvolumen already **is** the
+    /// Normvolumen.
+    #[test]
+    fn the_normzustand_has_a_zustandszahl_of_exactly_one() {
+        let at_norm = ZustandszahlParams::new(NORMDRUCK_MBAR, dec!(0), dec!(0), Decimal::ONE);
+        assert_eq!(zustandszahl(&at_norm), Some(Decimal::ONE));
+    }
+
+    /// The worked example every Netzbetreiber Merkblatt zur thermischen
+    /// Gasabrechnung prints, end to end.
+    ///
+    /// A household connection in a Höhenzone of mean height 253 m, 22 mbar
+    /// Effektivdruck: `p_amb = 1016 − 0,12 × 253 = 985,64 mbar`, absolute
+    /// pressure 1007,64 mbar, and `z = 0,9427` at the four places G 685
+    /// practice rounds to. 1 874 m³ at 11,316 kWh/m³ then settle at
+    /// 19 991,07 kWh.
+    #[test]
+    fn the_g685_worked_example_reproduces() {
+        let luftdruck = hoehenzonen_luftdruck_mbar(dec!(253));
+        assert_eq!(luftdruck, dec!(985.64));
+
+        let params = ZustandszahlParams::niederdruck(luftdruck, dec!(22))
+            .expect("22 mbar is well below one bar");
+        assert_eq!(params.absolutdruck_mbar(), dec!(1007.64));
+        assert_eq!(params.abrechnungstemperatur_c, ABRECHNUNGSTEMPERATUR_C);
+        assert_eq!(params.kompressibilitaetszahl, Decimal::ONE);
+
+        let z = zustandszahl(&params).expect("a positive gas state");
+        assert_eq!(z.round_dp(4), dec!(0.9427));
+
+        let kwh = gas_m3_to_kwh_hs_rounded(dec!(1874), dec!(11.316), z, G685Rounding::default());
+        assert_eq!(kwh.round_dp(2), dec!(19991.07));
+    }
+
+    /// `K = 1` is an assumption with a stated limit, so the constructor that
+    /// makes it refuses to be used past that limit.
+    #[test]
+    fn the_k_equals_one_shortcut_stops_at_one_bar() {
+        assert!(ZustandszahlParams::niederdruck(dec!(1013.25), dec!(999.9)).is_some());
+        assert!(ZustandszahlParams::niederdruck(dec!(1013.25), K_EINS_GRENZE_MBAR).is_none());
+        assert!(ZustandszahlParams::niederdruck(dec!(1013.25), dec!(4000)).is_none());
+    }
+
+    /// A gas state that cannot exist has no Zustandszahl, rather than a
+    /// plausible-looking number.
+    #[test]
+    fn an_impossible_gas_state_has_no_zustandszahl() {
+        // Absolute zero: the division would be by zero.
+        let frozen = ZustandszahlParams::new(dec!(1013.25), dec!(0), dec!(-273.15), Decimal::ONE);
+        assert_eq!(zustandszahl(&frozen), None);
+        // Below absolute zero.
+        let colder = ZustandszahlParams::new(dec!(1013.25), dec!(0), dec!(-300), Decimal::ONE);
+        assert_eq!(zustandszahl(&colder), None);
+        // A K-Zahl of zero or less is not a compressibility.
+        let no_k = ZustandszahlParams::new(dec!(1013.25), dec!(0), dec!(15), Decimal::ZERO);
+        assert_eq!(zustandszahl(&no_k), None);
+        // A vacuum has no volume to convert.
+        let vacuum = ZustandszahlParams::new(dec!(0), dec!(0), dec!(15), Decimal::ONE);
+        assert_eq!(zustandszahl(&vacuum), None);
+    }
+
+    /// Higher ground is thinner air is less gas per cubic metre.
+    ///
+    /// The direction matters on an invoice: reading the Höhenzone off the wrong
+    /// side of the table bills the customer for gas that was never delivered.
+    #[test]
+    fn a_higher_hoehenzone_has_a_smaller_zustandszahl() {
+        let z_at = |h| {
+            zustandszahl(
+                &ZustandszahlParams::niederdruck(hoehenzonen_luftdruck_mbar(h), dec!(22))
+                    .expect("niederdruck"),
+            )
+            .expect("a positive gas state")
+        };
+        assert!(z_at(dec!(0)) > z_at(dec!(253)));
+        assert!(z_at(dec!(253)) > z_at(dec!(1000)));
     }
 
     /// A Normvolumen has already been state-converted, so the Zustandszahl to

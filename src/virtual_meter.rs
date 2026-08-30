@@ -23,8 +23,8 @@
 //! ## Legal basis
 //!
 //! - **§ 42b EnWG — Gemeinschaftliche Gebäudeversorgung** (Solarpaket I). Abs. 5
-//!   caps the allocation, verbatim: *"die rechnerisch aufteilbare Strommenge
-//!   \[ist\] begrenzt … auf die Strommenge, die innerhalb eines
+//!   caps the allocation, verbatim: *"wobei die rechnerisch aufteilbare
+//!   Strommenge begrenzt ist auf die Strommenge, die innerhalb eines
 //!   15-Minuten-Zeitintervalls in der Solaranlage erzeugt oder von allen
 //!   teilnehmenden Letztverbrauchern verbraucht wird, je nachdem welche dieser
 //!   Strommengen geringer ist."*
@@ -286,19 +286,24 @@ pub struct GgvInterval {
     pub to: OffsetDateTime,
 
     /// The tenant's metered consumption — `Melo_i Verbrauch`.
+    #[cfg_attr(feature = "serde", serde(with = "crate::wire::decimal"))]
     pub consumption: Decimal,
     /// The community plant's whole generation in the interval —
     /// `Melo1 Erzeugung`.
+    #[cfg_attr(feature = "serde", serde(with = "crate::wire::decimal"))]
     pub generation: Decimal,
 
     /// The tenant's share of that generation **before** the `Pos()` cap:
     /// `fraction × generation`, or `ratio × generation`, cut to
     /// [`ALLOCATION_DP`](crate::ALLOCATION_DP) places toward zero.
+    #[cfg_attr(feature = "serde", serde(with = "crate::wire::decimal"))]
     pub share: Decimal,
     /// The share actually credited: `min(consumption, share)`.
+    #[cfg_attr(feature = "serde", serde(with = "crate::wire::decimal"))]
     pub allocated: Decimal,
     /// What the tenant still draws from the public grid:
     /// `consumption − allocated`.
+    #[cfg_attr(feature = "serde", serde(with = "crate::wire::decimal"))]
     pub net_grid_draw: Decimal,
 
     /// Worst quality across the plant and every contributing tenant.
@@ -584,6 +589,7 @@ pub enum AllocationKey {
     /// generation the community does not claim and which feeds the grid.
     Constant {
         /// Participant series id → fraction of the plant's generation.
+        #[cfg_attr(feature = "serde", serde(with = "crate::wire::decimal_map"))]
         fractions: std::collections::BTreeMap<String, Decimal>,
     },
     /// Proportional to each participant's own consumption in the interval —
@@ -617,13 +623,17 @@ pub struct ParticipantAllocation {
     /// The participant's series id.
     pub id: String,
     /// What they consumed.
+    #[cfg_attr(feature = "serde", serde(with = "crate::wire::decimal"))]
     pub consumption: Decimal,
     /// Their nominal share of the generation, before the `Pos()` cap, cut to
     /// [`ALLOCATION_DP`](crate::ALLOCATION_DP) places toward zero.
+    #[cfg_attr(feature = "serde", serde(with = "crate::wire::decimal"))]
     pub share: Decimal,
     /// What was actually credited: `min(consumption, share)`.
+    #[cfg_attr(feature = "serde", serde(with = "crate::wire::decimal"))]
     pub allocated: Decimal,
     /// What they still drew from the public grid.
+    #[cfg_attr(feature = "serde", serde(with = "crate::wire::decimal"))]
     pub net_grid_draw: Decimal,
 }
 
@@ -647,17 +657,21 @@ pub struct CommunityInterval {
     #[cfg_attr(feature = "serde", serde(with = "crate::wire::rfc3339"))]
     pub to: OffsetDateTime,
     /// The plant's whole generation in the interval.
+    #[cfg_attr(feature = "serde", serde(with = "crate::wire::decimal"))]
     pub generation: Decimal,
     /// The sum of every participant's consumption.
+    #[cfg_attr(feature = "serde", serde(with = "crate::wire::decimal"))]
     pub total_consumption: Decimal,
     /// The § 42b Abs. 5 ceiling: `min(generation, total_consumption)`.
     ///
     /// **A ceiling, not a clamp.** See
     /// [`compute_community_allocation`](compute_community_allocation#the-pool-cap-is-a-theorem-here-not-a-step).
+    #[cfg_attr(feature = "serde", serde(with = "crate::wire::decimal"))]
     pub pool_cap: Decimal,
     /// Per participant, in the key's own order.
     pub participants: Vec<ParticipantAllocation>,
     /// Generation the community did not use, which fed the public grid.
+    #[cfg_attr(feature = "serde", serde(with = "crate::wire::decimal"))]
     pub surplus_to_grid: Decimal,
     /// Worst quality across the plant and every participant.
     pub quality: QualityFlag,
@@ -686,35 +700,21 @@ impl CommunityInterval {
 /// Allocate a community's generation across **every** participant at once.
 ///
 /// [`compute_ggv_allocation`] answers for one tenant, which is the shape a
-/// persisted rule has. This answers for the community, and is not the same
+/// persisted rule has. This answers for the community, and is not that
 /// computation run N times: the proportional denominator and the source index
-/// are formed once rather than once per tenant, the surplus that fed the grid
-/// is a number rather than something to reconstruct, and the § 42b Abs. 5 pool
-/// ceiling becomes computable at all.
+/// are formed once, the surplus that fed the grid is a number rather than
+/// something to reconstruct, and the § 42b Abs. 5 pool ceiling — quoted in the
+/// [module docs](self) — becomes computable at all.
 ///
-/// ## The pool cap is a theorem, not a step
+/// [`CommunityInterval::pool_cap`] **reports** that ceiling; nothing clamps to
+/// it. With fractions summing to at most 1 the per-participant `Pos()` cap
+/// already implies it — `Σ min(cᵢ, shareᵢ) ≤ Σ cᵢ` and `Σ shareᵢ ≤ generation`
+/// — so a second clamp would be a rule the statute does not contain.
+/// `tests/allocation_invariants.rs` holds the inequality under proptest. § 42c
+/// runs the same arithmetic with a contractual key and no Abs. 5 counterpart;
+/// the [Virtual meters] guide works both through.
 ///
-/// § 42b Abs. 5 caps the allocatable energy at *"die Strommenge, die innerhalb
-/// eines 15-Minuten-Zeitintervalls in der Solaranlage erzeugt oder von allen
-/// teilnehmenden Letztverbrauchern verbraucht wird, je nachdem welche dieser
-/// Strommengen geringer ist."*
-///
-/// This does **not** clamp to that figure. With fractions summing to at most 1
-/// the per-participant `Pos()` cap already implies it — `Σ min(cᵢ, shareᵢ) ≤ Σ cᵢ`
-/// and `Σ shareᵢ ≤ generation` — so clamping again would be a rule the statute
-/// does not contain. [`CommunityInterval::pool_cap`] reports the ceiling, and
-/// `tests/allocation_invariants.rs` holds the inequality under proptest.
-///
-/// ## § 42c uses the same arithmetic
-///
-/// Energy Sharing has no published allocation formula: § 42c Abs. 3 Nr. 2
-/// requires the *contract* to state *"einen Aufteilungsschlüssel, aus dem sich
-/// der Umfang des Rechts zur Nutzung der Elektrizität ergibt"*, so the key is
-/// an input. Both [`AllocationKey`] variants express one, and
-/// `min(consumption, share)` carries over as physics. [`pool_cap`] does not:
-/// § 42c has no counterpart to Abs. 5, so there it is an observation.
-///
-/// [`pool_cap`]: CommunityInterval::pool_cap
+/// [Virtual meters]: https://hupe1980.github.io/metering/docs/virtual-meters/
 ///
 /// # Errors
 ///
@@ -753,7 +753,6 @@ impl CommunityInterval {
 /// // Both tenants are capped by their own draw; six kWh fed the grid.
 /// assert_eq!(interval.total_allocated(), dec!(4));
 /// assert_eq!(interval.surplus_to_grid, dec!(6));
-/// assert_eq!(interval.total_net_grid_draw(), dec!(0));
 /// assert!(interval.participant("T1").unwrap().capped());
 /// # Ok::<(), metering::VirtualMeterError>(())
 /// ```

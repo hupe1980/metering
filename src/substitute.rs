@@ -702,14 +702,11 @@ impl Gap {
             },
 
             M::LinearInterpolation => match (self.preceding, self.following) {
-                // The line runs from the preceding billable anchor to the
-                // following one, and this slot sits `idx − pi` steps along a
-                // span of `fi − pi` — its *true* offsets, which differ from
-                // the naive run-relative fractions whenever a faulty slot
-                // borders the run. Every missing slot between the same two
-                // anchors lands on the same straight line, however the runs
-                // between them are partitioned.
-                // `u64`, not `u32`: a `usize` narrowed to `u32` truncates
+                // Offsets into the whole series, not into the run: every
+                // missing slot between the same two anchors then lands on the
+                // same straight line, however the runs between them are
+                // partitioned by a bordering faulty slot.
+                // `u64`, not `u32` — a `usize` narrowed to `u32` truncates
                 // silently, and a truncated denominator is a wrong value
                 // rather than a failure.
                 (Some((pi, p)), Some((fi, f))) if pi < idx && idx < fi => {

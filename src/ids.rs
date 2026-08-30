@@ -232,6 +232,15 @@ impl TryFrom<&str> for MaloId {
     }
 }
 
+/// Accepts an owned `String`, which a generic `TryInto<MaloId>` bound does not
+/// get from `TryFrom<&str>` by deref coercion.
+impl TryFrom<String> for MaloId {
+    type Error = ParseError;
+    fn try_from(s: String) -> Result<Self, Self::Error> {
+        s.parse()
+    }
+}
+
 impl From<MaloId> for String {
     fn from(id: MaloId) -> String {
         id.as_str().to_owned()
@@ -459,6 +468,15 @@ impl TryFrom<&str> for BdewCode {
     }
 }
 
+/// Accepts an owned `String`, which a generic `TryInto<BdewCode>` bound does not
+/// get from `TryFrom<&str>` by deref coercion.
+impl TryFrom<String> for BdewCode {
+    type Error = ParseError;
+    fn try_from(s: String) -> Result<Self, Self::Error> {
+        s.parse()
+    }
+}
+
 impl From<BdewCode> for String {
     fn from(id: BdewCode) -> String {
         id.as_str().to_owned()
@@ -564,6 +582,15 @@ impl FromStr for MeloId {
 impl TryFrom<&str> for MeloId {
     type Error = ParseError;
     fn try_from(s: &str) -> Result<Self, Self::Error> {
+        s.parse()
+    }
+}
+
+/// Accepts an owned `String`, which a generic `TryInto<MeloId>` bound does not
+/// get from `TryFrom<&str>` by deref coercion.
+impl TryFrom<String> for MeloId {
+    type Error = ParseError;
+    fn try_from(s: String) -> Result<Self, Self::Error> {
         s.parse()
     }
 }
@@ -893,6 +920,11 @@ impl Eic {
     /// ENTSO-E's to extend, and a library that hard-fails on a letter added
     /// after its release rejects data the market has already issued. The
     /// *shape* is still enforced — position 3 must be an uppercase letter.
+    ///
+    /// A caller whose own downstream rejects unlisted types gates on
+    /// `object_type().is_none()` and reports it there, where the message that
+    /// carried the code is still in hand. This crate does not make that
+    /// decision on their behalf, in either direction.
     #[must_use]
     pub const fn object_type(&self) -> Option<EicType> {
         EicType::from_letter(self.chars[2])
@@ -1056,6 +1088,15 @@ impl FromStr for Eic {
 impl TryFrom<&str> for Eic {
     type Error = ParseError;
     fn try_from(s: &str) -> Result<Self, Self::Error> {
+        s.parse()
+    }
+}
+
+/// Accepts an owned `String`, which a generic `TryInto<Eic>` bound does not
+/// get from `TryFrom<&str>` by deref coercion.
+impl TryFrom<String> for Eic {
+    type Error = ParseError;
+    fn try_from(s: String) -> Result<Self, Self::Error> {
         s.parse()
     }
 }
@@ -1454,5 +1495,41 @@ mod tests {
 
         // A CIO-issued control area: right type, wrong issuing office.
         assert_eq!(Regelzone::Amprion.control_area_eic().regelzone(), None);
+    }
+
+    /// Every identifier converts from an owned `String` as well as a `&str`.
+    ///
+    /// A generic `impl TryInto<T>` bound sees the caller's own type, not a
+    /// deref of it, so a missing `TryFrom<String>` is a `.as_str()` at one call
+    /// site and a `.parse()?` at the next for the same value.
+    #[test]
+    fn an_owned_string_converts_like_a_borrowed_one() {
+        fn accepts<T: TryFrom<S>, S>(value: S) -> Result<T, T::Error> {
+            value.try_into()
+        }
+
+        assert_eq!(
+            accepts::<MaloId, _>("51238696781".to_owned()).expect("a valid MaLo-ID"),
+            "51238696781".parse::<MaloId>().expect("the same ID"),
+        );
+        assert_eq!(
+            accepts::<BdewCode, _>("9900987654321".to_owned()).expect("a valid code"),
+            "9900987654321".parse::<BdewCode>().expect("the same code"),
+        );
+        assert_eq!(
+            accepts::<MeloId, _>("DE0001234567800000000000000012345".to_owned())
+                .expect("a valid MeLo-ID"),
+            "DE0001234567800000000000000012345"
+                .parse::<MeloId>()
+                .expect("the same ID"),
+        );
+        assert_eq!(
+            accepts::<Eic, _>("10X168Y4E6H0041Z".to_owned()).expect("a valid EIC"),
+            "10X168Y4E6H0041Z".parse::<Eic>().expect("the same EIC"),
+        );
+
+        // The error type is the crate's own, on both spellings.
+        let err = accepts::<MaloId, _>("nope".to_owned()).expect_err("not an ID");
+        assert!(err.to_string().contains("MaloId"), "{err}");
     }
 }

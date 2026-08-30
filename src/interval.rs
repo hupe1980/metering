@@ -590,6 +590,7 @@ pub struct MeterInterval {
     #[cfg_attr(feature = "serde", serde(with = "crate::wire::rfc3339"))]
     pub to: OffsetDateTime,
     /// The metered quantity, in the Sparte's own unit — see the type docs.
+    #[cfg_attr(feature = "serde", serde(with = "crate::wire::decimal"))]
     pub value: Decimal,
     /// Reading quality.
     pub quality: QualityFlag,

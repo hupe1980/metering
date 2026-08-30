@@ -75,13 +75,12 @@ fn series_of(value: BoxedStrategy<Decimal>) -> impl Strategy<Value = Vec<Sample>
 /// A set of samples on distinct slots, ascending — the "ordered" input.
 ///
 /// Half the series are drawn from a **coarse** half-kWh grid, and that half is
-/// what gives this file its teeth. A tie is what makes a maximum
-/// order-dependent, and ties do not happen by accident in a 200 000-wide value
-/// space — the `spitzenleistung_at` bug survived a fine-grained generator for
-/// exactly that reason, and survives one that merely *mixes* coarse and fine
-/// values within a series, because the fine ones win the maximum. Coarse
-/// *series* make several intervals share the peak; fine ones keep the outlier,
-/// coverage and gap rules seeing realistic variety.
+/// what gives this file its teeth. Order dependence only becomes visible on a
+/// **tie**, and ties do not happen by accident in a 200 000-wide value space. A
+/// generator that merely *mixes* coarse and fine values within one series does
+/// not produce them either: the fine values win the maximum. It has to be whole
+/// coarse *series*, so that several intervals share the peak; the fine half
+/// keeps the outlier, coverage and gap rules seeing realistic variety.
 fn arb_series() -> impl Strategy<Value = Vec<Sample>> {
     prop_oneof![
         // −10.0 … 19.5 in 0.5 kWh steps: ties at the maximum are the norm.

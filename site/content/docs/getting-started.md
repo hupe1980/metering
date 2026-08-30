@@ -16,6 +16,11 @@ Serde support for every public type is behind a feature flag:
 cargo add metering --features serde
 ```
 
+The feature turns on `serde` and `time/serde` and **nothing else**. It enables
+no `rust_decimal` feature, so switching it on cannot change how a `Decimal`
+behaves anywhere else in your workspace — the representation is written on this
+crate's own fields. See [the wire format](@/docs/design.md#serde-representation-stability).
+
 The MSRV is Rust 1.94 (edition 2024), pinned in `rust-toolchain.toml` and
 verified by a dedicated CI lane.
 

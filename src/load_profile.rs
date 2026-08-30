@@ -591,6 +591,7 @@ mod profile_table {
         /// Werktag / Samstag / Sonn- und Feiertag.
         day_type: SlpDayType,
         /// The day's quarter-hour values — 96 of them on an ordinary day.
+        #[cfg_attr(feature = "serde", serde(with = "crate::wire::decimal_vec"))]
         values: Vec<Decimal>,
     }
 

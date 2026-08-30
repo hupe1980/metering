@@ -284,6 +284,7 @@ pub fn allocation_temperature(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct WeekdayFactors {
+    #[cfg_attr(feature = "serde", serde(with = "crate::wire::decimal_array"))]
     factors: [Decimal; 7],
 }
 

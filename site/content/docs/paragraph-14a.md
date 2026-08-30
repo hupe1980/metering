@@ -28,9 +28,9 @@ The netzwirksamer Leistungsbezug is only **defined** there. Ziff. 2.3 says which
 share it is —
 
 > derjenige Anteil der über den Netzanschluss aus einem
-> Elektrizitätsverteilernetz der allgemeinen Versorgung entnommenen Leistung,
-> der zeitgleich durch eine oder mehrere steuerbare Verbrauchseinrichtungen
-> verursacht wird
+> Elektrizitätsverteilernetz der allgemeinen Versorgung entnommenen
+> elektrischen Leistung, der zeitgleich durch eine oder mehrere steuerbare
+> Verbrauchseinrichtungen verursacht wird
 
 — and stops. When local generation covers part of the load, *which* part of the
 remaining grid draw the steuVE caused is an apportionment the text does not
@@ -101,7 +101,7 @@ cooling — and a floor that is too high silently denies the Netzbetreiber
 reduction headroom it is entitled to.
 
 **`n_steuVE` counts all of them**, Ladepunkte and Speicher included, not only
-the scaled ones: *"Anzahl aller steuerbaren Verbrauchseinrichtungen, die nach
+the scaled ones: *"Anzahl aller steuerbarer Verbrauchseinrichtungen, die nach
 Ziffer 4.4.b angesteuert werden"*.
 
 ```rust

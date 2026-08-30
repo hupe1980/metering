@@ -148,18 +148,41 @@ carries two instants and is the hottest type in the crate, so a twenty-byte
 string per boundary is a poor trade there. `serde` is asked which kind of format
 it is and the answer decides.
 
+### Quantities are exact decimal strings
+
+A `Decimal` travels as `"12.345"`, the characters its `Display` writes, in every
+format. There is no readable/binary split here because there is nothing to
+trade: `"0.25"` is five postcard bytes against the sixteen a packed mantissa
+would take, and it is the one form a human, a `NUMERIC` column and a JSON Schema
+all read.
+
+The representation is written on each field rather than inherited from
+`rust_decimal`'s `serde` features, because **Cargo features are additive and
+global to a build graph**. `serde-str` enabled here moves every `Decimal` in the
+consumer's workspace from `deserialize_any` to `deserialize_str`, so a JSON
+number stops being accepted in crates that never named `metering` and their
+tests pass alone but fail in a workspace run. In the other direction,
+`serde-float` set by *any* crate in that graph decides how these quantities
+serialise — as `f64`, in a library whose claim is exact arithmetic.
+
+Per-field costs an attribute and buys a wire format identical under every
+feature combination anyone can select. Two source scans fail if a field forgets;
+a third fails if the manifest reaches for a `rust_decimal/serde*` feature.
+
+Reading asks for a **string**: a JSON number is a type error rather than a
+silent trip through `f64`, and more digits than a `Decimal` holds are refused
+rather than rounded away.
+
 ### The hot types survive a non-self-describing format
 
 `MeterInterval`, `ObisCode`, `MeterReading` and the identifiers round-trip
 through bincode and postcard; the internally tagged `AggregationRule` and
 `AllocationKey` deliberately do not.
 
-`rust_decimal/serde-str` is what makes the first half hold. The default
-`Deserialize` calls `deserialize_any`, which is the one question a format
-without a self-describing wire cannot answer, and `MeterInterval` carries a
-`Decimal`. The JSON is identical either way — a `Decimal` travels as its exact
-string regardless — so the feature costs nothing and buys the binary path. A
-test holds both halves of the trade-off.
+Asking for a string is what makes the first half hold: `deserialize_any` is the
+one question a format without a self-describing wire cannot answer, and it is
+what an inherited `Decimal` impl asks. A test holds both halves of the
+trade-off.
 
 ## Enum exhaustiveness
 

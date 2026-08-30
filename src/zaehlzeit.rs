@@ -530,12 +530,15 @@ impl Quarter {
 /// Tag"*.
 pub const MODUL_3_MIN_HOCHTARIF_MINUTES: u16 = 120;
 
-/// Fewest calendar quarters the three tariffs must be billed in.
+/// Fewest calendar quarters the tariffs must be billed in.
 ///
-/// BDEW AWH Modul 3 v1.1, §2: *"Die Zeitfenster und insofern die drei
-/// Netzentgelttarife müssen in mindestens zwei Quartalen eines Jahres
-/// abgerechnet werden. Diese zwei Quartale müssen nicht zusammenhängend
-/// sein."*
+/// BDEW AWH Modul 3 v1.1, *Rahmenbedingungen bei der Gestaltung der
+/// Zeitfenster mit Netzentgelttarifen*: *"Die Zeitfenster und Preisstufen für
+/// HT und NT müssen in mindestens zwei Quartalen im Jahr durch den
+/// Netzbetreiber abgerechnet werden. Diese zwei Quartale müssen nicht
+/// zusammenhängend sein."* The overview states the same rule over all three:
+/// *"Die Zeitfenster und insofern die drei Netzentgelttarife müssen in
+/// mindestens zwei Quartalen eines Jahres abgerechnet werden."*
 pub const MODUL_3_MIN_BILLED_QUARTERS: usize = 2;
 
 /// Why a Zählzeitdefinition does not meet the Modul 3 rules.
@@ -921,11 +924,12 @@ pub fn assess_modul_3(
 /// How one kind of day resolves: wall-clock minutes per register, with `None`
 /// for the minutes no register covers.
 ///
-/// The **whole** map, not a summary of it. Comparing only the Hochtarif and the
-/// uncovered minutes across the twelve months missed a definition whose NT and
-/// ST swap between summer and winter while HT stays put — which is exactly the
-/// *"Preisstufen und Zeitfenster müssen ganzjährig identisch sein"* rule the
-/// comparison exists to enforce.
+/// The **whole** map, not a summary of it. A definition whose NT and ST swap
+/// between summer and winter while HT stays put has the same Hochtarif minutes
+/// and the same uncovered minutes in every month, so any summary of those two
+/// finds it conforming — and it is the exact case the rule forbids: *"Die
+/// Preisstufen und Zeitfenster müssen ganzjährig identisch sein, d. h. sie
+/// dürfen zwischen den einzelnen Quartalen nicht variieren."*
 type DayProfile<'a> = BTreeMap<Option<&'a str>, u16>;
 
 /// The kinds of day a definition can tell apart.
@@ -1420,7 +1424,8 @@ mod modul_3_conformance_tests {
         );
     }
 
-    /// *"Die Preisstufen und Zeitfenster müssen ganzjährig identisch sein."*
+    /// *"Die Preisstufen und Zeitfenster müssen ganzjährig identisch sein,
+    /// d. h. sie dürfen zwischen den einzelnen Quartalen nicht variieren."*
     #[test]
     fn a_seasonal_window_varies_across_the_year() {
         let mut zzd = conforming();

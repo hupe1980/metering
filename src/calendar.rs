@@ -1080,8 +1080,12 @@ mod tests {
         assert_eq!(intervals_between(from, to, IntervalResolution::Month), None);
     }
 
-    /// Counting days by dividing a duration loses one across the spring
-    /// transition — the bug that inflated the Jahresprognose by 7.7 %.
+    /// A calendar day count, not a duration divided by 86 400.
+    ///
+    /// A German spring day is 82 800 s and an autumn day 90 000 s, so a
+    /// division truncates one day away each March and adds one each October.
+    /// The Jahresprognose scales an observed quantity by this count, so an
+    /// error here is a percentage error on a forecast.
     #[test]
     fn days_between_counts_calendar_days_not_durations() {
         let from = day_start_utc(date!(2026 - 03 - 23));

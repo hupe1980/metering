@@ -356,6 +356,7 @@ pub struct MeasurementPoint {
     /// the factor is applied when the counter is read, so this field is
     /// traceability, and applying it a second time inflates consumption by the
     /// factor.
+    #[cfg_attr(feature = "serde", serde(with = "crate::wire::decimal"))]
     pub wandler_factor: Decimal,
 
     /// Validity start (German local date, inclusive).

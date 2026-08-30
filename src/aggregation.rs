@@ -122,12 +122,14 @@ impl Default for AggregationConfig {
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct BillingPeriod {
     /// Arbeitsmenge in kWh — the sum of the **billable** intervals.
+    #[cfg_attr(feature = "serde", serde(with = "crate::wire::decimal"))]
     pub arbeitsmenge: Decimal,
 
     /// Spitzenleistung in kW: the highest average power over any single
     /// billable interval, `max(kWh / duration_h)`.
     ///
     /// `None` when the config disables it or nothing billable was supplied.
+    #[cfg_attr(feature = "serde", serde(with = "crate::wire::decimal_option"))]
     pub spitzenleistung_kw: Option<Decimal>,
 
     /// The interval the Spitzenleistung was **first** reached in.
@@ -272,11 +274,14 @@ pub fn aggregate(intervals: &[MeterInterval], config: &AggregationConfig) -> Bil
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct DirectionalEnergy {
     /// Bezug — the sum over intervals whose code counts C = 1.
+    #[cfg_attr(feature = "serde", serde(with = "crate::wire::decimal"))]
     pub import: Decimal,
     /// Einspeisung — the sum over intervals whose code counts C = 2.
+    #[cfg_attr(feature = "serde", serde(with = "crate::wire::decimal"))]
     pub export: Decimal,
     /// Everything with no direction to read: no OBIS code, or a code that
     /// counts something other than a directed active energy.
+    #[cfg_attr(feature = "serde", serde(with = "crate::wire::decimal"))]
     pub undirected: Decimal,
 }
 

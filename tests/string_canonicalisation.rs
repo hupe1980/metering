@@ -465,8 +465,7 @@ mod serde_agrees_with_display {
             prop_assert_eq!(serde_json::from_str::<IntervalResolution>(&encoded).unwrap(), r);
         }
 
-        /// The identifiers travel as their digits too — the same rule, and
-        /// previously asserted for neither.
+        /// The identifiers travel as their digits too — the same rule.
         #[test]
         fn malo_serde_form_is_the_display_form(id in arb_malo()) {
             let encoded = serde_json::to_string(&id).unwrap();

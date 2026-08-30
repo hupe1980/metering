@@ -43,14 +43,19 @@ use serde::{Deserialize, Serialize};
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct ImbalanceSaldo {
     /// Actual metered energy in kWh.
+    #[cfg_attr(feature = "serde", serde(with = "crate::wire::decimal"))]
     pub actual_kwh: Decimal,
     /// Contracted / profile energy in kWh.
+    #[cfg_attr(feature = "serde", serde(with = "crate::wire::decimal"))]
     pub contracted_kwh: Decimal,
     /// Mehr-Menge: `max(0, contracted − actual)`. NB vergütet, so NB owes LF.
+    #[cfg_attr(feature = "serde", serde(with = "crate::wire::decimal"))]
     pub mehr_kwh: Decimal,
     /// Minder-Menge: `max(0, actual − contracted)`. NB invoices, so LF owes NB.
+    #[cfg_attr(feature = "serde", serde(with = "crate::wire::decimal"))]
     pub minder_kwh: Decimal,
     /// Signed delta: `actual − contracted`. Positive is a **Minder**menge.
+    #[cfg_attr(feature = "serde", serde(with = "crate::wire::decimal"))]
     pub delta_kwh: Decimal,
 }
 

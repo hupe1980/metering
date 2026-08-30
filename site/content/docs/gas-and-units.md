@@ -17,9 +17,73 @@ conversion rests on the Eichrecht exceptions to § 33 MessEG:
   determined with a Messgerät.
 - **§ 25 Nr. 4 MessEV** — permits Brennwert values *"wenn sie nach den
   anerkannten Regeln der Technik ermittelt worden sind"*.
-- **§ 25 Nr. 7 MessEV** — permits a value formed as a *"Produkt"* of measured
-  values, which `V × Z × Hs` is.
-- **DVGW G 685** — the anerkannte Regel der Technik § 25 Nr. 4 refers to.
+- **§ 25 Nr. 7 MessEV** — permits a value formed as a *"Summe, Differenz,
+  Produkt oder Quotient"* of measured values, which `V × Z × Hs` is. See
+  [almost nothing here is a measured value](@/docs/regulatory-basis.md#almost-nothing-here-is-a-measured-value)
+  for what that exception costs in exchange.
+- **DVGW G 685** — the anerkannte Regel der Technik § 25 Nr. 4 refers to,
+  restructured in 2020 into parts. Teil 2 is the Brennwert, **Teil 3** the
+  Volumen im Normzustand, **Teil 6** the Kompressibilitätszahl (formerly the
+  separate G 486).
+
+## Where the Zustandszahl comes from
+
+The Brennwert is operator data and this library will not invent one. The
+Zustandszahl is different: it is **computable**, from four inputs G 685-3 names
+and two constants DIN 1343 fixes.
+
+```text
+       T_n        p_amb + p_eff       1
+z =  ───────  ×  ───────────────  ×  ───
+      T_eff            p_n            K
+```
+
+`T_n` = 273,15 K and `p_n` = 1013,25 mbar are the Normzustand. `T_eff` is a
+**Festwert of 15 °C** — the meter is not required to measure a gas temperature,
+so the rule fixes one rather than letting each Netzbetreiber choose. `p_eff` is
+the gauge pressure at the meter, and `K` is 1 below one bar, where the
+compressibility of natural gas is smaller than the rounding of `z` itself.
+
+`p_amb` is where the Höhenzone comes in. G 685-3 has the Netzbetreiber cut the
+network into height zones and bill each on one mean air pressure, so that
+neighbours are not settled on different constants:
+
+```text
+p_amb [mbar] = 1016 − 0,12 × H [m]
+```
+
+A zone's stated mean height may not be more than 50 m from its outermost
+boundary, which is what bounds the error of that straight line.
+
+```rust
+use metering::{
+    G685Rounding, ZustandszahlParams, gas_m3_to_kwh_hs_rounded,
+    hoehenzonen_luftdruck_mbar, zustandszahl,
+};
+use rust_decimal::dec;
+
+// A household connection 253 m up, 22 mbar Effektivdruck.
+let params = ZustandszahlParams::niederdruck(
+    hoehenzonen_luftdruck_mbar(dec!(253)), // 985.64 mbar
+    dec!(22),
+).expect("below one bar, so K = 1");
+
+let z = zustandszahl(&params).expect("a positive gas state");
+assert_eq!(z.round_dp(4), dec!(0.9427));
+
+// 1 874 m³ over the year at an Abrechnungsbrennwert of 11,316 kWh/m³.
+let kwh = gas_m3_to_kwh_hs_rounded(dec!(1874), dec!(11.316), z, G685Rounding::default());
+assert_eq!(kwh.round_dp(2), dec!(19991.07));
+```
+
+`zustandszahl` returns the quotient **unrounded**: the four places `z` is quoted
+to are the market's rounding, and `gas_m3_to_kwh_hs_rounded` applies them at the
+point of use. Rounding here as well would round the same number twice, in the
+same direction, on every invoice.
+
+`niederdruck` fills in the two inputs the rule fixes rather than leaves open,
+and returns `None` at or above one bar — an assumption with a stated limit
+should refuse to be used past it.
 
 ## Pass a Betriebsvolumen, not a Normvolumen
 

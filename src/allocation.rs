@@ -181,6 +181,7 @@ pub struct AllocationPart {
     pub key: String,
     /// How much of the total this part claims, read according to the
     /// [`AllocationBasis`].
+    #[cfg_attr(feature = "serde", serde(with = "crate::wire::decimal"))]
     pub weight: Decimal,
     /// The most this part can absorb, if it has a ceiling.
     ///
@@ -189,6 +190,7 @@ pub struct AllocationPart {
     /// Anwendungshilfe, where the ceiling is the participant's own
     /// consumption: nobody is credited more solar than they actually drew, and
     /// what the cap refuses stays in the residual.
+    #[cfg_attr(feature = "serde", serde(with = "crate::wire::decimal_option"))]
     pub capacity: Option<Decimal>,
 }
 
@@ -218,11 +220,14 @@ pub struct AllocatedPart {
     /// The part's key, carried through unchanged.
     pub key: String,
     /// The weight it was allocated on.
+    #[cfg_attr(feature = "serde", serde(with = "crate::wire::decimal"))]
     pub weight: Decimal,
     /// Its nominal share of the total, before any ceiling, cut to
     /// [`ALLOCATION_DP`] places toward zero.
+    #[cfg_attr(feature = "serde", serde(with = "crate::wire::decimal"))]
     pub share: Decimal,
     /// What it actually received: `min(capacity, share)`, never below zero.
+    #[cfg_attr(feature = "serde", serde(with = "crate::wire::decimal"))]
     pub allocated: Decimal,
 }
 
@@ -250,6 +255,7 @@ impl AllocatedPart {
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct AllocationRow {
     /// The pool that was divided.
+    #[cfg_attr(feature = "serde", serde(with = "crate::wire::decimal"))]
     pub total: Decimal,
     /// Per part, in the order they were supplied.
     pub parts: Vec<AllocatedPart>,
@@ -258,6 +264,7 @@ pub struct AllocationRow {
     /// Under § 42b this is the generation that fed the public grid. It is a
     /// **quantity**, not a rounding error, which is why nothing here
     /// redistributes it.
+    #[cfg_attr(feature = "serde", serde(with = "crate::wire::decimal"))]
     pub residual: Decimal,
 }
 

@@ -136,6 +136,7 @@ pub struct MeterLifecycleEvent {
     pub occurred_at: OffsetDateTime,
     /// The meter reading at the time of the event (kWh).
     /// `None` when not applicable (e.g., firmware update).
+    #[cfg_attr(feature = "serde", serde(with = "crate::wire::decimal_option"))]
     pub reading: Option<Decimal>,
     /// OBIS code of the reading (when `reading` is set).
     pub obis_code: Option<crate::obis::ObisCode>,
@@ -182,10 +183,12 @@ pub struct MeterExchangeEvent {
     /// Serial number of the removed meter.
     pub old_meter_serial: String,
     /// Final reading of the old meter (kWh).
+    #[cfg_attr(feature = "serde", serde(with = "crate::wire::decimal"))]
     pub old_final_reading: Decimal,
     /// Serial number of the newly installed meter.
     pub new_meter_serial: String,
     /// First reading of the new meter (kWh).
+    #[cfg_attr(feature = "serde", serde(with = "crate::wire::decimal"))]
     pub new_first_reading: Decimal,
     /// Date and time of the exchange (UTC).
     ///

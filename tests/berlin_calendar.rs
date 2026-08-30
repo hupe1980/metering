@@ -167,3 +167,163 @@ fn a_year_of_days_tiles_without_loss() {
         Some(total)
     );
 }
+
+// ── the same properties, over generated dates ────────────────────────────────
+//
+// The literals above pin the numbers a completeness check has to agree with,
+// and they pin them for 2026. These say the *structure* holds for any date:
+// consecutive periods abut, an instant lands in the period that contains it,
+// and a coarse count is the sum of the fine ones it is made of. A tz-database
+// update that moved a transition, or an off-by-one in a month count, shows up
+// here rather than in a customer's Jahresabrechnung.
+
+use metering::DayBoundary;
+use proptest::prelude::*;
+
+/// Any day from 1996 to 2065 — inside `Date`'s range, and either side of every
+/// rule change the tz database records for this zone.
+fn arb_day() -> impl Strategy<Value = Date> {
+    (1996i32..2065, 1u16..=366).prop_filter_map("a real ordinal", |(year, ordinal)| {
+        Date::from_ordinal_date(year, ordinal).ok()
+    })
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(512))]
+
+    /// Consecutive days tile the timeline, on both boundaries, and an instant
+    /// belongs to the day whose bounds contain it.
+    #[test]
+    fn days_tile_and_contain_their_own_instants(day in arb_day()) {
+        for boundary in DayBoundary::ALL {
+            let start = boundary.day_start_utc(day);
+            let end = boundary.day_end_utc(day);
+            prop_assert!(start < end, "{boundary:?} {day}");
+
+            let next = day.next_day().expect("in range");
+            prop_assert_eq!(
+                end,
+                boundary.day_start_utc(next),
+                "{:?}: {} must end where {} begins",
+                boundary,
+                day,
+                next,
+            );
+
+            // Every instant of the day maps back to it — including the last.
+            for probe in [start, start + Duration::seconds(1), end - Duration::seconds(1)] {
+                prop_assert_eq!(boundary.local_day(probe), day, "{:?} {}", boundary, probe);
+            }
+            prop_assert_eq!(boundary.local_day(end), next, "the end is exclusive");
+
+            // A German day is 23, 24 or 25 hours. Nothing else, ever.
+            let hours = boundary.day_length(day).whole_hours();
+            prop_assert!((23..=25).contains(&hours), "{boundary:?} {day}: {hours} h");
+        }
+    }
+
+    /// A coarse interval count is the sum of the fine ones inside it — which is
+    /// the whole reason `intervals_in_month` exists rather than `days × 96`.
+    #[test]
+    fn interval_counts_compose(day in arb_day()) {
+        let first = Date::from_calendar_date(day.year(), day.month(), 1).expect("valid");
+        let mut cursor = first;
+        let mut quarters = 0u32;
+        let mut days = 0u32;
+        while cursor.month() == day.month() && cursor.year() == day.year() {
+            quarters += calendar::intervals_in_day(cursor, IntervalResolution::QuarterHour)
+                .expect("a day divides into quarter-hours");
+            days += 1;
+            cursor = cursor.next_day().expect("in range");
+        }
+        prop_assert_eq!(
+            calendar::intervals_in_month(day, IntervalResolution::QuarterHour),
+            Some(quarters),
+        );
+        prop_assert_eq!(
+            calendar::intervals_in_month(day, IntervalResolution::Day),
+            Some(days),
+        );
+        prop_assert_eq!(u32::from(calendar::days_in_month(day)), days);
+
+        // …and the month tiles into the year.
+        prop_assert_eq!(
+            calendar::month_end_utc(day) - calendar::month_start_utc(day),
+            calendar::month_length(day),
+        );
+        prop_assert!(calendar::month_start_utc(day) <= calendar::day_start_utc(day));
+        prop_assert!(calendar::day_start_utc(day) < calendar::month_end_utc(day));
+    }
+
+    /// A year is the sum of its months and of its days, and the two DST
+    /// transitions cancel inside it.
+    #[test]
+    fn a_year_is_the_sum_of_its_parts(year in 1996i32..2065) {
+        let mut quarters = 0u32;
+        let mut day = Date::from_ordinal_date(year, 1).expect("valid");
+        let mut cursor = calendar::day_start_utc(day);
+        while day.year() == year {
+            prop_assert_eq!(calendar::day_start_utc(day), cursor, "{} must abut", day);
+            quarters += calendar::intervals_in_day(day, IntervalResolution::QuarterHour)
+                .expect("divides");
+            cursor = calendar::day_end_utc(day);
+            day = day.next_day().expect("in range");
+        }
+        prop_assert_eq!(cursor, calendar::year_end_utc(year));
+        prop_assert_eq!(
+            calendar::intervals_in_year(year, IntervalResolution::QuarterHour),
+            Some(quarters),
+        );
+        prop_assert_eq!(
+            u32::from(calendar::days_in_year(year)) * 96,
+            quarters,
+            "the transitions cancel over a full year",
+        );
+    }
+
+    /// Stepping back `n` calendar days and counting forward again returns `n`,
+    /// whatever lies in between — which is the property a Vergleichstag window
+    /// and a Jahresprognose both rest on.
+    #[test]
+    fn stepping_back_and_counting_forward_agree(
+        day in arb_day(),
+        minute in 0i64..1440,
+        back in 1i64..400,
+    ) {
+        let instant = calendar::day_start_utc(day) + Duration::minutes(minute);
+        let shifted = calendar::shift_back_days(instant, back);
+        prop_assert!(shifted < instant, "the shift must go backwards");
+        prop_assert_eq!(calendar::days_between(shifted, instant), back);
+        prop_assert_eq!(calendar::days_between(instant, shifted), -back, "antisymmetric");
+
+        // The local wall clock is preserved, except where the clocks skipped
+        // that time — there it resolves forward, never backward.
+        let want = calendar::to_berlin(instant).time();
+        let got = calendar::to_berlin(shifted).time();
+        prop_assert!(got >= want, "a skipped hour resolves forward: {got} < {want}");
+    }
+
+    /// `local_day` and `local_gas_day` differ by exactly the six-hour cut:
+    /// before 06:00 local, the Gastag is the previous calendar day.
+    #[test]
+    fn the_gastag_is_the_calendar_day_cut_six_hours_later(
+        day in arb_day(),
+        minute in 0i64..1440,
+    ) {
+        let instant = calendar::day_start_utc(day) + Duration::minutes(minute);
+        let calendar_day = calendar::local_day(instant);
+        let gas_day = calendar::local_gas_day(instant);
+        let before_six = calendar::to_berlin(instant).time() < time::macros::time!(6:00);
+
+        prop_assert_eq!(
+            gas_day,
+            if before_six {
+                calendar_day.previous_day().expect("in range")
+            } else {
+                calendar_day
+            },
+        );
+        prop_assert!(calendar::gas_day_start_utc(gas_day) <= instant);
+        prop_assert!(instant < calendar::gas_day_end_utc(gas_day));
+    }
+}

@@ -1355,8 +1355,8 @@ mod tests {
         assert!(empty.intervals.is_empty());
     }
 
-    /// A long gap must not be truncated. The previous implementation capped its
-    /// gap-length scan at 100 and silently changed method past that point.
+    /// A long gap must not be truncated: a scan capped at a fixed length would
+    /// silently switch method past that point.
     #[test]
     fn a_gap_longer_than_a_hundred_intervals_is_measured_in_full() {
         let intervals = vec![

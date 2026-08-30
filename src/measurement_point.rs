@@ -40,7 +40,7 @@ use time::Date;
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
-use crate::ids::{MaloId, MeloId};
+use crate::ids::{BdewCode, MaloId, MeloId};
 use crate::interval::Sparte;
 use crate::obis::{ObisCode, RegisterUnit};
 
@@ -274,8 +274,13 @@ pub struct MeasurementPoint {
     /// Market role accountable for this measurement point.
     pub accountable_role: MarktRolle,
 
-    /// 13-digit BDEW or DVGW Codenummer of the accountable market participant.
-    pub accountable_mp_id: String,
+    /// Marktpartner-ID of the accountable market participant.
+    ///
+    /// A [`BdewCode`], not a `String`: the same reasoning as [`MaloId`] — an
+    /// identifier held as free text is validated nowhere, and a
+    /// twelve-character typo becomes a plausible-looking key for a different
+    /// market partner. Parse at the boundary.
+    pub accountable_mp_id: BdewCode,
 
     /// `true` when this is a virtual/derived measurement point (GGV, Residuallast).
     pub is_virtual: bool,
@@ -291,11 +296,13 @@ pub struct MeasurementPoint {
     pub wandler_factor: Decimal,
 
     /// Validity start (German local date, inclusive).
+    #[cfg_attr(feature = "serde", serde(with = "crate::wire::iso_date"))]
     pub valid_from: Date,
 
     /// Validity end (German local date, inclusive).
     ///
     /// `None` = still active.
+    #[cfg_attr(feature = "serde", serde(with = "crate::wire::iso_date_option"))]
     pub valid_to: Option<Date>,
 }
 
@@ -400,7 +407,7 @@ mod tests {
             sparte: Sparte::Strom,
             energy_flow: EnergyFlow::Consumption,
             accountable_role: MarktRolle::Lf,
-            accountable_mp_id: "9900987654321".to_owned(),
+            accountable_mp_id: "9900987654321".parse().unwrap(),
             is_virtual: false,
             wandler_factor: Decimal::ONE,
             valid_from: date!(2026 - 01 - 01),

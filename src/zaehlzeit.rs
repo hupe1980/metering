@@ -62,6 +62,7 @@ use time_tz::{OffsetDateTimeExt as _, timezones};
 use serde::{Deserialize, Serialize};
 
 use crate::holiday::Bundesland;
+use crate::ids::BdewCode;
 use crate::interval::MeterInterval;
 
 // ── register ids ──────────────────────────────────────────────────────────────
@@ -240,8 +241,10 @@ pub struct Zaehlzeitdefinition {
     /// NB-assigned identifier (UTILTS Zählzeitdefinitions-ID).
     pub id: String,
     /// First day the definition applies (inclusive, German calendar day).
+    #[cfg_attr(feature = "serde", serde(with = "crate::wire::iso_date"))]
     pub valid_from: Date,
     /// Last day (inclusive); `None` = open-ended.
+    #[cfg_attr(feature = "serde", serde(with = "crate::wire::iso_date_option"))]
     pub valid_to: Option<Date>,
     /// Ordered windows — the **first match wins**, so put the narrower bands
     /// first.
@@ -256,6 +259,18 @@ pub struct Zaehlzeitdefinition {
     /// `None` classifies by weekday alone. See the
     /// [module docs](self#resolution-is-dst-correct-and-feiertag-aware).
     pub holiday_land: Option<Bundesland>,
+    /// Marktpartner-ID of the Netzbetreiber that published this definition.
+    ///
+    /// [`id`](Self::id) is *NB-assigned*, so it identifies the definition only
+    /// within one operator's price sheet: `HT/NT-1` from two Netzbetreiber are
+    /// two different calendars under one name. A portfolio holding hundreds of
+    /// DSO calendars needs the pair.
+    ///
+    /// `None` for a definition built in place, where the caller already knows
+    /// whose it is. The **year** is deliberately not a field: it is
+    /// [`valid_from`](Self::valid_from) and [`valid_to`](Self::valid_to), and a
+    /// second copy of one fact is a second thing to keep in step.
+    pub netzbetreiber: Option<BdewCode>,
 }
 
 impl Zaehlzeitdefinition {
@@ -297,6 +312,7 @@ impl Zaehlzeitdefinition {
                 .collect(),
             fallback_register: Some(NT.to_owned()),
             holiday_land: None,
+            netzbetreiber: None,
         }
     }
 
@@ -326,6 +342,7 @@ impl Zaehlzeitdefinition {
             windows,
             fallback_register: Some(ST.to_owned()),
             holiday_land: None,
+            netzbetreiber: None,
         }
     }
 
@@ -333,6 +350,13 @@ impl Zaehlzeitdefinition {
     #[must_use]
     pub fn in_land(mut self, land: Bundesland) -> Self {
         self.holiday_land = Some(land);
+        self
+    }
+
+    /// Record which Netzbetreiber published this definition (builder style).
+    #[must_use]
+    pub const fn published_by(mut self, netzbetreiber: BdewCode) -> Self {
+        self.netzbetreiber = Some(netzbetreiber);
         self
     }
 
@@ -401,15 +425,559 @@ impl Zaehlzeitdefinition {
     /// Each interval is assigned by its **start**. An interval straddling a band
     /// boundary is booked whole into the band it begins in; at quarter-hour
     /// resolution against bands on the hour or half hour, that never arises.
+    ///
+    /// The keys **borrow** from this definition, so they are exactly the
+    /// strings [`registers`](Self::registers) lists, and looking one up
+    /// allocates nothing.
+    ///
+    /// ```rust
+    /// use metering::zaehlzeit::{HT, NT, Zaehlzeitdefinition};
+    /// use metering::{MeterInterval, QualityFlag};
+    /// use rust_decimal::dec;
+    /// use time::macros::{date, datetime};
+    ///
+    /// let zzd = Zaehlzeitdefinition::ht_nt("NB-1", date!(2026 - 01 - 01), 6 * 60, 22 * 60);
+    /// let midday = MeterInterval {
+    ///     from: datetime!(2026-01-05 9:00 UTC), // Monday 10:00 local
+    ///     to:   datetime!(2026-01-05 9:15 UTC),
+    ///     value: dec!(3),
+    ///     quality: QualityFlag::Measured,
+    ///     obis_code: None,
+    /// };
+    ///
+    /// let split = zzd.split_energy(std::slice::from_ref(&midday));
+    /// assert_eq!(split[&Some(HT)], dec!(3));
+    /// assert!(!split.contains_key(&Some(NT)));
+    /// ```
     #[must_use]
-    pub fn split_energy(&self, intervals: &[MeterInterval]) -> BTreeMap<Option<String>, Decimal> {
-        let mut sums: BTreeMap<Option<String>, Decimal> = BTreeMap::new();
+    pub fn split_energy<'a>(
+        &'a self,
+        intervals: &[MeterInterval],
+    ) -> BTreeMap<Option<&'a str>, Decimal> {
+        let mut sums: BTreeMap<Option<&'a str>, Decimal> = BTreeMap::new();
         for iv in intervals.iter().filter(|iv| iv.quality.is_billable()) {
-            let register = self.register_for(iv.from).map(str::to_owned);
-            *sums.entry(register).or_insert(Decimal::ZERO) += iv.value;
+            *sums
+                .entry(self.register_for(iv.from))
+                .or_insert(Decimal::ZERO) += iv.value;
         }
         sums
     }
+}
+
+// ── Modul 3 conformance ──────────────────────────────────────────────────────
+
+/// A calendar quarter, January to March being the first.
+///
+/// BDEW *Anwendungshilfe für die Umsetzung von Modul 3* v1.1 (07.02.2025),
+/// §2: *"Dabei wird das Jahr in kalenderjährliche Quartale beginnend mit
+/// Januar unterteilt."*
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub enum Quarter {
+    /// January, February, March.
+    Q1,
+    /// April, May, June.
+    Q2,
+    /// July, August, September.
+    Q3,
+    /// October, November, December.
+    Q4,
+}
+
+impl Quarter {
+    /// Every quarter, in calendar order.
+    pub const ALL: [Self; 4] = [Self::Q1, Self::Q2, Self::Q3, Self::Q4];
+
+    /// Stable DB/wire label. Matches the `serde` tag and
+    /// [`FromStr`](std::str::FromStr) input.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Q1 => "Q1",
+            Self::Q2 => "Q2",
+            Self::Q3 => "Q3",
+            Self::Q4 => "Q4",
+        }
+    }
+
+    /// The quarter a 1-based calendar month falls in, or `None` outside 1–12.
+    #[must_use]
+    pub const fn of_month(month: u8) -> Option<Self> {
+        match month {
+            1..=3 => Some(Self::Q1),
+            4..=6 => Some(Self::Q2),
+            7..=9 => Some(Self::Q3),
+            10..=12 => Some(Self::Q4),
+            _ => None,
+        }
+    }
+
+    /// The three 1-based calendar months in this quarter.
+    #[must_use]
+    pub const fn months(self) -> [u8; 3] {
+        match self {
+            Self::Q1 => [1, 2, 3],
+            Self::Q2 => [4, 5, 6],
+            Self::Q3 => [7, 8, 9],
+            Self::Q4 => [10, 11, 12],
+        }
+    }
+}
+
+/// Shortest Hochtarif window the Modul 3 rules admit, in minutes.
+///
+/// BDEW AWH Modul 3 v1.1, §2: *"Hochlasttarif (HT): min. an 2 Stunden pro
+/// Tag"*.
+pub const MODUL_3_MIN_HOCHTARIF_MINUTES: u16 = 120;
+
+/// Fewest calendar quarters the three tariffs must be billed in.
+///
+/// BDEW AWH Modul 3 v1.1, §2: *"Die Zeitfenster und insofern die drei
+/// Netzentgelttarife müssen in mindestens zwei Quartalen eines Jahres
+/// abgerechnet werden. Diese zwei Quartale müssen nicht zusammenhängend
+/// sein."*
+pub const MODUL_3_MIN_BILLED_QUARTERS: usize = 2;
+
+/// Why a Zählzeitdefinition does not meet the Modul 3 rules.
+///
+/// A closed vocabulary, like [`crate::sharing::Finding`]: a curation pipeline
+/// routes on the reason, and `contains("Hochtarif")` is not a interface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "SCREAMING_SNAKE_CASE"))]
+pub enum Modul3Finding {
+    /// The definition does not book into exactly [`HT`], [`NT`] and [`ST`].
+    RegistersAreNotHtNtSt,
+    /// A register is declared but no instant of any day ever resolves to it.
+    ///
+    /// The likeliest cause is a band written as one wrapping window —
+    /// `22:00–06:00` as a single `from > to` pair, which
+    /// a window's bounds can never satisfy. The register then
+    /// appears in [`registers`](Zaehlzeitdefinition::registers), the day is
+    /// still fully covered by the fallback, and every other rule passes: the
+    /// calendar reads as a conforming three-level tariff while one of the three
+    /// levels is unreachable. [`ZaehlzeitFenster::spanning`] is what builds the
+    /// two windows such a band actually needs.
+    RegisterNeverReached,
+    /// Some part of the day falls into no register at all — there is no
+    /// fallback, or a window leaves a hole.
+    TimeNotFullyCovered,
+    /// The Hochtarif window is shorter than
+    /// [`MODUL_3_MIN_HOCHTARIF_MINUTES`] on at least one day the definition
+    /// distinguishes.
+    HochtarifBelowTwoHours,
+    /// The windows are not the same in every month, so they vary between
+    /// quarters.
+    WindowsVaryAcrossTheYear,
+    /// Fewer than [`MODUL_3_MIN_BILLED_QUARTERS`] quarters were named.
+    FewerThanTwoBilledQuarters,
+    /// No billed quarters were supplied, so that rule could not be checked.
+    BilledQuartersUnknown,
+    /// Validity does not describe one calendar year.
+    ValidityIsNotOneCalendarYear,
+    /// The delivery point has not selected Modul 1.
+    ///
+    /// The `serde` tag is spelled out because `SCREAMING_SNAKE_CASE` renders
+    /// the Rust name as `MODUL1_NOT_SELECTED`, which is not what `as_str`
+    /// writes — and the contract is that the two are the same string.
+    #[cfg_attr(feature = "serde", serde(rename = "MODUL_1_NOT_SELECTED"))]
+    Modul1NotSelected,
+    /// The Marktlokation is metered by registrierende Leistungsmessung.
+    RegistrierendeLeistungsmessung,
+    /// No intelligentes Messsystem is installed.
+    NoIntelligentesMesssystem,
+    /// A precondition on the delivery point was not stated.
+    DeliveryPointDataMissing,
+}
+
+impl Modul3Finding {
+    /// Every finding, in declaration order.
+    pub const ALL: [Self; 12] = [
+        Self::RegistersAreNotHtNtSt,
+        Self::RegisterNeverReached,
+        Self::TimeNotFullyCovered,
+        Self::HochtarifBelowTwoHours,
+        Self::WindowsVaryAcrossTheYear,
+        Self::FewerThanTwoBilledQuarters,
+        Self::BilledQuartersUnknown,
+        Self::ValidityIsNotOneCalendarYear,
+        Self::Modul1NotSelected,
+        Self::RegistrierendeLeistungsmessung,
+        Self::NoIntelligentesMesssystem,
+        Self::DeliveryPointDataMissing,
+    ];
+
+    /// Stable DB/wire label. Matches the `serde` tag and
+    /// [`FromStr`](std::str::FromStr) input.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::RegistersAreNotHtNtSt => "REGISTERS_ARE_NOT_HT_NT_ST",
+            Self::RegisterNeverReached => "REGISTER_NEVER_REACHED",
+            Self::TimeNotFullyCovered => "TIME_NOT_FULLY_COVERED",
+            Self::HochtarifBelowTwoHours => "HOCHTARIF_BELOW_TWO_HOURS",
+            Self::WindowsVaryAcrossTheYear => "WINDOWS_VARY_ACROSS_THE_YEAR",
+            Self::FewerThanTwoBilledQuarters => "FEWER_THAN_TWO_BILLED_QUARTERS",
+            Self::BilledQuartersUnknown => "BILLED_QUARTERS_UNKNOWN",
+            Self::ValidityIsNotOneCalendarYear => "VALIDITY_IS_NOT_ONE_CALENDAR_YEAR",
+            Self::Modul1NotSelected => "MODUL_1_NOT_SELECTED",
+            Self::RegistrierendeLeistungsmessung => "REGISTRIERENDE_LEISTUNGSMESSUNG",
+            Self::NoIntelligentesMesssystem => "NO_INTELLIGENTES_MESSSYSTEM",
+            Self::DeliveryPointDataMissing => "DELIVERY_POINT_DATA_MISSING",
+        }
+    }
+
+    /// The provision this finding rests on.
+    #[must_use]
+    pub const fn legal_basis(self) -> &'static str {
+        match self {
+            Self::BilledQuartersUnknown | Self::DeliveryPointDataMissing => {
+                "(not a rule — the input did not say)"
+            }
+            _ => "BDEW AWH Modul 3 v1.1 (07.02.2025) §2",
+        }
+    }
+
+    /// `true` when the finding is about missing input rather than a breach.
+    #[must_use]
+    pub const fn is_unknown(self) -> bool {
+        matches!(
+            self,
+            Self::BilledQuartersUnknown | Self::DeliveryPointDataMissing
+        )
+    }
+}
+
+/// Whether a Zählzeitdefinition meets the Modul 3 rules.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "SCREAMING_SNAKE_CASE"))]
+pub enum Modul3Conformance {
+    /// Every rule this crate can check was met.
+    Conforms,
+    /// At least one rule was broken.
+    Violates,
+    /// Nothing was broken, but something could not be checked.
+    Unknown,
+}
+
+impl Modul3Conformance {
+    /// Every verdict, in declaration order.
+    pub const ALL: [Self; 3] = [Self::Conforms, Self::Violates, Self::Unknown];
+
+    /// Stable DB/wire label. Matches the `serde` tag and
+    /// [`FromStr`](std::str::FromStr) input.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Conforms => "CONFORMS",
+            Self::Violates => "VIOLATES",
+            Self::Unknown => "UNKNOWN",
+        }
+    }
+}
+
+crate::codes::string_codes! {
+    Quarter;
+    Modul3Finding;
+    Modul3Conformance;
+}
+
+/// What [`assess_modul_3`] needs that the calendar itself does not carry.
+///
+/// Every field is optional because a curated portfolio is routinely
+/// incomplete, and the assessment reports *what it could not check* rather
+/// than guessing — the same shape as
+/// [`MeteringCapabilityInput`](crate::MeteringCapabilityInput).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Modul3Context {
+    /// The calendar quarters the Netzbetreiber bills the three tariffs in.
+    ///
+    /// The operator's Wahlrecht, published on the price sheet — *"Der
+    /// Netzbetreiber hat das Wahlrecht, den Gültigkeitszeitraum auf einzelne
+    /// Quartale zu beschränken"* — so it is not a property of the windows.
+    /// Duplicates are ignored.
+    pub billed_quarters: Option<Vec<Quarter>>,
+    /// Whether the delivery point has selected Modul 1.
+    pub modul_1_selected: Option<bool>,
+    /// Whether the Marktlokation is metered by registrierende
+    /// Leistungsmessung.
+    pub registrierende_leistungsmessung: Option<bool>,
+    /// Whether an intelligentes Messsystem is installed.
+    pub intelligentes_messsystem: Option<bool>,
+}
+
+impl Modul3Context {
+    /// The quarters the three tariffs are billed in (builder style).
+    #[must_use]
+    pub fn billed_in(mut self, quarters: impl IntoIterator<Item = Quarter>) -> Self {
+        self.billed_quarters = Some(quarters.into_iter().collect());
+        self
+    }
+
+    /// Whether the delivery point has Modul 1 selected (builder style).
+    ///
+    /// The three preconditions are named rather than positional: as bare
+    /// booleans they read as interchangeable, and the middle one is inverted —
+    /// Modul 3 requires *no* RLM.
+    #[must_use]
+    pub const fn with_modul_1(mut self, selected: bool) -> Self {
+        self.modul_1_selected = Some(selected);
+        self
+    }
+
+    /// Whether the Marktlokation is metered by registrierende
+    /// Leistungsmessung (builder style). Modul 3 requires that it is **not**.
+    #[must_use]
+    pub const fn with_registrierende_leistungsmessung(mut self, rlm: bool) -> Self {
+        self.registrierende_leistungsmessung = Some(rlm);
+        self
+    }
+
+    /// Whether an intelligentes Messsystem is installed (builder style).
+    #[must_use]
+    pub const fn with_intelligentes_messsystem(mut self, imsys: bool) -> Self {
+        self.intelligentes_messsystem = Some(imsys);
+        self
+    }
+
+    /// The three delivery-point preconditions a conforming point satisfies:
+    /// Modul 1 selected, no RLM, iMSys installed.
+    #[must_use]
+    pub const fn at_a_conforming_delivery_point(self) -> Self {
+        self.with_modul_1(true)
+            .with_registrierende_leistungsmessung(false)
+            .with_intelligentes_messsystem(true)
+    }
+}
+
+/// Assess a Zählzeitdefinition against the § 14a **Modul 3** rules.
+///
+/// Modul 3 is the *Anreizmodul* of BK8-22/010-A: three time-variable
+/// Netzentgelt levels over windows the Netzbetreiber sets for its whole
+/// Netzgebiet, mandatory to offer since 1 April 2025. A portfolio of hundreds
+/// of DSO calendars is worth refusing at the door rather than at the optimiser.
+///
+/// | Rule (BDEW AWH Modul 3 v1.1 §2) | Finding |
+/// |---|---|
+/// | three Netzentgelttarife HT/NT/ST | [`RegistersAreNotHtNtSt`] |
+/// | each of them reachable | [`RegisterNeverReached`] |
+/// | every instant books into one of them | [`TimeNotFullyCovered`] |
+/// | HT at least two hours per day | [`HochtarifBelowTwoHours`] |
+/// | windows *ganzjährig identisch* | [`WindowsVaryAcrossTheYear`] |
+/// | billed in at least two quarters | [`FewerThanTwoBilledQuarters`] |
+/// | set per calendar year | [`ValidityIsNotOneCalendarYear`] |
+/// | only with Modul 1, iMSys, no RLM | from [`Modul3Context`] |
+///
+/// The price corridors (HT ≤ 100 % Aufschlag, NT 10–40 % of ST, the
+/// Netzentgeltgleichheit condition) and the publication deadline are **not**
+/// checked. The first are money, which this crate does not model; the second is
+/// a Fristen question, and the AWH states its 15.10. date for the first year
+/// rather than as a standing rule. Check both where the price sheet is parsed.
+///
+/// *"min. an 2 Stunden pro Tag"* is read per day **class** — an ordinary
+/// weekday, a Saturday, a Sunday, and a statutory holiday where
+/// [`holiday_land`](Zaehlzeitdefinition::holiday_land) is set — so a
+/// weekday-only Hochtarif is reported: on a Sunday it offers none at all.
+/// Minutes are wall-clock minutes, the vocabulary the windows are written in.
+///
+/// [`RegistersAreNotHtNtSt`]: Modul3Finding::RegistersAreNotHtNtSt
+/// [`RegisterNeverReached`]: Modul3Finding::RegisterNeverReached
+/// [`TimeNotFullyCovered`]: Modul3Finding::TimeNotFullyCovered
+/// [`HochtarifBelowTwoHours`]: Modul3Finding::HochtarifBelowTwoHours
+/// [`WindowsVaryAcrossTheYear`]: Modul3Finding::WindowsVaryAcrossTheYear
+/// [`FewerThanTwoBilledQuarters`]: Modul3Finding::FewerThanTwoBilledQuarters
+/// [`ValidityIsNotOneCalendarYear`]: Modul3Finding::ValidityIsNotOneCalendarYear
+///
+/// ```rust
+/// use metering::zaehlzeit::{
+///     Modul3Conformance, Modul3Context, Quarter, Zaehlzeitdefinition, assess_modul_3,
+/// };
+/// use time::macros::date;
+///
+/// let zzd = Zaehlzeitdefinition::modul_3(
+///     "NB-14A-3",
+///     date!(2026 - 01 - 01),
+///     (17 * 60, 20 * 60), // Hochtarif 17:00–20:00 — three hours
+///     (22 * 60, 6 * 60),  // Niedertarif 22:00–06:00, wrapping
+/// )
+/// .until(date!(2026 - 12 - 31));
+///
+/// let ctx = Modul3Context::default()
+///     .billed_in([Quarter::Q1, Quarter::Q4])
+///     .at_a_conforming_delivery_point();
+///
+/// let (verdict, findings) = assess_modul_3(&zzd, &ctx);
+/// assert_eq!(verdict, Modul3Conformance::Conforms, "{findings:?}");
+/// ```
+#[must_use]
+pub fn assess_modul_3(
+    zzd: &Zaehlzeitdefinition,
+    ctx: &Modul3Context,
+) -> (Modul3Conformance, Vec<Modul3Finding>) {
+    let mut findings = Vec::new();
+
+    // ── the three tariffs ────────────────────────────────────────────────
+    if zzd.registers() != vec![HT, NT, ST] {
+        findings.push(Modul3Finding::RegistersAreNotHtNtSt);
+    }
+
+    // ── the day profiles, once per (month, day class) ────────────────────
+    let classes = day_classes(zzd);
+    let mut months = (1u8..=12).map(|month| {
+        classes
+            .iter()
+            .map(|&class| day_profile(zzd, month - 1, class))
+            .collect::<Vec<_>>()
+    });
+    let first = months.next().unwrap_or_default();
+    if !months.all(|other| other == first) {
+        findings.push(Modul3Finding::WindowsVaryAcrossTheYear);
+    }
+    let minutes = |profile: &DayProfile<'_>, register: &str| -> u16 {
+        profile.get(&Some(register)).copied().unwrap_or(0)
+    };
+    if first.iter().any(|p| p.contains_key(&None)) {
+        findings.push(Modul3Finding::TimeNotFullyCovered);
+    }
+    if first
+        .iter()
+        .any(|p| minutes(p, HT) < MODUL_3_MIN_HOCHTARIF_MINUTES)
+    {
+        findings.push(Modul3Finding::HochtarifBelowTwoHours);
+    }
+    // A register nobody can ever be charged is not one of the three levels,
+    // whatever the window list says it is.
+    let reachable: std::collections::BTreeSet<&str> = (1u8..=12)
+        .flat_map(|month| {
+            classes
+                .iter()
+                .flat_map(move |&class| day_profile(zzd, month - 1, class).into_keys())
+        })
+        .flatten()
+        .collect();
+    if zzd.registers().iter().any(|r| !reachable.contains(r)) {
+        findings.push(Modul3Finding::RegisterNeverReached);
+    }
+
+    // ── billed quarters ──────────────────────────────────────────────────
+    match &ctx.billed_quarters {
+        None => findings.push(Modul3Finding::BilledQuartersUnknown),
+        Some(quarters) => {
+            let distinct: std::collections::BTreeSet<Quarter> = quarters.iter().copied().collect();
+            if distinct.len() < MODUL_3_MIN_BILLED_QUARTERS {
+                findings.push(Modul3Finding::FewerThanTwoBilledQuarters);
+            }
+        }
+    }
+
+    // ── validity ─────────────────────────────────────────────────────────
+    // An open end is how operators express "until further notice" and is not
+    // itself a breach; a start that is not a 1 January, or an end that is not
+    // the 31 December of that same year, demonstrably is not one calendar year.
+    let starts_a_year = zzd.valid_from.month() == time::Month::January && zzd.valid_from.day() == 1;
+    let ends_that_year = zzd.valid_to.is_none_or(|end| {
+        end.year() == zzd.valid_from.year()
+            && end.month() == time::Month::December
+            && end.day() == 31
+    });
+    if !starts_a_year || !ends_that_year {
+        findings.push(Modul3Finding::ValidityIsNotOneCalendarYear);
+    }
+
+    // ── delivery-point preconditions ─────────────────────────────────────
+    let mut missing = false;
+    let mut precondition = |value: Option<bool>, required: bool, breach: Modul3Finding| match value
+    {
+        Some(v) if v == required => {}
+        Some(_) => findings.push(breach),
+        None => missing = true,
+    };
+    precondition(ctx.modul_1_selected, true, Modul3Finding::Modul1NotSelected);
+    precondition(
+        ctx.registrierende_leistungsmessung,
+        false,
+        Modul3Finding::RegistrierendeLeistungsmessung,
+    );
+    precondition(
+        ctx.intelligentes_messsystem,
+        true,
+        Modul3Finding::NoIntelligentesMesssystem,
+    );
+    if missing {
+        findings.push(Modul3Finding::DeliveryPointDataMissing);
+    }
+
+    let verdict = if findings.iter().any(|f| !f.is_unknown()) {
+        Modul3Conformance::Violates
+    } else if findings.is_empty() {
+        Modul3Conformance::Conforms
+    } else {
+        Modul3Conformance::Unknown
+    };
+    (verdict, findings)
+}
+
+/// How one kind of day resolves: wall-clock minutes per register, with `None`
+/// for the minutes no register covers.
+///
+/// The **whole** map, not a summary of it. Comparing only the Hochtarif and the
+/// uncovered minutes across the twelve months missed a definition whose NT and
+/// ST swap between summer and winter while HT stays put — which is exactly the
+/// *"Preisstufen und Zeitfenster müssen ganzjährig identisch sein"* rule the
+/// comparison exists to enforce.
+type DayProfile<'a> = BTreeMap<Option<&'a str>, u16>;
+
+/// The kinds of day a definition can tell apart.
+///
+/// [`ZaehlzeitFenster::matches`] reads the weekday only through
+/// [`DayGroup::contains`] and the holiday flag, so four representatives cover
+/// every distinction the type can express — and the holiday one only arises
+/// where a [`Bundesland`] was named.
+fn day_classes(zzd: &Zaehlzeitdefinition) -> Vec<(Weekday, bool)> {
+    let mut classes = vec![
+        (Weekday::Monday, false),
+        (Weekday::Saturday, false),
+        (Weekday::Sunday, false),
+    ];
+    if zzd.holiday_land.is_some() {
+        classes.push((Weekday::Monday, true));
+    }
+    classes
+}
+
+/// Resolve one (month, day class) into its register profile.
+///
+/// [`ZaehlzeitFenster::matches`] is piecewise constant between window bounds,
+/// so evaluating once per segment is exact — and far cheaper than walking
+/// 1 440 minutes twelve times over.
+fn day_profile<'a>(
+    zzd: &'a Zaehlzeitdefinition,
+    month0: u8,
+    class: (Weekday, bool),
+) -> DayProfile<'a> {
+    let (weekday, is_holiday) = class;
+
+    let mut breakpoints: Vec<u16> = vec![0, MINUTES_PER_DAY];
+    for w in &zzd.windows {
+        breakpoints.push(w.from_minute.min(MINUTES_PER_DAY));
+        breakpoints.push(w.to_minute.min(MINUTES_PER_DAY));
+    }
+    breakpoints.sort_unstable();
+    breakpoints.dedup();
+
+    let mut profile = DayProfile::new();
+    for pair in breakpoints.windows(2) {
+        let (from, to) = (pair[0], pair[1]);
+        let register = zzd
+            .windows
+            .iter()
+            .find(|w| w.matches(month0, weekday, from, is_holiday))
+            .map(|w| w.register_id.as_str())
+            .or(zzd.fallback_register.as_deref());
+        *profile.entry(register).or_insert(0) += to - from;
+    }
+    profile
 }
 
 // ── tests ─────────────────────────────────────────────────────────────────────
@@ -676,9 +1244,9 @@ mod tests {
         );
         assert!(!split.contains_key(&None), "the fallback covers everything");
         // 12 quarter-hours HT (17:00–20:00), 24 NT (00:00–06:00), 60 ST.
-        assert_eq!(split[&Some(HT.to_owned())], dec!(2.5) * dec!(12));
-        assert_eq!(split[&Some(NT.to_owned())], dec!(2.5) * dec!(24));
-        assert_eq!(split[&Some(ST.to_owned())], dec!(2.5) * dec!(60));
+        assert_eq!(split[&Some(HT)], dec!(2.5) * dec!(12));
+        assert_eq!(split[&Some(NT)], dec!(2.5) * dec!(24));
+        assert_eq!(split[&Some(ST)], dec!(2.5) * dec!(60));
     }
 
     /// The same invariant across a DST day, where the register counts are not
@@ -716,7 +1284,7 @@ mod tests {
                 "{day}: nothing lost across the transition"
             );
             assert_eq!(
-                split[&Some(NT.to_owned())],
+                split[&Some(NT)],
                 Decimal::from(expected_nt),
                 "{day}: NT quarter-hours"
             );
@@ -733,7 +1301,7 @@ mod tests {
             iv(datetime!(2026-02-16 8:00 UTC), dec!(4)), // inside
         ]);
         assert_eq!(split[&None], dec!(3));
-        assert_eq!(split[&Some(HT.to_owned())], dec!(4));
+        assert_eq!(split[&Some(HT)], dec!(4));
     }
 
     #[test]
@@ -742,7 +1310,7 @@ mod tests {
         let mut faulty = iv(datetime!(2026-01-05 8:00 UTC), dec!(99));
         faulty.quality = QualityFlag::Faulty;
         let split = zzd.split_energy(&[iv(datetime!(2026-01-05 9:00 UTC), dec!(4)), faulty]);
-        assert_eq!(split[&Some(HT.to_owned())], dec!(4));
+        assert_eq!(split[&Some(HT)], dec!(4));
         assert_eq!(split.len(), 1);
     }
 
@@ -772,5 +1340,375 @@ mod tests {
         for day in [Monday, Saturday, Sunday] {
             assert!(DayGroup::AllDays.contains(day));
         }
+    }
+}
+
+#[cfg(test)]
+mod modul_3_conformance_tests {
+    use super::*;
+    use time::macros::date;
+
+    fn conforming() -> Zaehlzeitdefinition {
+        Zaehlzeitdefinition::modul_3(
+            "NB-14A-3",
+            date!(2026 - 01 - 01),
+            (17 * 60, 20 * 60),
+            (22 * 60, 6 * 60),
+        )
+        .until(date!(2026 - 12 - 31))
+    }
+
+    fn full_context() -> Modul3Context {
+        Modul3Context::default()
+            .billed_in([Quarter::Q1, Quarter::Q4])
+            .at_a_conforming_delivery_point()
+    }
+
+    #[test]
+    fn a_well_formed_definition_conforms() {
+        let (verdict, findings) = assess_modul_3(&conforming(), &full_context());
+        assert_eq!(verdict, Modul3Conformance::Conforms, "{findings:?}");
+        assert!(findings.is_empty());
+    }
+
+    /// *"min. an 2 Stunden pro Tag"* — a 90-minute Hochtarif is short.
+    #[test]
+    fn a_hochtarif_under_two_hours_is_a_breach() {
+        let zzd = Zaehlzeitdefinition::modul_3(
+            "NB-1",
+            date!(2026 - 01 - 01),
+            (17 * 60, 18 * 60 + 30), // 90 minutes
+            (22 * 60, 6 * 60),
+        )
+        .until(date!(2026 - 12 - 31));
+        let (verdict, findings) = assess_modul_3(&zzd, &full_context());
+        assert_eq!(verdict, Modul3Conformance::Violates);
+        assert!(
+            findings.contains(&Modul3Finding::HochtarifBelowTwoHours),
+            "{findings:?}"
+        );
+
+        // Exactly two hours is enough — the bound is inclusive.
+        let exact = Zaehlzeitdefinition::modul_3(
+            "NB-1",
+            date!(2026 - 01 - 01),
+            (17 * 60, 19 * 60),
+            (22 * 60, 6 * 60),
+        )
+        .until(date!(2026 - 12 - 31));
+        assert_eq!(
+            assess_modul_3(&exact, &full_context()).0,
+            Modul3Conformance::Conforms,
+        );
+    }
+
+    /// A weekday-only Hochtarif offers none at all on a Sunday, which the
+    /// per-day-class reading catches and a whole-week average would not.
+    #[test]
+    fn a_weekday_only_hochtarif_fails_on_sundays() {
+        let mut zzd = conforming();
+        for w in &mut zzd.windows {
+            if w.register_id == HT {
+                w.days = DayGroup::Weekdays;
+            }
+        }
+        let (verdict, findings) = assess_modul_3(&zzd, &full_context());
+        assert_eq!(verdict, Modul3Conformance::Violates);
+        assert!(
+            findings.contains(&Modul3Finding::HochtarifBelowTwoHours),
+            "{findings:?}"
+        );
+    }
+
+    /// *"Die Preisstufen und Zeitfenster müssen ganzjährig identisch sein."*
+    #[test]
+    fn a_seasonal_window_varies_across_the_year() {
+        let mut zzd = conforming();
+        // Winter months only — bits 0,1,10,11.
+        for w in &mut zzd.windows {
+            if w.register_id == HT {
+                w.months_mask = 0b1100_0000_0011;
+            }
+        }
+        let (verdict, findings) = assess_modul_3(&zzd, &full_context());
+        assert_eq!(verdict, Modul3Conformance::Violates);
+        assert!(
+            findings.contains(&Modul3Finding::WindowsVaryAcrossTheYear),
+            "{findings:?}"
+        );
+    }
+
+    /// Without a fallback the Standardtarif has nowhere to book, so part of
+    /// the day belongs to no register at all.
+    #[test]
+    fn a_missing_fallback_leaves_time_uncovered() {
+        let mut zzd = conforming();
+        zzd.fallback_register = None;
+        let (verdict, findings) = assess_modul_3(&zzd, &full_context());
+        assert_eq!(verdict, Modul3Conformance::Violates);
+        assert!(
+            findings.contains(&Modul3Finding::TimeNotFullyCovered),
+            "{findings:?}"
+        );
+        assert!(
+            findings.contains(&Modul3Finding::RegistersAreNotHtNtSt),
+            "{findings:?}"
+        );
+    }
+
+    /// *"in mindestens zwei Quartalen eines Jahres"* — and they need not be
+    /// adjacent, so Q1 + Q4 passes while Q2 alone does not.
+    #[test]
+    fn two_quarters_are_required_but_need_not_be_adjacent() {
+        let zzd = conforming();
+
+        let one = full_context().billed_in([Quarter::Q2]);
+        let (verdict, findings) = assess_modul_3(&zzd, &one);
+        assert_eq!(verdict, Modul3Conformance::Violates);
+        assert!(findings.contains(&Modul3Finding::FewerThanTwoBilledQuarters));
+
+        // A repeated quarter is still one quarter.
+        let repeated = full_context().billed_in([Quarter::Q2, Quarter::Q2]);
+        assert_eq!(
+            assess_modul_3(&zzd, &repeated).0,
+            Modul3Conformance::Violates
+        );
+
+        // Non-adjacent is explicitly fine.
+        let split = full_context().billed_in([Quarter::Q1, Quarter::Q3]);
+        assert_eq!(assess_modul_3(&zzd, &split).0, Modul3Conformance::Conforms);
+    }
+
+    /// A missing input is `Unknown`, not `Conforms` — the same distinction
+    /// `sharing` and the validation engine draw.
+    #[test]
+    fn missing_input_is_unknown_rather_than_clean() {
+        let zzd = conforming();
+
+        let (verdict, findings) = assess_modul_3(&zzd, &Modul3Context::default());
+        assert_eq!(verdict, Modul3Conformance::Unknown);
+        assert!(findings.contains(&Modul3Finding::BilledQuartersUnknown));
+        assert!(findings.contains(&Modul3Finding::DeliveryPointDataMissing));
+        assert!(findings.iter().copied().all(Modul3Finding::is_unknown));
+
+        // A breach outranks an unknown.
+        let partial = Modul3Context::default()
+            .with_modul_1(false)
+            .with_registrierende_leistungsmessung(false)
+            .with_intelligentes_messsystem(true);
+        let (verdict, findings) = assess_modul_3(&zzd, &partial);
+        assert_eq!(verdict, Modul3Conformance::Violates);
+        assert!(findings.contains(&Modul3Finding::Modul1NotSelected));
+    }
+
+    #[test]
+    fn the_delivery_point_preconditions_are_each_reported() {
+        let zzd = conforming();
+        let ctx = Modul3Context::default()
+            .billed_in([Quarter::Q1, Quarter::Q2])
+            .with_modul_1(false)
+            .with_registrierende_leistungsmessung(true)
+            .with_intelligentes_messsystem(false);
+        let (verdict, findings) = assess_modul_3(&zzd, &ctx);
+        assert_eq!(verdict, Modul3Conformance::Violates);
+        for expected in [
+            Modul3Finding::Modul1NotSelected,
+            Modul3Finding::RegistrierendeLeistungsmessung,
+            Modul3Finding::NoIntelligentesMesssystem,
+        ] {
+            assert!(
+                findings.contains(&expected),
+                "{expected} missing: {findings:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn validity_must_describe_one_calendar_year() {
+        let mid_year = Zaehlzeitdefinition::modul_3(
+            "NB-1",
+            date!(2026 - 04 - 01),
+            (17 * 60, 20 * 60),
+            (22 * 60, 6 * 60),
+        );
+        assert!(
+            assess_modul_3(&mid_year, &full_context())
+                .1
+                .contains(&Modul3Finding::ValidityIsNotOneCalendarYear)
+        );
+
+        // An open end is "until further notice", not a breach.
+        let open = Zaehlzeitdefinition::modul_3(
+            "NB-1",
+            date!(2026 - 01 - 01),
+            (17 * 60, 20 * 60),
+            (22 * 60, 6 * 60),
+        );
+        assert_eq!(
+            assess_modul_3(&open, &full_context()).0,
+            Modul3Conformance::Conforms
+        );
+    }
+
+    #[test]
+    fn quarters_partition_the_year() {
+        let mut seen = Vec::new();
+        for q in Quarter::ALL {
+            for m in q.months() {
+                assert_eq!(Quarter::of_month(m), Some(q));
+                seen.push(m);
+            }
+        }
+        seen.sort_unstable();
+        assert_eq!(seen, (1u8..=12).collect::<Vec<_>>());
+        assert_eq!(Quarter::of_month(0), None);
+        assert_eq!(Quarter::of_month(13), None);
+    }
+
+    /// A classic HT/NT definition is not a Modul 3 definition, and says so.
+    #[test]
+    fn a_two_register_definition_is_not_modul_3() {
+        let zzd = Zaehlzeitdefinition::ht_nt("NB-1", date!(2026 - 01 - 01), 6 * 60, 22 * 60);
+        let (verdict, findings) = assess_modul_3(&zzd, &full_context());
+        assert_eq!(verdict, Modul3Conformance::Violates);
+        assert!(findings.contains(&Modul3Finding::RegistersAreNotHtNtSt));
+    }
+
+    /// Provenance: the NB-assigned id means nothing without whose it is.
+    #[test]
+    fn a_definition_can_name_the_netzbetreiber_that_published_it() {
+        let nb: crate::BdewCode = "9900987654321".parse().unwrap();
+        let zzd = conforming().published_by(nb);
+        assert_eq!(zzd.netzbetreiber, Some(nb));
+        assert_eq!(
+            zzd.netzbetreiber.unwrap().vergabestelle(),
+            crate::CodeVergabestelle::BdewStrom
+        );
+    }
+}
+
+#[cfg(test)]
+mod modul_3_reachability_tests {
+    use super::*;
+    use time::macros::{date, datetime};
+
+    fn ctx() -> Modul3Context {
+        Modul3Context::default()
+            .billed_in([Quarter::Q1, Quarter::Q4])
+            .at_a_conforming_delivery_point()
+    }
+
+    /// The most likely import mistake there is: a Niedertarif band written as
+    /// **one** wrapping window. `from > to` matches nothing, so NT is declared,
+    /// never applied, and every other rule passes — the day is still fully
+    /// covered by the ST fallback and HT is untouched. The calendar reads as a
+    /// conforming three-level tariff with one level unreachable.
+    #[test]
+    fn a_wrapping_band_written_as_one_window_is_caught() {
+        let broken = Zaehlzeitdefinition {
+            id: "NB-BROKEN".to_owned(),
+            valid_from: date!(2026 - 01 - 01),
+            valid_to: Some(date!(2026 - 12 - 31)),
+            windows: vec![
+                ZaehlzeitFenster::new(HT, 17 * 60, 20 * 60),
+                ZaehlzeitFenster::new(NT, 22 * 60, 6 * 60), // never matches
+            ],
+            fallback_register: Some(ST.to_owned()),
+            holiday_land: None,
+            netzbetreiber: None,
+        };
+
+        // Everything else about it looks right, which is why this needs saying.
+        assert_eq!(broken.registers(), vec![HT, NT, ST]);
+        assert_eq!(
+            broken.register_for(datetime!(2026-01-05 22:00 UTC)),
+            Some(ST),
+            "23:00 local should be NT and is not",
+        );
+
+        let (verdict, findings) = assess_modul_3(&broken, &ctx());
+        assert_eq!(verdict, Modul3Conformance::Violates);
+        assert!(
+            findings.contains(&Modul3Finding::RegisterNeverReached),
+            "{findings:?}",
+        );
+
+        // Split into the two windows it needs, and it conforms.
+        let fixed = Zaehlzeitdefinition {
+            windows: {
+                let mut w = vec![ZaehlzeitFenster::new(HT, 17 * 60, 20 * 60)];
+                w.extend(ZaehlzeitFenster::spanning(NT, 22 * 60, 6 * 60));
+                w
+            },
+            ..broken
+        };
+        assert_eq!(
+            assess_modul_3(&fixed, &ctx()).0,
+            Modul3Conformance::Conforms
+        );
+    }
+
+    /// A month-restricted window that leaves another register to cover the gap
+    /// varies across the year even though the Hochtarif does not move.
+    /// Comparing only the HT and the uncovered minutes missed it.
+    #[test]
+    fn a_seasonal_swap_between_nt_and_st_varies_across_the_year() {
+        let mut zzd = Zaehlzeitdefinition::modul_3(
+            "NB-1",
+            date!(2026 - 01 - 01),
+            (17 * 60, 20 * 60),
+            (22 * 60, 6 * 60),
+        )
+        .until(date!(2026 - 12 - 31));
+
+        // Restrict only the Niedertarif to the winter half. HT is untouched and
+        // the ST fallback still covers every minute, so neither the Hochtarif
+        // total nor the uncovered total moves — only the NT/ST split does.
+        for w in &mut zzd.windows {
+            if w.register_id == NT {
+                w.months_mask = 0b1100_0000_0011;
+            }
+        }
+
+        let (verdict, findings) = assess_modul_3(&zzd, &ctx());
+        assert_eq!(verdict, Modul3Conformance::Violates);
+        assert!(
+            findings.contains(&Modul3Finding::WindowsVaryAcrossTheYear),
+            "{findings:?}",
+        );
+        assert!(
+            !findings.contains(&Modul3Finding::HochtarifBelowTwoHours),
+            "the Hochtarif itself is fine: {findings:?}",
+        );
+        assert!(
+            !findings.contains(&Modul3Finding::TimeNotFullyCovered),
+            "and every minute still books somewhere: {findings:?}",
+        );
+    }
+
+    /// Reachability is judged over every month and day class, so a register
+    /// that applies only on Sundays is still reachable.
+    #[test]
+    fn a_register_used_on_one_day_class_is_reachable() {
+        let mut zzd = Zaehlzeitdefinition::modul_3(
+            "NB-1",
+            date!(2026 - 01 - 01),
+            (17 * 60, 20 * 60),
+            (22 * 60, 6 * 60),
+        )
+        .until(date!(2026 - 12 - 31));
+        for w in &mut zzd.windows {
+            if w.register_id == NT {
+                w.days = DayGroup::Weekdays;
+            }
+        }
+        let findings = assess_modul_3(&zzd, &ctx()).1;
+        assert!(
+            !findings.contains(&Modul3Finding::RegisterNeverReached),
+            "{findings:?}",
+        );
+        // …though restricting it that way does make the year vary by day class,
+        // which is a different question the profile comparison does not ask.
+        assert!(!findings.contains(&Modul3Finding::WindowsVaryAcrossTheYear));
     }
 }

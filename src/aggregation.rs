@@ -130,11 +130,16 @@ pub struct BillingPeriod {
     /// `None` when the config disables it or nothing billable was supplied.
     pub spitzenleistung_kw: Option<Decimal>,
 
-    /// The interval the Spitzenleistung was reached in.
+    /// The interval the Spitzenleistung was **first** reached in.
     ///
     /// The Leistungspreis is the single most disputed line on an RLM invoice
     /// and "48 kW" is not an answer to "when?". `None` whenever
     /// [`spitzenleistung_kw`](Self::spitzenleistung_kw) is.
+    ///
+    /// A flat load reaches its maximum in many intervals, so the tie is broken
+    /// by the **earliest** `from` rather than by whichever the caller listed
+    /// first — see [`aggregate`].
+    #[cfg_attr(feature = "serde", serde(with = "crate::wire::rfc3339_option"))]
     pub spitzenleistung_at: Option<OffsetDateTime>,
 
     /// Number of intervals that contributed to the Arbeitsmenge.
@@ -156,6 +161,13 @@ pub struct BillingPeriod {
     /// Measured against [`AggregationConfig::period`] when set, and against the
     /// extent of the data otherwise — in which case it can only detect interior
     /// gaps. See that field.
+    ///
+    /// Only **billable** intervals contribute, because this figure answers
+    /// *"can this period be invoiced"*.
+    /// [`QualityReport::coverage_pct`](crate::QualityReport::coverage_pct)
+    /// counts every delivered interval, because it answers *"did the data
+    /// arrive"*. A day of `Faulty` quarter-hours is 100 % covered there and
+    /// 0 % here, and that divergence is the point rather than a discrepancy.
     pub coverage_pct: f64,
 }
 
@@ -165,6 +177,11 @@ pub struct BillingPeriod {
 /// maximum, two counts, a covered duration — is order-independent by
 /// construction, so shuffled input gives an identical result in a single pass
 /// with no allocation.
+///
+/// A maximum can be reached in several intervals, so
+/// [`BillingPeriod::spitzenleistung_at`] breaks the tie by the **earliest**
+/// interval start: a flat load reports the first quarter-hour it hit its peak
+/// in, whatever order the series arrived in.
 ///
 /// Only intervals where `quality.is_billable()` contribute to the result.
 ///
@@ -208,9 +225,11 @@ pub fn aggregate(intervals: &[MeterInterval], config: &AggregationConfig) -> Bil
         earliest = Some(earliest.map_or(iv.from, |e: OffsetDateTime| e.min(iv.from)));
         latest = Some(latest.map_or(iv.to, |l: OffsetDateTime| l.max(iv.to)));
 
+        // A higher power wins; an equal one wins only if it happened earlier,
+        // so the answer does not depend on the order the slice arrived in.
         if config.include_spitzenleistung
             && let Some(kw) = iv.demand_kw()
-            && peak.is_none_or(|(best, _)| kw > best)
+            && peak.is_none_or(|(best, at)| kw > best || (kw == best && iv.from < at))
         {
             peak = Some((kw, iv.from));
         }
@@ -360,5 +379,34 @@ mod order_tests {
             a.spitzenleistung_at,
             Some(base + time::Duration::minutes(15))
         );
+    }
+
+    /// A flat load reaches its maximum in every interval, and
+    /// `spitzenleistung_at` is the one quantity here a tie can make depend on
+    /// the slice order.
+    #[test]
+    fn a_tied_peak_reports_the_earliest_interval() {
+        let base = datetime!(2026-01-01 0:00 UTC);
+        let flat: Vec<MeterInterval> = (0..4)
+            .map(|i| MeterInterval {
+                from: base + time::Duration::minutes(i * 15),
+                to: base + time::Duration::minutes(i * 15 + 15),
+                value: dec!(5),
+                quality: QualityFlag::Measured,
+                obis_code: None,
+            })
+            .collect();
+        let mut reversed = flat.clone();
+        reversed.reverse();
+
+        let forward = aggregate(&flat, &AggregationConfig::rlm());
+        let backward = aggregate(&reversed, &AggregationConfig::rlm());
+        assert_eq!(forward, backward);
+        assert_eq!(
+            forward.spitzenleistung_at,
+            Some(base),
+            "the first quarter-hour the peak was reached in, not the first listed"
+        );
+        assert_eq!(forward.spitzenleistung_kw, Some(dec!(20)));
     }
 }

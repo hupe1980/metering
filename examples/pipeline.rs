@@ -140,10 +140,7 @@ fn main() {
     let registers = zzd.split_energy(&filled.intervals);
     println!("\n6. Zählzeitregister");
     for name in [HT, NT, ST] {
-        let kwh = registers
-            .get(&Some(name.to_owned()))
-            .copied()
-            .unwrap_or_default();
+        let kwh = registers.get(&Some(name)).copied().unwrap_or_default();
         println!("     {name}  {kwh:>10} kWh");
     }
 
@@ -217,7 +214,7 @@ fn fill(
 fn check_invariants(
     intervals: &[metering::MeterInterval],
     period: &metering::BillingPeriod,
-    registers: &std::collections::BTreeMap<Option<String>, Decimal>,
+    registers: &std::collections::BTreeMap<Option<&str>, Decimal>,
     expected: u32,
 ) {
     assert_eq!(

@@ -1,0 +1,10 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 2cd321d1689d03b64eebde4fb2958c5f2dfa70a86af0fbcf78445ea71ee0b75e # shrinks to picks = [4, 2]
+cc 3196aa0902afa90295a2558cdf3c6d83cef8d1b7803b4c734a7989d06c78eca1 # shrinks to samples = [Sample { slot: 0, value: 0.000, quality: Substituted, shuffle_key: 1 }, Sample { slot: 2, value: 0.000, quality: Corrected, shuffle_key: 0 }]
+cc 9ec5fe72c636178c08a1e82ca3133b3fb860053cf15fdd56c426865c67d6d051 # shrinks to samples = [Sample { slot: 0, value: 18.500, quality: Measured, shuffle_key: 8880823250940059573 }, Sample { slot: 1, value: 18.500, quality: Measured, shuffle_key: 0 }]
+cc 9afe6dbab13443f9319ce625544930c5318ae1039500f2c121ad323b09ec3b3a # shrinks to samples = [Sample { slot: 159, value: 0.000, quality: Measured, shuffle_key: 3779987540142315764 }, Sample { slot: 160, value: 0.000, quality: Measured, shuffle_key: 0 }]

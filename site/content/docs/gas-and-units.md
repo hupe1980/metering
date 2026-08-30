@@ -1,7 +1,7 @@
 +++
 title = "Gas conversion and units"
 description = "m³ to kWh_Hs under MessEG and DVGW G 685, the SigLinDe gas SLP arithmetic, the 06:00 Gastag, and unit normalisation that refuses to guess."
-weight = 8
+weight = 9
 +++
 
 ## The formula and why it is lawful
@@ -56,14 +56,36 @@ setting rather than a hard-coded claim.
 use metering::{GasConversionParams, normalize_to_kwh};
 use rust_decimal::dec;
 
-let gas = GasConversionParams { hs_kwh_per_m3: dec!(10.55), zustandszahl: dec!(0.98) };
+let gas = GasConversionParams::new(dec!(10.55), dec!(0.98));
 assert_eq!(normalize_to_kwh(dec!(100), "m3", Some(&gas), None)?, dec!(1033.900));
 assert_eq!(normalize_to_kwh(dec!(3.6), "GJ", None, None)?, dec!(1000)); // exactly
 assert_eq!(normalize_to_kwh(dec!(48), "kW", None, Some(900))?, dec!(12));
 
 // An unknown unit is an error, not a silent pass-through as kWh.
 assert!(normalize_to_kwh(dec!(1), "furlong", None, None).is_err());
-# Ok::<(), metering::conversion::ConversionError>(())
+# Ok::<(), metering::ConversionError>(())
+```
+
+### Pass a Betriebsvolumen, or say you are not
+
+`GasConversionParams` has **no `Default`**, and no "typical Erdgas H" preset.
+Both fields are operator data published per supply area and billing period, and
+a stand-in Brennwert is a direct multiplier on a billed quantity: 10.55 against
+a real 11.20 understates every gas invoice in the portfolio by 6 %, with nothing
+in the output to show for it.
+
+For a volume the Mengenumwerter has already state-converted — `7-0:13.2.0`
+Normvolumen umgewertet, or `7-0:3.2.0` Normvolumen gemessen — the Zustandszahl
+has already been applied, and applying it again overstates the energy by its
+deviation from unity:
+
+```rust
+use metering::{GasConversionParams, normalize_to_kwh};
+use rust_decimal::dec;
+
+let normvolumen = GasConversionParams::already_converted(dec!(11.2));
+assert_eq!(normalize_to_kwh(dec!(100), "m3", Some(&normvolumen), None)?, dec!(1120.0));
+# Ok::<(), metering::ConversionError>(())
 ```
 
 `MeasurementUnit::parse_scaled` accepts device symbols (kWh, Wh, MWh, GJ, MJ,

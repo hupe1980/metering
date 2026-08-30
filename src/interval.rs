@@ -226,8 +226,19 @@ impl FromStr for MeasurementUnit {
 /// that unit into the canonical [`MeasurementUnit`].
 ///
 /// The factor is kept as a numerator/denominator pair rather than a single
-/// `Decimal` because the useful ones repeat: 1 GJ is 277.7… kWh. Multiplying
-/// before dividing keeps the result exact.
+/// `Decimal` because the useful ones repeat: 1 GJ is 277.7… kWh. Storing
+/// `277.777…8` and multiplying by it would round **twice** — once when the
+/// factor was written down and once per reading — and the error would be
+/// systematic rather than symmetric.
+///
+/// Multiplying before dividing rounds **once**, at the end. That makes the
+/// conversion exact wherever the quotient terminates, which covers every
+/// decimal-power unit (Wh, MWh, GWh, litres) and the identities the rationals
+/// are chosen to satisfy — 3.6 GJ is exactly 1 000 kWh, 18 MJ exactly 5 kWh,
+/// 3.6 × 10⁶ J exactly 1 kWh. For an input whose quotient does not terminate
+/// the result is correctly rounded to `Decimal`'s width, once, and `apply(v) ×
+/// den` will not equal `v × num` digit for digit. See the crate-level
+/// **What "exact" means here**.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UnitScale {
     /// The canonical unit the value converts into.
@@ -346,8 +357,9 @@ impl QualityFlag {
         matches!(self, Self::Preliminary | Self::Estimated)
     }
 
-    /// How far this flag is from a plain measured value, on a total order from
-    /// `0` (`Measured`) to `5` (`Faulty` / `Unknown`).
+    /// How far this flag is from a plain measured value, on a **strict** total
+    /// order from `0` ([`Measured`](Self::Measured)) to `7`
+    /// ([`Unknown`](Self::Unknown)).
     ///
     /// Aggregating a set of intervals into one bucket has to give the bucket a
     /// single flag, and the only defensible choice is the worst contributor —
@@ -355,22 +367,52 @@ impl QualityFlag {
     /// total. The ranking is public so that every aggregation in and outside
     /// this crate reaches the same verdict.
     ///
+    /// **No two flags share a rank**, and that is load-bearing rather than
+    /// tidy. [`worse_of`](Self::worse_of) keeps `self` on a tie, so a shared
+    /// rank would make [`worst_of`](Self::worst_of) — and with it every bucket
+    /// quality in [`mod@crate::resample`] and [`crate::virtual_meter`] — depend
+    /// on the order the caller supplied the intervals in.
+    ///
     /// The order is by how far the value is from a measurement, not by
-    /// billability: `Preliminary` outranks `Estimated` because it is explicitly
-    /// subject to revision, and both are billable.
+    /// billability:
+    ///
+    /// | Rank | Flag | Why here |
+    /// |---|---|---|
+    /// | 0 | `Measured` | the measurement itself |
+    /// | 1 | `Calculated` | derived from measurements, arithmetically |
+    /// | 2 | `Corrected` | measured, then revised — a measurement stands behind it |
+    /// | 3 | `Substituted` | never measured; reconstructed from other values |
+    /// | 4 | `Estimated` | a forecast, not a reconstruction |
+    /// | 5 | `Preliminary` | billable, and explicitly subject to revision |
+    /// | 6 | `Faulty` | known bad |
+    /// | 7 | `Unknown` | not even known to be bad |
+    ///
+    /// ```rust
+    /// use metering::QualityFlag;
+    ///
+    /// // Distinct ranks, so the worst of a set does not depend on its order.
+    /// let a = [QualityFlag::Corrected, QualityFlag::Substituted];
+    /// let b = [QualityFlag::Substituted, QualityFlag::Corrected];
+    /// assert_eq!(QualityFlag::worst_of(a), QualityFlag::worst_of(b));
+    /// ```
     #[must_use]
     pub const fn severity_rank(self) -> u8 {
         match self {
             Self::Measured => 0,
             Self::Calculated => 1,
-            Self::Corrected | Self::Substituted => 2,
-            Self::Estimated => 3,
-            Self::Preliminary => 4,
-            Self::Faulty | Self::Unknown => 5,
+            Self::Corrected => 2,
+            Self::Substituted => 3,
+            Self::Estimated => 4,
+            Self::Preliminary => 5,
+            Self::Faulty => 6,
+            Self::Unknown => 7,
         }
     }
 
     /// The worse of two flags, by [`severity_rank`](Self::severity_rank).
+    ///
+    /// Commutative, associative and idempotent — the ranks are distinct — so
+    /// folding it over a set is order-independent.
     #[must_use]
     pub const fn worse_of(self, other: Self) -> Self {
         if other.severity_rank() > self.severity_rank() {
@@ -384,7 +426,8 @@ impl QualityFlag {
     /// is empty.
     ///
     /// An empty set has no measurement to speak for it, so the neutral answer
-    /// is "not known" rather than "measured".
+    /// is "not known" rather than "measured" — and `Unknown` being the maximum
+    /// rank makes that the same answer either way.
     #[must_use]
     pub fn worst_of(flags: impl IntoIterator<Item = Self>) -> Self {
         flags
@@ -463,8 +506,10 @@ crate::codes::string_codes! {
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct MeterInterval {
     /// Interval start (UTC, inclusive).
+    #[cfg_attr(feature = "serde", serde(with = "crate::wire::rfc3339"))]
     pub from: OffsetDateTime,
     /// Interval end (UTC, exclusive).
+    #[cfg_attr(feature = "serde", serde(with = "crate::wire::rfc3339"))]
     pub to: OffsetDateTime,
     /// The metered quantity, in the Sparte's own unit — see the type docs.
     pub value: Decimal,
@@ -599,6 +644,41 @@ mod tests {
         assert!(!QualityFlag::Unknown.is_billable());
     }
 
+    /// Distinct ranks are what make `worst_of` order-independent — the
+    /// property every bucket quality in the crate rests on.
+    #[test]
+    fn severity_ranks_are_a_strict_total_order() {
+        let ranks: Vec<u8> = QualityFlag::ALL.iter().map(|q| q.severity_rank()).collect();
+        let unique: std::collections::BTreeSet<u8> = ranks.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            QualityFlag::ALL.len(),
+            "every flag needs its own rank, or worse_of breaks ties by argument order: {ranks:?}"
+        );
+
+        // Commutative over every pair, which is exactly what a tie would break.
+        for a in QualityFlag::ALL {
+            for b in QualityFlag::ALL {
+                assert_eq!(a.worse_of(b), b.worse_of(a), "{a} vs {b}");
+            }
+        }
+
+        // ...so shuffling a set cannot change its worst flag.
+        let set = QualityFlag::ALL;
+        let mut reversed = set;
+        reversed.reverse();
+        assert_eq!(QualityFlag::worst_of(set), QualityFlag::worst_of(reversed));
+        assert_eq!(QualityFlag::worst_of(set), QualityFlag::Unknown);
+        assert_eq!(QualityFlag::worst_of([]), QualityFlag::Unknown);
+
+        // A measurement outranks everything derived from one.
+        assert_eq!(QualityFlag::Measured.severity_rank(), 0);
+        assert!(
+            QualityFlag::Corrected.severity_rank() < QualityFlag::Substituted.severity_rank(),
+            "a corrected value has a measurement behind it; a substitute does not"
+        );
+    }
+
     #[test]
     fn quality_flag_provisional() {
         assert!(QualityFlag::Estimated.is_provisional());
@@ -684,7 +764,9 @@ mod media_tests {
     }
 
     /// GJ→kWh is 2500/9, a repeating decimal. Holding it as a rational and
-    /// multiplying before dividing keeps the conversion exact.
+    /// multiplying before dividing keeps the *defining* identities exact —
+    /// 3.6 GJ is 1 000 kWh and 9 GJ is 2 500 kWh, to the digit — where a
+    /// stored `277.777…8` factor would not.
     #[test]
     fn gigajoule_conversion_is_exact() {
         let gj = MeasurementUnit::parse_scaled("GJ").unwrap();

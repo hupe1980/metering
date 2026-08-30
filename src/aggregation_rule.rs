@@ -80,6 +80,7 @@ use serde::{Deserialize, Serialize};
 /// per delivery point in a queryable document; the hot types a binary format is
 /// chosen for ([`MeterInterval`](crate::MeterInterval),
 /// [`ObisCode`](crate::ObisCode)) are unaffected.
+/// `tests/serde_representation.rs` holds both halves.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[cfg_attr(

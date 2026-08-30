@@ -451,16 +451,8 @@ fn ht_nt_weekday_split() {
     ];
     let zzd = Zaehlzeitdefinition::ht_nt("NB-1", date!(2026 - 01 - 01), 6 * 60, 22 * 60);
     let split = zzd.split_energy(&intervals);
-    assert_eq!(
-        split[&Some(HT.to_owned())],
-        dec!(4.0),
-        "daytime weekday = HT"
-    );
-    assert_eq!(
-        split[&Some(NT.to_owned())],
-        dec!(1.0),
-        "nighttime weekday = NT"
-    );
+    assert_eq!(split[&Some(HT)], dec!(4.0), "daytime weekday = HT");
+    assert_eq!(split[&Some(NT)], dec!(1.0), "nighttime weekday = NT");
 
     // The split reconstructs the Arbeitsmenge exactly.
     let period = aggregate(&intervals, &AggregationConfig::rlm());
@@ -481,11 +473,8 @@ fn ht_nt_weekend_all_nt() {
     }];
     let zzd = Zaehlzeitdefinition::ht_nt("NB-1", date!(2026 - 01 - 01), 6 * 60, 22 * 60);
     let split = zzd.split_energy(&intervals);
-    assert!(
-        !split.contains_key(&Some(HT.to_owned())),
-        "Saturday morning = NT"
-    );
-    assert_eq!(split[&Some(NT.to_owned())], dec!(3.0));
+    assert!(!split.contains_key(&Some(HT)), "Saturday morning = NT");
+    assert_eq!(split[&Some(NT)], dec!(3.0));
 }
 
 /// §14a EnWG Modul 3 — three tariff levels, mandatory for every Netzbetreiber
@@ -517,9 +506,9 @@ fn modul_3_splits_a_day_into_three_registers() {
     let split = zzd.split_energy(&intervals);
     // HT 17:00–20:00 is 3 h; NT 22:00–24:00 plus 00:00–06:00 is 8 h; ST the
     // remaining 13 h.
-    assert_eq!(split[&Some(HT.to_owned())], dec!(12));
-    assert_eq!(split[&Some(NT.to_owned())], dec!(32));
-    assert_eq!(split[&Some(ST.to_owned())], dec!(52));
+    assert_eq!(split[&Some(HT)], dec!(12));
+    assert_eq!(split[&Some(NT)], dec!(32));
+    assert_eq!(split[&Some(ST)], dec!(52));
 
     let period = aggregate(&intervals, &AggregationConfig::rlm());
     assert_eq!(split.values().sum::<Decimal>(), period.arbeitsmenge);

@@ -132,6 +132,7 @@ pub struct MeterLifecycleEvent {
     /// Type of lifecycle event.
     pub event_type: MeterLifecycleEventType,
     /// When the event occurred (UTC).
+    #[cfg_attr(feature = "serde", serde(with = "crate::wire::rfc3339"))]
     pub occurred_at: OffsetDateTime,
     /// The meter reading at the time of the event (kWh).
     /// `None` when not applicable (e.g., firmware update).
@@ -193,6 +194,7 @@ pub struct MeterExchangeEvent {
     /// second copy of one fact is a second thing to keep in step, and the
     /// timestamp is the one that decides: 23:30 UTC on 14 June is already
     /// 15 June in Berlin, and a hand-filled date field said otherwise.
+    #[cfg_attr(feature = "serde", serde(with = "crate::wire::rfc3339"))]
     pub exchange_at: OffsetDateTime,
     /// BDEW PID that triggered this exchange (typically 23003).
     pub triggered_by_pid: Option<u32>,

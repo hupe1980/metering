@@ -58,7 +58,7 @@ use time::OffsetDateTime;
 use serde::{Deserialize, Serialize};
 
 use crate::aggregation_rule::VirtualMeterKind;
-use crate::ids::{MaloId, MeloId};
+use crate::ids::{BdewCode, MaloId, MeloId};
 use crate::interval::{MeterInterval, QualityFlag};
 use crate::obis::ObisCode;
 use crate::resolution::IntervalResolution;
@@ -91,8 +91,8 @@ pub enum MeasurementSource {
         pid: u32,
         /// EDIFACT message reference.
         message_ref: Option<String>,
-        /// BDEW Codenummer of the sending NB/MSB.
-        sender_mp_id: String,
+        /// Marktpartner-ID of the sending NB/MSB — see [`BdewCode`].
+        sender_mp_id: BdewCode,
     },
 
     /// iMSys / SMGW direct push — bypasses EDIFACT pipeline.
@@ -127,8 +127,16 @@ pub enum MeasurementSource {
 
     /// A retroactive correction, applied when an earlier value was found wrong.
     RetroactiveCorrection {
-        /// ID of the original meter_read_corrections row.
-        correction_id: uuid::Uuid,
+        /// Reference to the correction record in the caller's own system.
+        ///
+        /// A `String`, like every other external reference in this enum. It
+        /// was a `uuid::Uuid`, which is a claim about the *consumer's*
+        /// primary-key scheme that this crate has no business making — and it
+        /// made `uuid` a mandatory dependency for one field the crate never
+        /// constructs, parses or validates, dragging `getrandom`'s system
+        /// entropy source into a library whose first promise is that it reads
+        /// no ambient state.
+        correction_ref: String,
         /// Who applied the correction.
         corrected_by: String,
     },
@@ -185,6 +193,7 @@ impl MeasurementSource {
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct ProvenanceEntry {
     /// When this event occurred (UTC).
+    #[cfg_attr(feature = "serde", serde(with = "crate::wire::rfc3339"))]
     pub occurred_at: OffsetDateTime,
     /// What kind of event this was.
     pub event_type: ProvenanceEventType,
@@ -444,7 +453,6 @@ mod tests {
     use crate::obis::ObisCode;
     use rust_decimal::dec;
     use time::{Duration, macros::datetime};
-    use uuid::Uuid;
 
     const INGEST: OffsetDateTime = datetime!(2026-01-02 09:30 UTC);
 
@@ -466,7 +474,7 @@ mod tests {
         MeasurementSource::Mscons {
             pid: 13005,
             message_ref: None,
-            sender_mp_id: "9900357000004".to_owned(),
+            sender_mp_id: "9900357000004".parse().unwrap(),
         }
     }
 
@@ -632,7 +640,7 @@ mod tests {
                 reason: crate::substitute::SubstitutionReason::MeterFault,
             },
             MeasurementSource::RetroactiveCorrection {
-                correction_id: Uuid::nil(),
+                correction_ref: "corr-2026-0001".to_owned(),
                 corrected_by: "op".into(),
             },
             MeasurementSource::VirtualMeter {

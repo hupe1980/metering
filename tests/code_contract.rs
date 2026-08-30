@@ -17,8 +17,11 @@
 //!    pin a `CHECK` constraint to `CODES` and know the two cannot drift.
 //! 6. **An unknown code is an error**, never a silent default.
 //!
-//! Adding an enum without adding it here is the only way to escape, so the
-//! list below is itself part of the contract.
+//! The list below is itself part of the contract, and
+//! [`no_coded_enum_escapes_this_file`] holds it there: it reads the crate
+//! source, collects every type the `string_codes!` macro is applied to, and
+//! fails if one of them is missing from the list. A comment saying "remember to
+//! add it here" is not a mechanism.
 
 use metering::*;
 
@@ -117,14 +120,14 @@ fn every_coded_enum_holds_the_contract() {
     use metering::classification::SeriesOrigin;
     use metering::conversion::G685FinalRounding;
     use metering::holiday::Holiday;
-    use metering::ids::MaloIssuer;
+    use metering::ids::{CodeVergabestelle, MaloIssuer};
     use metering::lifecycle::{MeterLifecycleEventType, MeterStatus};
     use metering::load_profile::SlpDayType;
     use metering::measurement_series::ProvenanceEventType;
     use metering::obis::RegisterUnit;
     use metering::reading::AnomalyKind;
     use metering::rollout::QuotaScope;
-    use metering::zaehlzeit::DayGroup;
+    use metering::zaehlzeit::{DayGroup, Modul3Conformance, Modul3Finding, Quarter};
 
     // interval / quantities
     assert_contract!(Sparte);
@@ -132,7 +135,9 @@ fn every_coded_enum_holds_the_contract() {
 
     // identifiers and channels
     assert_contract!(MaloIssuer);
+    assert_contract!(CodeVergabestelle);
     assert_contract!(RegisterUnit);
+    assert_contract!(Phase);
 
     // calendar and profiles
     assert_contract!(DayKind);
@@ -152,6 +157,9 @@ fn every_coded_enum_holds_the_contract() {
     assert_contract!(Messtyp);
     assert_contract!(SeriesOrigin);
     assert_contract!(DayGroup);
+    assert_contract!(Quarter);
+    assert_contract!(Modul3Finding);
+    assert_contract!(Modul3Conformance);
     assert_contract!(G685FinalRounding);
 
     // master data and lifecycle
@@ -163,6 +171,8 @@ fn every_coded_enum_holds_the_contract() {
     assert_contract!(VirtualMeterKind);
 
     // regulatory classification
+    assert_contract!(SteuVeFallgruppe);
+    assert_contract!(Verursachungsregel);
     assert_contract!(RolloutObligation);
     assert_contract!(QuotaScope);
     assert_contract!(EligibilityBasis);
@@ -274,4 +284,90 @@ fn validation_rule_ids_are_the_vnn_codes_everywhere() {
     assert!("V10".parse::<ValidationRuleId>().is_err());
     assert!(!ValidationRuleId::CODES.contains(&"V10"));
     assert_eq!(ValidationRuleId::CODES.len(), 11);
+}
+
+/// Every `string_codes!` type appears in [`every_coded_enum_holds_the_contract`].
+///
+/// The macro is the crate's single definition of "this is a coded enum", so the
+/// set of types it is applied to is the set the contract must cover. Reading it
+/// out of the source is crude, and it is the only way to make the list above
+/// self-maintaining: nothing in Rust lets a test enumerate the types a macro was
+/// invoked on, so without this a new enum joins the crate with no contract at
+/// all and every existing assertion still passes.
+///
+/// This is a test, so it may read files; the no-I/O guarantee is about `src/`.
+#[test]
+fn no_coded_enum_escapes_this_file() {
+    use std::collections::BTreeSet;
+
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+
+    // Types the macro is applied to, from every `string_codes! { … }` block.
+    let mut coded: BTreeSet<String> = BTreeSet::new();
+    let src = std::fs::read_dir(root.join("src")).expect("src/ is readable");
+    for entry in src {
+        let path = entry.expect("readable entry").path();
+        if path.extension().is_none_or(|e| e != "rs") {
+            continue;
+        }
+        let text = std::fs::read_to_string(&path).expect("readable source");
+        let mut rest = text.as_str();
+        while let Some(start) = rest.find("crate::codes::string_codes! {") {
+            let body = &rest[start..];
+            let open = body.find('{').expect("the macro body opens");
+            let close = body.find("\n}").expect("the macro body closes");
+            for line in body[open + 1..close].lines() {
+                let line = line.trim();
+                if line.is_empty() || line.starts_with("//") {
+                    continue;
+                }
+                // `Ty;` or `Ty, aliases = [...];`
+                let name = line
+                    .split([',', ';'])
+                    .next()
+                    .unwrap_or_default()
+                    .trim()
+                    .to_owned();
+                if name.starts_with(char::is_uppercase) {
+                    coded.insert(name);
+                }
+            }
+            rest = &body[close..];
+        }
+    }
+    assert!(
+        coded.len() > 30,
+        "the scan found only {} types — it has stopped working, not the crate",
+        coded.len()
+    );
+
+    // Types this file asserts the contract for.
+    let this_file = std::fs::read_to_string(root.join("tests/code_contract.rs"))
+        .expect("this test file is readable");
+    let asserted: BTreeSet<String> = this_file
+        .match_indices("assert_contract!(")
+        .filter_map(|(i, m)| {
+            let tail = &this_file[i + m.len()..];
+            tail.find(')').map(|end| tail[..end].trim().to_owned())
+        })
+        // The macro name also occurs inside this file's own prose; only a
+        // type-shaped argument is a real invocation.
+        .filter(|name| {
+            name.starts_with(char::is_uppercase)
+                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        })
+        .collect();
+
+    let missing: Vec<&String> = coded.difference(&asserted).collect();
+    assert!(
+        missing.is_empty(),
+        "coded enums with no contract assertion: {missing:?} — add \
+         `assert_contract!(…)` to every_coded_enum_holds_the_contract"
+    );
+
+    let stale: Vec<&String> = asserted.difference(&coded).collect();
+    assert!(
+        stale.is_empty(),
+        "asserted types that are no longer coded enums: {stale:?}"
+    );
 }

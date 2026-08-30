@@ -39,12 +39,17 @@ use crate::interval::MeterInterval;
 /// `observed_days` counts **Europe/Berlin calendar days** and the year factor
 /// is the target year's real length, so neither a DST transition inside the
 /// observation window nor a leap day skews the result.
+///
+/// The result is cut to [`FORECAST_DP`] places; the division that produces it
+/// does not generally terminate.
 #[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct AnnualForecast {
     /// Start of the observation window (earliest interval start).
+    #[cfg_attr(feature = "serde", serde(with = "crate::wire::rfc3339"))]
     pub observation_from: OffsetDateTime,
     /// End of the observation window (latest interval end).
+    #[cfg_attr(feature = "serde", serde(with = "crate::wire::rfc3339"))]
     pub observation_to: OffsetDateTime,
     /// Billable energy observed in the window (kWh).
     pub observed: Decimal,
@@ -52,22 +57,29 @@ pub struct AnnualForecast {
     pub observed_days: u32,
     /// Days in the target year — 366 in a leap year.
     pub target_year_days: u16,
-    /// Projected annual consumption (kWh).
+    /// Projected annual consumption (kWh), cut to [`FORECAST_DP`] places.
     pub projected_annual: Decimal,
     /// Seasonal correction factor; `1` when none was applied.
     pub seasonal_factor: Decimal,
-    /// Whether prior-year data was available to correct for seasonality.
+    /// Whether a seasonal factor could be derived from prior-year data.
     ///
     /// An uncorrected projection from a January window overstates the year for
     /// a heating-dominated load and understates it for a cooling-dominated one.
     /// The flag exists so a caller can refuse to bill on one.
+    ///
+    /// It records whether the **correction ran**, not whether it moved the
+    /// number: a window whose prior-year rate equals the prior year's overall
+    /// rate produces a factor of exactly `1`, and that is a corrected
+    /// projection rather than an uncorrected one.
     pub seasonal_correction_applied: bool,
-    /// Lower bound of the 95 % prediction interval (kWh), clamped at zero.
+    /// Lower bound of the 95 % prediction interval (kWh), clamped at zero and
+    /// cut to [`FORECAST_DP`] places.
     ///
     /// See [`AnnualForecast::prediction_interval_note`] for what it does and
     /// does not claim. `None` when fewer than two whole days were observed.
     pub confidence_lower: Option<Decimal>,
-    /// Upper bound of the 95 % prediction interval (kWh).
+    /// Upper bound of the 95 % prediction interval (kWh), cut to
+    /// [`FORECAST_DP`] places.
     pub confidence_upper: Option<Decimal>,
 }
 
@@ -107,6 +119,20 @@ impl AnnualForecast {
         self.observed / Decimal::from(self.observed_days)
     }
 }
+
+/// Decimal places a projected quantity is cut to: **3**, a milliwatt-hour.
+///
+/// The projection divides — `observed ÷ observed_days` — so its quotient does
+/// not generally terminate, and an annual figure carrying twenty-eight
+/// significant digits is not a quantity anyone can put on an Abschlag. Cutting
+/// it makes every reported number representable; the granularity is four orders
+/// of magnitude below anything the market settles.
+///
+/// [`AnnualForecast::projected_annual`] is therefore homogeneous only to its
+/// last reported place: doubling every reading doubles the projection to within
+/// `2 × 10⁻³` kWh rather than exactly, because `round(2x) ≠ 2·round(x)` at a
+/// rounding boundary. See the crate-level **What "exact" means here**.
+pub const FORECAST_DP: u32 = 3;
 
 /// The minimum observation window that yields a projection.
 ///
@@ -182,10 +208,12 @@ pub fn project_annual_consumption(
     let target_year_days = crate::calendar::days_in_year(target_year);
     let daily_avg = observed / Decimal::from(observed_days);
 
-    let seasonal_factor = prior_year_intervals
-        .and_then(|prior| seasonal_factor(first_from, last_to, prior))
-        .unwrap_or(Decimal::ONE);
-    let seasonal_correction_applied = seasonal_factor != Decimal::ONE;
+    // The flag says whether the correction ran, not whether the factor differs
+    // from 1 — a legitimately neutral factor is still a correction.
+    let derived_factor =
+        prior_year_intervals.and_then(|prior| seasonal_factor(first_from, last_to, prior));
+    let seasonal_correction_applied = derived_factor.is_some();
+    let seasonal_factor = derived_factor.unwrap_or(Decimal::ONE);
 
     let projected = daily_avg * Decimal::from(target_year_days) * seasonal_factor;
 
@@ -197,11 +225,12 @@ pub fn project_annual_consumption(
         observed,
         observed_days,
         target_year_days,
-        projected_annual: projected.round_dp(3),
+        projected_annual: projected.round_dp(FORECAST_DP),
         seasonal_factor,
         seasonal_correction_applied,
-        confidence_lower: half_width.map(|h| (projected - h).max(Decimal::ZERO).round_dp(3)),
-        confidence_upper: half_width.map(|h| (projected + h).round_dp(3)),
+        confidence_lower: half_width
+            .map(|h| (projected - h).max(Decimal::ZERO).round_dp(FORECAST_DP)),
+        confidence_upper: half_width.map(|h| (projected + h).round_dp(FORECAST_DP)),
     })
 }
 
@@ -250,7 +279,9 @@ fn prediction_half_width(
     if !half.is_finite() {
         return None;
     }
-    Decimal::try_from(half).ok().map(|d| d.round_dp(3))
+    Decimal::try_from(half)
+        .ok()
+        .map(|d| d.round_dp(FORECAST_DP))
 }
 
 /// The prior year's daily rate over the matching window, relative to its
@@ -576,7 +607,11 @@ mod tests {
             Decimal::ONE,
             "a flat reference is seasonally neutral over any span"
         );
-        assert!(!f.seasonal_correction_applied);
+        assert!(
+            f.seasonal_correction_applied,
+            "the correction ran and found the window neutral — which is not the \
+             same as having no reference to run it against"
+        );
     }
 
     #[test]

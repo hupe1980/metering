@@ -22,8 +22,7 @@
 //!
 //! The **consumption thresholds do not appear here** — the SLP/RLM boundary at
 //! 100 000 kWh/a is a property of the Marktlokation's master data and annual
-//! quantity, neither of which is in a `MeterInterval`. An earlier version of
-//! this table listed those thresholds beside rules that never read them.
+//! quantity, neither of which is in a `MeterInterval`.
 
 use crate::interval::MeterInterval;
 use crate::resolution::IntervalResolution;
@@ -79,13 +78,10 @@ impl Messtyp {
 /// Detect the dominant interval length in a set of meter intervals.
 ///
 /// Uses the median interval duration, so it is robust against gaps and against
-/// the odd short or long interval at a DST transition.
-///
-/// The daily band is deliberately **23–25 hours**: a Berlin calendar day is 23
-/// hours each spring and 25 each autumn, so a daily series legitimately contains
-/// intervals of all three lengths. A median in that band is
-/// [`IntervalResolution::Day`] — the calendar day — rather than a fixed
-/// `Custom(86_400)` window.
+/// the odd short or long interval at a DST transition, and maps it through
+/// [`IntervalResolution::from_observed_seconds`] — the one tolerance table,
+/// shared with [`crate::reading::detect_reading_cadence`], so the two cannot
+/// disagree about what a daily series looks like.
 ///
 /// # Returns
 ///
@@ -105,19 +101,7 @@ pub fn detect_interval_length(intervals: &[MeterInterval]) -> Option<IntervalRes
         return None;
     }
     durations.sort_unstable();
-    let median = durations[durations.len() / 2];
-    Some(match median {
-        750..=1050 => IntervalResolution::QuarterHour, // 900 s ± 150 s
-        1650..=1950 => IntervalResolution::HalfHour,   // 1800 s
-        3300..=3900 => IntervalResolution::Hour,       // 3600 s ± 300 s
-        // 23 h … 25 h — a Berlin calendar day at either DST transition.
-        82_800..=90_000 => IntervalResolution::Day,
-        // Anything else is a non-standard grid. It goes through
-        // `from_seconds`, which normalises: a median landing exactly on a
-        // named length comes back under that name rather than as a second
-        // spelling of it.
-        other => IntervalResolution::from_seconds(u32::try_from(other).ok()?)?,
-    })
+    IntervalResolution::from_observed_seconds(durations[durations.len() / 2])
 }
 
 /// How a series reached the system, where that settles the Messtyp on its own.

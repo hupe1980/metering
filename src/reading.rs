@@ -107,6 +107,7 @@ const fn longest_seconds(resolution: IntervalResolution) -> i64 {
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct MeterReading {
     /// When the register held this value (UTC).
+    #[cfg_attr(feature = "serde", serde(with = "crate::wire::rfc3339"))]
     pub at: OffsetDateTime,
     /// The register value. Cumulative and, absent a rollover, non-decreasing.
     pub value: Decimal,
@@ -154,12 +155,14 @@ impl MeterReading {
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct Rollover {
     /// Start of the span the wrap happened in (the earlier reading).
+    #[cfg_attr(feature = "serde", serde(with = "crate::wire::rfc3339"))]
     pub from: OffsetDateTime,
     /// End of it — the reading at which the wrap became visible.
     ///
     /// Paired with [`from`](Self::from) so a rollover and an [`Anomaly`]
     /// describe the same shape — *what happened between two readings* — and
     /// can share one audit table.
+    #[cfg_attr(feature = "serde", serde(with = "crate::wire::rfc3339"))]
     pub to: OffsetDateTime,
     /// Register value before the wrap.
     pub previous: Decimal,
@@ -190,8 +193,10 @@ impl Rollover {
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct Anomaly {
     /// Start of the affected span (the earlier reading).
+    #[cfg_attr(feature = "serde", serde(with = "crate::wire::rfc3339"))]
     pub from: OffsetDateTime,
     /// End of it (the later reading).
+    #[cfg_attr(feature = "serde", serde(with = "crate::wire::rfc3339"))]
     pub to: OffsetDateTime,
     /// Why the difference was refused.
     pub kind: AnomalyKind,
@@ -634,9 +639,13 @@ pub fn to_lastgang(readings: &[MeterReading], config: &LastgangConfig) -> Lastga
 /// instead, and the `cadence` [`LastgangConfig::with_capacity_kw`] needs.
 ///
 /// Readings are sorted first and the **median** gap is taken, so neither a
-/// missed transmission nor an out-of-order merge moves the answer. The 23–25
-/// hour band makes a daily series a calendar [`Day`](IntervalResolution::Day)
-/// rather than a fixed 86 400 s window.
+/// missed transmission nor an out-of-order merge moves the answer, and the
+/// result comes from [`IntervalResolution::from_observed_seconds`] — the same
+/// tolerance table [`detect_interval_length`] uses, so a daily series is a
+/// calendar [`Day`](IntervalResolution::Day) here and there alike rather than a
+/// fixed 86 400 s window in one of them.
+///
+/// [`detect_interval_length`]: crate::classification::detect_interval_length
 ///
 /// § 2 Satz 1 Nr. 27 MsbG names the two cadences the market defines:
 /// *"viertelstündig ermittelter Zählerstände von elektrischer Arbeit und
@@ -677,16 +686,7 @@ pub fn detect_reading_cadence(readings: &[MeterReading]) -> Option<IntervalResol
         return None;
     }
     gaps.sort_unstable();
-    let median = gaps[gaps.len() / 2];
-
-    Some(match median {
-        750..=1050 => IntervalResolution::QuarterHour, // 900 s ± 150 s
-        1650..=1950 => IntervalResolution::HalfHour,   // 1800 s
-        3300..=3900 => IntervalResolution::Hour,       // 3600 s ± 300 s
-        // 23 h … 25 h — a Berlin calendar day at either DST transition.
-        82_800..=90_000 => IntervalResolution::Day,
-        other => IntervalResolution::from_seconds(u32::try_from(other).ok()?)?,
-    })
+    IntervalResolution::from_observed_seconds(gaps[gaps.len() / 2])
 }
 
 // ── consumption between two readings ──────────────────────────────────────────

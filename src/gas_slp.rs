@@ -235,8 +235,17 @@ impl SigLinDe {
 /// ```
 ///
 /// `t_d` is the forecast for the delivery day, `t_d1`–`t_d3` the three days
-/// before it. The division is exact: the weights are eighths, so the formula
-/// is `(8ϑ_D + 4ϑ_D₋₁ + 2ϑ_D₋₂ + ϑ_D₋₃) / 15` in integers.
+/// before it. The **weights** are exact — they are eighths, so the formula is
+/// `(8ϑ_D + 4ϑ_D₋₁ + 2ϑ_D₋₂ + ϑ_D₋₃) / 15` in integers and no float is
+/// involved. The **division** is not: `8/15` does not terminate, so for most
+/// inputs the result is a `Decimal` rounded once to its full width, and
+/// `ϑ_allok × 15` does not recover the numerator digit for digit.
+///
+/// It is left at that width rather than cut to a fixed number of places,
+/// because nothing downstream can tell: the only consumer is
+/// [`SigLinDe::h_value`], which crosses into `f64` immediately and rounds to
+/// [`SigLinDe::H_VALUE_DP`]. Round it yourself before printing or storing one —
+/// see the crate-level **What "exact" means here**.
 ///
 /// Daily means themselves are formed over the **Gastag** where the operator
 /// balances on gas days — see [`crate::calendar::gas_day_start_utc`].
@@ -422,7 +431,7 @@ mod tests {
         assert!((tum.h(-35.0) - (tum.a + tum.d)).abs() < 0.05);
     }
 
-    /// The Leitfaden's geometric series, including its exactness: the weights
+    /// The Leitfaden's geometric series, and the exactness of its weights: they
     /// are eighths over 1.875, so no rounding is involved.
     #[test]
     fn the_allocation_temperature_is_the_geometric_series() {

@@ -42,6 +42,7 @@
 //! flat-profile medium it is useless, which is what
 //! [`hampel_filter_with_floor`] exists for.
 
+use crate::calendar::DayBoundary;
 use crate::interval::{MeterInterval, Sparte};
 use crate::validation::{
     RuleSet, ValidationConfig, ValidationIssue, ValidationRuleId, ValidationSeverity,
@@ -228,28 +229,33 @@ impl QualityConfig {
     /// sigma floor, or the first draw after a quiet spell reads as an outlier.
     #[must_use]
     pub fn for_sparte(sparte: Sparte) -> Self {
-        let with = |zero_run: usize, min_sigma: f64, interval_secs: u32| Self {
-            validation: ValidationConfig {
-                expected_interval_secs: Some(interval_secs),
-                outlier_min_sigma: min_sigma,
-                // Kept in step with `max_zero_run_allowed`: a run the grader is
-                // told to tolerate must not still be reported as a finding, or
-                // the tolerance only ever downgrades A to B.
-                zero_run_threshold: zero_run + 1,
-                ..ValidationConfig::default()
-            },
-            max_zero_run_allowed: zero_run,
-            min_coverage_pct: 99.0,
+        let with = |zero_run: usize, min_sigma: f64, interval_secs: u32, boundary: DayBoundary| {
+            Self {
+                validation: ValidationConfig {
+                    expected_interval_secs: Some(interval_secs),
+                    outlier_min_sigma: min_sigma,
+                    // Kept in step with `max_zero_run_allowed`: a run the grader
+                    // is told to tolerate must not still be reported as a
+                    // finding, or the tolerance only ever downgrades A to B.
+                    zero_run_threshold: zero_run + 1,
+                    day_boundary: boundary,
+                    ..ValidationConfig::default()
+                },
+                max_zero_run_allowed: zero_run,
+                min_coverage_pct: 99.0,
+            }
         };
         match sparte {
             Sparte::Strom => Self::default(),
-            // Gas heating is seasonal: a summer week of near-zero draw is normal.
-            Sparte::Gas => with(48, 0.01, 3600),
+            // Gas heating is seasonal: a summer week of near-zero draw is
+            // normal. The day is the 06:00 Gastag, which matters as soon as a
+            // caller moves this config to a daily grid.
+            Sparte::Gas => with(48, 0.01, 3600, DayBoundary::Gastag),
             // Heat: unheated months are ordinary, and the resolution is coarse.
-            Sparte::Waerme => with(720, 0.05, 3600),
+            Sparte::Waerme => with(720, 0.05, 3600, DayBoundary::Midnight),
             // Water: a vacant flat reads exactly zero indefinitely, and the
             // resolution is litres, so the sigma floor must be small.
-            Sparte::Wasser => with(720, 0.001, 86_400),
+            Sparte::Wasser => with(720, 0.001, 86_400, DayBoundary::Midnight),
         }
     }
 
@@ -273,6 +279,16 @@ pub struct QualityReport {
     /// Overall grade.
     pub grade: QualityGrade,
     /// Coverage: covered duration ÷ period duration × 100, capped at 100.
+    ///
+    /// **Every** delivered interval counts, including the `Faulty` and
+    /// `Unknown` ones — this answers *"did the data arrive"*, which is the
+    /// question a grade is a summary of. `BillingPeriod::coverage_pct` counts
+    /// only the **billable** intervals, because it answers *"can this period be
+    /// invoiced"*. The two numbers therefore differ, on purpose, exactly when a
+    /// series contains unbillable values: a day of `Faulty` quarter-hours is
+    /// 100 % covered and 0 % billable.
+    ///
+    /// [`BillingPeriod::coverage_pct`]: crate::BillingPeriod::coverage_pct
     pub coverage_pct: f64,
     /// Longest run of consecutive zero-value intervals, in timestamp order.
     pub max_zero_run: usize,

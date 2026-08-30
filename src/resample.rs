@@ -70,8 +70,10 @@ use crate::resolution::IntervalResolution;
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct ResampledBucket {
     /// Bucket start (UTC, inclusive).
+    #[cfg_attr(feature = "serde", serde(with = "crate::wire::rfc3339"))]
     pub from: OffsetDateTime,
     /// Bucket end (UTC, exclusive).
+    #[cfg_attr(feature = "serde", serde(with = "crate::wire::rfc3339"))]
     pub to: OffsetDateTime,
     /// Sum of all `value` from contributing intervals.
     pub total: Decimal,
@@ -79,6 +81,11 @@ pub struct ResampledBucket {
     ///
     /// Computed as `max(interval.value / interval_duration_h)`.
     /// `None` only when no intervals contributed (should not normally occur).
+    ///
+    /// Meaningful only where the interval unit is an **energy** — the same
+    /// caveat as [`MeterInterval::demand_kw`](crate::MeterInterval::demand_kw).
+    /// On a `Sparte::Wasser` series, whose values are cubic metres, this is a
+    /// flow rate in m³/h wearing a `_kw` name.
     pub peak_kw: Option<Decimal>,
     /// Number of intervals that contributed to this bucket.
     pub interval_count: u32,
@@ -284,7 +291,8 @@ pub fn resample(intervals: &[MeterInterval], config: &ResampleConfig) -> Vec<Res
             entry.peak_kw = Some(entry.peak_kw.map_or(kw, |prev| prev.max(kw)));
         }
 
-        // Quality: keep the worst contributor — see `QualityFlag::severity_rank`.
+        // Quality: keep the worst contributor — see `QualityFlag::severity_rank`,
+        // whose ranks are distinct so this fold is order-independent.
         entry.quality = entry.quality.worse_of(iv.quality);
     }
 

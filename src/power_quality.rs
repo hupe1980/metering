@@ -68,8 +68,10 @@ use serde::{Deserialize, Serialize};
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct PowerQualityInterval {
     /// Interval start (UTC).
+    #[cfg_attr(feature = "serde", serde(with = "crate::wire::rfc3339"))]
     pub from: OffsetDateTime,
     /// Interval end (UTC).
+    #[cfg_attr(feature = "serde", serde(with = "crate::wire::rfc3339"))]
     pub to: OffsetDateTime,
 
     /// L1 phase voltage in Volt, mean over the interval.
@@ -505,6 +507,209 @@ pub fn voltage_percentile(intervals: &[PowerQualityInterval], share: f64) -> Opt
     values.get(index).copied()
 }
 
+// ── Unsymmetrie (VDE-AR-N 4100 Abschnitt 5.5) ────────────────────────────────
+
+/// One of the three Außenleiter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub enum Phase {
+    /// L1.
+    L1,
+    /// L2.
+    L2,
+    /// L3.
+    L3,
+}
+
+impl Phase {
+    /// Every Außenleiter, in order.
+    pub const ALL: [Self; 3] = [Self::L1, Self::L2, Self::L3];
+
+    /// Stable DB/wire label. Matches the `serde` tag and
+    /// [`FromStr`](std::str::FromStr) input.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::L1 => "L1",
+            Self::L2 => "L2",
+            Self::L3 => "L3",
+        }
+    }
+}
+
+crate::codes::string_codes! {
+    Phase;
+}
+
+/// The Unsymmetrieleistung VDE-AR-N 4100 Abschnitt 5.5.2 limits: **4,6 kVA**.
+///
+/// The figure comes from the voltage side. VDE FNN *Symmetrischer Anschluss
+/// und Betrieb in Kundenanlagen*: EN 50160 caps the Unsymmetrie der
+/// Versorgungsspannung at 2 %, and *"zur Einhaltung dieser Symmetriegrenze der
+/// Versorgungsspannung wurde bei einem Außenleiterstrom von 20 A ein
+/// Leistungsgrenzwert von 4,6 kVA festgelegt"* — so 4,6 kVA and 20 A per
+/// Außenleiter are the same limit expressed twice.
+///
+/// A default, not a constant: the same Hinweis notes the value *"soll im
+/// Rahmen einer FNN-Studie untersucht werden"*, and VDE-AR-N 4100 is a
+/// paywalled Anwendungsregel this crate cannot quote. Pass your own to
+/// [`PhaseApparentPower::within_limit`].
+pub const UNSYMMETRIE_LIMIT_KVA: Decimal = Decimal::from_parts(46, 0, 0, false, 1);
+
+/// Apparent power per Außenleiter, in kVA.
+///
+/// ## kVA, not kW — and why that is not a detail
+///
+/// VDE-AR-N 4100 states the symmetry limit in **Scheinleistung**. An inverter
+/// running at cos φ < 1, which VDE-AR-N 4105 requires it to be able to do for
+/// Blindleistungsbereitstellung, draws or feeds more kVA than kW: a guard
+/// written on active power passes installations that breach the rule, and the
+/// error grows exactly when the grid asked for reactive support.
+///
+/// ## What counts, and what does not
+///
+/// Abschnitt 5.5.2, per the VDE FNN Hinweis: *"Die Anforderungen zum
+/// symmetrischen Betrieb gelten nur für Geräte die elektrische Energie
+/// einspeisen oder speichern können, also Erzeugungsanlagen, Speicher,
+/// Ladeeinrichtungen für Elektrofahrzeuge."*
+///
+/// So this is **not** what the grid meter sees. Ordinary household load is
+/// outside the rule, and a [`crate::MeterInterval`] — an energy accumulated at
+/// the Netzanschluss — cannot answer the question however many phases it
+/// carried. Sum the three device classes per Außenleiter and pass that.
+///
+/// A three-phase symmetric device contributes nothing to the unbalance
+/// whatever its size, which is [`symmetric`](Self::symmetric): *"Speicher und
+/// Erzeugungsanlagen, die dreiphasig angeschlossen werden, … müssen nach
+/// VDE-AR-N 4105 die Leistung dreiphasig symmetrisch in die drei Außenleiter
+/// einspeisen."*
+///
+/// ```rust
+/// use metering::power_quality::{PhaseApparentPower, Phase};
+/// use rust_decimal::dec;
+///
+/// // A single-phase 3,7 kVA wallbox on L1, and nothing else.
+/// let one = PhaseApparentPower::single_phase(Phase::L1, dec!(3.7));
+/// assert_eq!(one.unbalance_kva(), dec!(3.7));
+/// assert!(one.within_limit(None), "3,7 kVA is inside the 4,6 kVA limit");
+///
+/// // Three 4,6 kVA units, one per Außenleiter: 13,8 kVA installed, balanced.
+/// let spread = PhaseApparentPower::default()
+///     .plus(Phase::L1, dec!(4.6))
+///     .plus(Phase::L2, dec!(4.6))
+///     .plus(Phase::L3, dec!(4.6));
+/// assert_eq!(spread.unbalance_kva(), dec!(0.0));
+/// assert!(spread.within_limit(None));
+///
+/// // A 22 kVA wallbox charging single-phase at 7,2 kVA is not.
+/// let single = PhaseApparentPower::single_phase(Phase::L1, dec!(7.2));
+/// assert!(!single.within_limit(None));
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct PhaseApparentPower {
+    /// Apparent power on L1, kVA.
+    pub l1_kva: Decimal,
+    /// Apparent power on L2, kVA.
+    pub l2_kva: Decimal,
+    /// Apparent power on L3, kVA.
+    pub l3_kva: Decimal,
+}
+
+impl PhaseApparentPower {
+    /// One single-phase device of `kva` on `phase`.
+    #[must_use]
+    pub fn single_phase(phase: Phase, kva: Decimal) -> Self {
+        Self::default().plus(phase, kva)
+    }
+
+    /// A three-phase device feeding `total_kva` symmetrically.
+    ///
+    /// Contributes `total ÷ 3` to each Außenleiter and therefore **nothing**
+    /// to the unbalance, which is why a 30 kVA three-phase inverter needs no
+    /// Symmetrieeinrichtung and a 5 kVA single-phase one may.
+    #[must_use]
+    pub fn symmetric(total_kva: Decimal) -> Self {
+        let each = total_kva / Decimal::from(3u32);
+        Self {
+            l1_kva: each,
+            l2_kva: each,
+            l3_kva: each,
+        }
+    }
+
+    /// This plus `kva` on `phase` (builder style).
+    #[must_use]
+    pub fn plus(mut self, phase: Phase, kva: Decimal) -> Self {
+        *self.get_mut(phase) += kva;
+        self
+    }
+
+    /// The apparent power on one Außenleiter.
+    #[must_use]
+    pub const fn get(&self, phase: Phase) -> Decimal {
+        match phase {
+            Phase::L1 => self.l1_kva,
+            Phase::L2 => self.l2_kva,
+            Phase::L3 => self.l3_kva,
+        }
+    }
+
+    fn get_mut(&mut self, phase: Phase) -> &mut Decimal {
+        match phase {
+            Phase::L1 => &mut self.l1_kva,
+            Phase::L2 => &mut self.l2_kva,
+            Phase::L3 => &mut self.l3_kva,
+        }
+    }
+
+    /// The **Unsymmetrieleistung**: the largest difference between any two
+    /// Außenleiter, in kVA.
+    ///
+    /// The reading the VDE FNN Hinweis's worked examples pin. A single 3,7 kVA
+    /// device on one phase is an unbalance of 3,7 kVA; three 4,6 kVA devices
+    /// one per phase are an unbalance of zero even though 13,8 kVA is
+    /// installed; a 7,2 kVA single-phase charge is an unbalance of 7,2 kVA and
+    /// needs a Symmetrieeinrichtung. VDE-AR-N 4100 itself is paywalled, so
+    /// this is the arithmetic those examples demonstrate rather than a quoted
+    /// formula.
+    #[must_use]
+    pub fn unbalance_kva(&self) -> Decimal {
+        let max = self.l1_kva.max(self.l2_kva).max(self.l3_kva);
+        let min = self.l1_kva.min(self.l2_kva).min(self.l3_kva);
+        max - min
+    }
+
+    /// The most heavily loaded Außenleiter and its apparent power.
+    #[must_use]
+    pub fn worst_phase(&self) -> (Phase, Decimal) {
+        Phase::ALL
+            .into_iter()
+            .map(|p| (p, self.get(p)))
+            .reduce(|a, b| if b.1 > a.1 { b } else { a })
+            .unwrap_or((Phase::L1, Decimal::ZERO))
+    }
+
+    /// `true` when the Unsymmetrieleistung is at or below the limit.
+    ///
+    /// `None` uses [`UNSYMMETRIE_LIMIT_KVA`]. The bound is inclusive: the
+    /// Hinweis admits three devices of exactly 4,6 kVA.
+    #[must_use]
+    pub fn within_limit(&self, limit_kva: Option<Decimal>) -> bool {
+        self.unbalance_kva() <= limit_kva.unwrap_or(UNSYMMETRIE_LIMIT_KVA)
+    }
+
+    /// The apparent power that would have to move off the worst Außenleiter to
+    /// bring the installation inside the limit, in kVA.
+    ///
+    /// Zero when it already is. This is the figure a Symmetrieeinrichtung —
+    /// or a home energy manager holding the same lever — has to act on.
+    #[must_use]
+    pub fn excess_kva(&self, limit_kva: Option<Decimal>) -> Decimal {
+        (self.unbalance_kva() - limit_kva.unwrap_or(UNSYMMETRIE_LIMIT_KVA)).max(Decimal::ZERO)
+    }
+}
+
 // ── tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -819,5 +1024,102 @@ mod tests {
             Some(dec!(260.125)),
             "the reported worst value is the exact measurement"
         );
+    }
+}
+
+#[cfg(test)]
+mod unsymmetrie_tests {
+    use super::*;
+    use rust_decimal::dec;
+
+    /// The three worked examples of the VDE FNN Hinweis, which are what pins
+    /// the reading of "Unsymmetrieleistung" as the largest difference between
+    /// two Außenleiter.
+    #[test]
+    fn the_published_examples_resolve_as_printed() {
+        // Beispiel 1 — an 11 kVA wallbox charging single-phase at 3,7 kVA is
+        // inside the limit "sofern keine weiteren … in der gleichen
+        // Kundenanlage betrieben werden".
+        let one = PhaseApparentPower::single_phase(Phase::L1, dec!(3.7));
+        assert_eq!(one.unbalance_kva(), dec!(3.7));
+        assert!(one.within_limit(None));
+        assert_eq!(one.excess_kva(None), dec!(0.0));
+
+        // Beispiel 2 — a 22 kVA wallbox can put 7,2 kVA on one Außenleiter,
+        // "um dies zu vermeiden, muss die Leistung pro Außenleiter auf 4,6 kVA
+        // … reduziert werden".
+        let two = PhaseApparentPower::single_phase(Phase::L2, dec!(7.2));
+        assert_eq!(two.unbalance_kva(), dec!(7.2));
+        assert!(!two.within_limit(None));
+        assert_eq!(two.excess_kva(None), dec!(2.6));
+        assert_eq!(two.worst_phase(), (Phase::L2, dec!(7.2)));
+
+        // Bild 3 — three single-phase 4,6 kVA units, one per Außenleiter:
+        // 13,8 kVA installed and perfectly balanced.
+        let spread = PhaseApparentPower::default()
+            .plus(Phase::L1, dec!(4.6))
+            .plus(Phase::L2, dec!(4.6))
+            .plus(Phase::L3, dec!(4.6));
+        assert_eq!(spread.unbalance_kva(), dec!(0.0));
+        assert!(spread.within_limit(None));
+    }
+
+    /// A three-phase symmetric inverter contributes nothing to the unbalance,
+    /// which is why its size is not limited by this rule at all.
+    #[test]
+    fn a_symmetric_three_phase_device_is_never_an_unbalance() {
+        for total in [dec!(3), dec!(11), dec!(30), dec!(300)] {
+            let s = PhaseApparentPower::symmetric(total);
+            assert_eq!(s.unbalance_kva(), Decimal::ZERO, "{total} kVA");
+            assert!(s.within_limit(None));
+        }
+
+        // …and it does not rescue a single-phase device beside it.
+        let mixed = PhaseApparentPower::symmetric(dec!(30)).plus(Phase::L3, dec!(5));
+        assert_eq!(mixed.unbalance_kva(), dec!(5));
+        assert!(!mixed.within_limit(None));
+    }
+
+    /// The bound is inclusive — exactly 4,6 kVA is admitted — and the limit is
+    /// a parameter, because VDE-AR-N 4100 is paywalled and FNN has the figure
+    /// under study.
+    #[test]
+    fn the_limit_is_inclusive_and_overridable() {
+        let at = PhaseApparentPower::single_phase(Phase::L1, dec!(4.6));
+        assert!(at.within_limit(None));
+        let over = PhaseApparentPower::single_phase(Phase::L1, dec!(4.7));
+        assert!(!over.within_limit(None));
+        assert!(over.within_limit(Some(dec!(5.0))));
+        assert_eq!(over.excess_kva(Some(dec!(5.0))), dec!(0.0));
+    }
+
+    /// Unbalance does not depend on which Außenleiter carries the load, only
+    /// on the spread between them.
+    #[test]
+    fn unbalance_is_a_spread_not_a_phase() {
+        for phase in Phase::ALL {
+            let p = PhaseApparentPower::single_phase(phase, dec!(6));
+            assert_eq!(p.unbalance_kva(), dec!(6), "{phase}");
+            assert_eq!(p.worst_phase(), (phase, dec!(6)));
+        }
+        // Two phases loaded equally still leaves the third at zero.
+        let two = PhaseApparentPower::default()
+            .plus(Phase::L1, dec!(4))
+            .plus(Phase::L2, dec!(4));
+        assert_eq!(two.unbalance_kva(), dec!(4));
+    }
+
+    /// The rule counts apparent power. The same device at cos φ = 0,9 draws
+    /// 10 % more kVA than kW, so an active-power guard passes a breach.
+    #[test]
+    fn apparent_power_is_not_active_power() {
+        let active_kw = dec!(4.5);
+        let cos_phi = dec!(0.9);
+        let apparent_kva = active_kw / cos_phi; // 5.0 kVA
+
+        let by_kw = PhaseApparentPower::single_phase(Phase::L1, active_kw);
+        let by_kva = PhaseApparentPower::single_phase(Phase::L1, apparent_kva);
+        assert!(by_kw.within_limit(None), "4,5 kW looks compliant");
+        assert!(!by_kva.within_limit(None), "5,0 kVA is not");
     }
 }

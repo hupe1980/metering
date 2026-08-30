@@ -1,11 +1,22 @@
 //! §42c EnWG Energy-Sharing metering eligibility — pure decision logic.
 //!
-//! Energy Sharing has been in force since **1 June 2026**, initially within the
-//! Bilanzierungsgebiet of a single Verteilernetzbetreiber; from 1 June 2028 it
-//! extends to adjacent Bilanzierungsgebiete in the same Regelzone. Its binding practical
-//! constraint is not the allocation engine — it is which delivery points can
-//! produce quarter-hour values at all. §42c Abs. 1 admits a point only when both
-//! consumption *and* generation are measured by:
+//! § 42c EnWG itself entered into force on **22 December 2025** (BGBl. 2025 I
+//! Nr. 347). What starts later is the **Netzbetreiber's duty** to make sharing
+//! possible: Abs. 4 obliges every Verteilernetzbetreiber to ensure it from
+//! **1 June 2026** *"innerhalb des Bilanzierungsgebietes eines
+//! Elektrizitätsverteilernetzbetreibers"* and, from 1 June 2028, also into the
+//! Bilanzierungsgebiet of a directly adjacent operator in the same Regelzone.
+//!
+//! The distinction matters for a readiness report: the eligibility conditions
+//! of Abs. 1 have been law since December 2025 and can be assessed against a
+//! portfolio today, while a point that is [`NotCapable`] before June 2026 is
+//! not yet in breach of anything.
+//!
+//! [`NotCapable`]: SharingReadiness::NotCapable
+//!
+//! Its binding practical constraint is not the allocation engine — it is which
+//! delivery points can produce quarter-hour values at all. §42c Abs. 1 admits a
+//! point only when both consumption *and* generation are measured by:
 //!
 //! > „Zählerstandsgangmessung nach § 2 Satz 1 Nummer 27 des
 //! > Messstellenbetriebsgesetzes **oder** durch eine viertelstündliche
@@ -101,10 +112,14 @@ impl EligibilityBasis {
 /// caller's language, their wording and their formatting, and left them
 /// nothing to match on: routing a readiness report by *reason* meant
 /// `contains("fernauslesbar")`. Render these where the language is known.
+///
+/// Exhaustive, like every other domain enum here — see the crate-level
+/// **Enum exhaustiveness** section. `#[non_exhaustive]` is reserved for
+/// *errors*; a finding is routed, stored and displayed, so a new one should
+/// break a consumer's `match` and make a human decide what it means.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(rename_all = "SCREAMING_SNAKE_CASE"))]
-#[non_exhaustive]
 pub enum Finding {
     /// The meter is flagged as not remotely readable, so no series of
     /// viertelstündig ermittelte Zählerstände can be transmitted.
@@ -309,7 +324,10 @@ pub struct MeteringCapabilityInput {
 }
 
 /// Outcome of the master-data capability assessment.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Copy`, like every other verdict in this module: a discriminant plus an
+/// [`EligibilityBasis`], which is itself `Copy`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(rename_all = "SCREAMING_SNAKE_CASE"))]
 pub enum Capability {
@@ -528,17 +546,6 @@ impl SharingReadiness {
         }
     }
 
-    /// Stable label for API responses.
-    #[must_use]
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::Ready => "READY",
-            Self::CapableNotDelivering => "CAPABLE_NOT_DELIVERING",
-            Self::NotCapable => "NOT_CAPABLE",
-            Self::Unknown => "UNKNOWN",
-        }
-    }
-
     /// The operator action this verdict calls for.
     #[must_use]
     pub const fn required_action(self) -> &'static str {
@@ -557,7 +564,7 @@ impl SharingReadiness {
 /// measurement installed at the point, so a conforming series from an
 /// unidentifiable meter still leaves the master data to be fixed.
 #[must_use]
-pub const fn combine(capability: Capability, delivery: Delivery) -> SharingReadiness {
+pub const fn combine_readiness(capability: Capability, delivery: Delivery) -> SharingReadiness {
     match (capability, delivery) {
         (Capability::Qualified(_), Delivery::Delivering) => SharingReadiness::Ready,
         (Capability::Qualified(_), _) => SharingReadiness::CapableNotDelivering,
@@ -712,7 +719,7 @@ mod tests {
     #[test]
     fn capable_but_silent_is_its_own_verdict() {
         // The state the readiness report exists to surface.
-        let verdict = combine(
+        let verdict = combine_readiness(
             Capability::Qualified(EligibilityBasis::Zaehlerstandsgangmessung),
             Delivery::Absent,
         );
@@ -726,7 +733,7 @@ mod tests {
     #[test]
     fn delivery_alone_does_not_establish_eligibility() {
         assert_eq!(
-            combine(Capability::Unknown, Delivery::Delivering),
+            combine_readiness(Capability::Unknown, Delivery::Delivering),
             SharingReadiness::Unknown
         );
     }

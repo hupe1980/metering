@@ -42,7 +42,7 @@
 use std::collections::{HashMap, HashSet};
 use std::hash::BuildHasher;
 
-use rust_decimal::Decimal;
+use rust_decimal::{Decimal, RoundingStrategy};
 use time::OffsetDateTime;
 
 use crate::aggregation_rule::{AggregationRule, VirtualMeterKind};
@@ -72,10 +72,16 @@ pub enum VirtualMeterError {
     #[error("missing source MaLo: {0}")]
     MissingSource(String),
 
-    /// GGV tenant fractions are out of range — must be 0 < Σ ≤ 1.
-    #[error("GGV tenant fractions sum to {sum} — must be in (0, 1]")]
+    /// An allocation fraction is out of range — each must be positive and
+    /// they must sum to at most 1.
+    ///
+    /// [`compute_ggv_allocation`] knows only the one tenant's fraction, so
+    /// `sum` there is that single value; only
+    /// [`compute_community_allocation`], which sees the whole participant set,
+    /// can report a genuine sum.
+    #[error("allocation fractions total {sum} — each must be positive and the total at most 1")]
     InvalidFractions {
-        /// Actual sum of the provided fractions.
+        /// The offending fraction, or the sum across the community.
         sum: Decimal,
     },
 
@@ -265,13 +271,18 @@ fn compute_net_grid<S: BuildHasher>(
 /// subtracting the net from a re-projected consumption series.
 ///
 /// `consumption == allocated + net_grid_draw` holds in every interval,
-/// exactly: all three are [`Decimal`].
+/// exactly — because [`share`](Self::share) is cut to [`ALLOCATION_DP`] first.
+/// An uncut proportional share is a quotient with more significant digits than
+/// the subtraction that follows can hold, and the identity would miss by a few
+/// 1e-27 kWh.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct GgvInterval {
     /// Interval start (UTC, inclusive).
+    #[cfg_attr(feature = "serde", serde(with = "crate::wire::rfc3339"))]
     pub from: OffsetDateTime,
     /// Interval end (UTC, exclusive).
+    #[cfg_attr(feature = "serde", serde(with = "crate::wire::rfc3339"))]
     pub to: OffsetDateTime,
 
     /// The tenant's metered consumption — `Melo_i Verbrauch`.
@@ -281,7 +292,8 @@ pub struct GgvInterval {
     pub generation: Decimal,
 
     /// The tenant's share of that generation **before** the `Pos()` cap:
-    /// `fraction × generation`, or `ratio × generation`.
+    /// `fraction × generation`, or `ratio × generation`, cut to
+    /// [`ALLOCATION_DP`] places toward zero.
     pub share: Decimal,
     /// The share actually credited: `min(consumption, share)`.
     pub allocated: Decimal,
@@ -400,10 +412,44 @@ pub fn compute_ggv_allocation<S: BuildHasher>(
     }
 }
 
+/// Decimal places an allocated **share** is cut to before the `Pos()` cap.
+///
+/// The proportional key divides — `consumption ÷ Σ consumption × generation` —
+/// and a `Decimal` quotient carries up to 28 significant digits. Two things go
+/// wrong if that reaches the output. It is not a *quantity*: no invoice, no
+/// MSCONS field and no settlement system has a place for 0.333…3 kWh to
+/// twenty-seven places. And it breaks the identity this module documents,
+/// because `consumption − allocated` then needs more significant digits than a
+/// `Decimal` has and rounds.
+///
+/// Six places is a millionth of a kWh: four orders of magnitude finer than
+/// anything the market settles, and coarse enough that every derived value is
+/// a number someone can write down.
+///
+/// The cut is **toward zero**, which is not a stylistic choice. Truncating can
+/// only lower a share, so `Σ allocated ≤ Σ share ≤ generation` survives it and
+/// the § 42b Abs. 5 ceiling stays a theorem rather than becoming a clamp.
+pub const ALLOCATION_DP: u32 = 6;
+
+/// A raw share, cut to [`ALLOCATION_DP`] places toward zero.
+///
+/// Applied where the share is *formed*, not where it is capped, so the value
+/// reported as [`GgvInterval::share`] is the one the cap was taken against —
+/// which is what `capped()`, comparing the two, depends on.
+fn allocation_share(raw: Decimal) -> Decimal {
+    raw.round_dp_with_strategy(ALLOCATION_DP, RoundingStrategy::ToZero)
+}
+
 /// `allocated = min(consumption, share)`, and the net that follows.
 ///
 /// One place, so the `Pos()` cap of § 42b Abs. 5 / UTILTS Z83 is applied once
-/// and both entry points read the same arithmetic.
+/// and both entry points read the same arithmetic. `share` is expected to have
+/// been through [`allocation_share`] already.
+///
+/// The consumption is the caller's measurement and passes through untouched,
+/// so a participant whose whole draw is covered is credited exactly what they
+/// drew and nets exactly zero, however many decimal places their meter
+/// delivered.
 fn ggv_split(consumption: Decimal, share: Decimal) -> (Decimal, Decimal) {
     let allocated = consumption.min(share).max(Decimal::ZERO);
     (allocated, consumption - allocated)
@@ -438,7 +484,7 @@ fn ggv_constant<S: BuildHasher>(
         else {
             continue;
         };
-        let share = fraction * plant_iv.value;
+        let share = allocation_share(fraction * plant_iv.value);
         let (allocated, net_grid_draw) = ggv_split(tenant_iv.value, share);
         result.push(GgvInterval {
             from: ts,
@@ -500,11 +546,11 @@ fn ggv_proportional<S: BuildHasher>(
             continue;
         };
 
-        let share = if total > Decimal::ZERO {
+        let share = allocation_share(if total > Decimal::ZERO {
             tenant_iv.value / total * plant_iv.value
         } else {
             Decimal::ZERO
-        };
+        });
         let (allocated, net_grid_draw) = ggv_split(tenant_iv.value, share);
 
         // Any estimated or substituted contributor moves the whole result.
@@ -538,6 +584,284 @@ fn require<'a, S: BuildHasher>(
         }
     }
     Ok(())
+}
+
+// ── the whole community at once ──────────────────────────────────────────────
+
+/// How a community's generation is divided among its participants.
+///
+/// The two keys the BDEW Anwendungshilfe publishes for § 42b, and the shape a
+/// § 42c *Aufteilungsschlüssel* takes as well — see
+/// [`compute_community_allocation`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(
+    feature = "serde",
+    serde(tag = "kind", rename_all = "SCREAMING_SNAKE_CASE")
+)]
+pub enum AllocationKey {
+    /// A fixed fraction per participant — UTILTS `CCI+ZG6` with `CAV+Z28`.
+    ///
+    /// The fractions must be positive and sum to at most 1; the remainder is
+    /// generation the community does not claim and which feeds the grid.
+    Constant {
+        /// Participant series id → fraction of the plant's generation.
+        fractions: std::collections::BTreeMap<String, Decimal>,
+    },
+    /// Proportional to each participant's own consumption in the interval —
+    /// UTILTS `Z74` Divisionsquotient.
+    Proportional {
+        /// Participant series ids. Order does not affect the result.
+        participants: Vec<String>,
+    },
+}
+
+impl AllocationKey {
+    /// The participant series ids this key names, in a stable order.
+    #[must_use]
+    pub fn participant_ids(&self) -> Vec<&str> {
+        match self {
+            Self::Constant { fractions } => fractions.keys().map(String::as_str).collect(),
+            Self::Proportional { participants } => {
+                let mut ids: Vec<&str> = participants.iter().map(String::as_str).collect();
+                ids.sort_unstable();
+                ids.dedup();
+                ids
+            }
+        }
+    }
+}
+
+/// What one participant received in one interval.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct ParticipantAllocation {
+    /// The participant's series id.
+    pub id: String,
+    /// What they consumed.
+    pub consumption: Decimal,
+    /// Their nominal share of the generation, before the `Pos()` cap, cut to
+    /// [`ALLOCATION_DP`] places toward zero.
+    pub share: Decimal,
+    /// What was actually credited: `min(consumption, share)`.
+    pub allocated: Decimal,
+    /// What they still drew from the public grid.
+    pub net_grid_draw: Decimal,
+}
+
+impl ParticipantAllocation {
+    /// `true` when the share was limited by this participant's own
+    /// consumption, so the remainder fed the grid.
+    #[must_use]
+    pub fn capped(&self) -> bool {
+        self.share > self.allocated
+    }
+}
+
+/// One interval of a community allocation, from the community's side.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct CommunityInterval {
+    /// Interval start (UTC, inclusive).
+    #[cfg_attr(feature = "serde", serde(with = "crate::wire::rfc3339"))]
+    pub from: OffsetDateTime,
+    /// Interval end (UTC, exclusive).
+    #[cfg_attr(feature = "serde", serde(with = "crate::wire::rfc3339"))]
+    pub to: OffsetDateTime,
+    /// The plant's whole generation in the interval.
+    pub generation: Decimal,
+    /// The sum of every participant's consumption.
+    pub total_consumption: Decimal,
+    /// The § 42b Abs. 5 ceiling: `min(generation, total_consumption)`.
+    ///
+    /// **A ceiling, not a clamp.** See
+    /// [`compute_community_allocation`](compute_community_allocation#the-pool-cap-is-a-theorem-here-not-a-step).
+    pub pool_cap: Decimal,
+    /// Per participant, in the key's own order.
+    pub participants: Vec<ParticipantAllocation>,
+    /// Generation the community did not use, which fed the public grid.
+    pub surplus_to_grid: Decimal,
+    /// Worst quality across the plant and every participant.
+    pub quality: QualityFlag,
+}
+
+impl CommunityInterval {
+    /// The energy credited across every participant.
+    #[must_use]
+    pub fn total_allocated(&self) -> Decimal {
+        self.participants.iter().map(|p| p.allocated).sum()
+    }
+
+    /// The energy the community still drew from the public grid.
+    #[must_use]
+    pub fn total_net_grid_draw(&self) -> Decimal {
+        self.participants.iter().map(|p| p.net_grid_draw).sum()
+    }
+
+    /// One participant's allocation, by series id.
+    #[must_use]
+    pub fn participant(&self, id: &str) -> Option<&ParticipantAllocation> {
+        self.participants.iter().find(|p| p.id == id)
+    }
+}
+
+/// Allocate a community's generation across **every** participant at once.
+///
+/// [`compute_ggv_allocation`] answers for one tenant, which is the shape a
+/// persisted rule has. This answers for the community, and is not the same
+/// computation run N times: the proportional denominator and the source index
+/// are formed once rather than once per tenant, the surplus that fed the grid
+/// is a number rather than something to reconstruct, and the § 42b Abs. 5 pool
+/// ceiling becomes computable at all.
+///
+/// ## The pool cap is a theorem, not a step
+///
+/// § 42b Abs. 5 caps the allocatable energy at *"die Strommenge, die innerhalb
+/// eines 15-Minuten-Zeitintervalls in der Solaranlage erzeugt oder von allen
+/// teilnehmenden Letztverbrauchern verbraucht wird, je nachdem welche dieser
+/// Strommengen geringer ist."*
+///
+/// This does **not** clamp to that figure. With fractions summing to at most 1
+/// the per-participant `Pos()` cap already implies it — `Σ min(cᵢ, shareᵢ) ≤ Σ cᵢ`
+/// and `Σ shareᵢ ≤ generation` — so clamping again would be a rule the statute
+/// does not contain. [`CommunityInterval::pool_cap`] reports the ceiling, and
+/// `tests/allocation_invariants.rs` holds the inequality under proptest.
+///
+/// ## § 42c uses the same arithmetic
+///
+/// Energy Sharing has no published allocation formula: § 42c Abs. 3 Nr. 2
+/// requires the *contract* to state *"einen Aufteilungsschlüssel, aus dem sich
+/// der Umfang des Rechts zur Nutzung der Elektrizität ergibt"*, so the key is
+/// an input. Both [`AllocationKey`] variants express one, and
+/// `min(consumption, share)` carries over as physics. [`pool_cap`] does not:
+/// § 42c has no counterpart to Abs. 5, so there it is an observation.
+///
+/// [`pool_cap`]: CommunityInterval::pool_cap
+///
+/// # Errors
+///
+/// - [`MissingSource`](VirtualMeterError::MissingSource) for an absent series.
+/// - [`InvalidFractions`](VirtualMeterError::InvalidFractions) when the
+///   constant fractions are not all positive, or sum above 1.
+///
+/// ```rust
+/// use metering::{AllocationKey, MeterInterval, QualityFlag, compute_community_allocation};
+/// use rust_decimal::dec;
+/// use std::collections::HashMap;
+/// use time::macros::datetime;
+///
+/// let iv = |kwh| vec![MeterInterval {
+///     from: datetime!(2026-06-01 12:00 UTC),
+///     to:   datetime!(2026-06-01 12:15 UTC),
+///     value: kwh,
+///     quality: QualityFlag::Measured,
+///     obis_code: None,
+/// }];
+/// let mut sources = HashMap::new();
+/// sources.insert("PLANT".to_owned(), iv(dec!(10)));
+/// sources.insert("T1".to_owned(), iv(dec!(1)));
+/// sources.insert("T2".to_owned(), iv(dec!(3)));
+///
+/// let key = AllocationKey::Proportional {
+///     participants: vec!["T1".to_owned(), "T2".to_owned()],
+/// };
+/// let out = compute_community_allocation("PLANT", &key, &sources)?;
+/// let interval = &out[0];
+///
+/// // Four kWh drawn against ten generated, so the pool cap is the consumption.
+/// assert_eq!(interval.total_consumption, dec!(4));
+/// assert_eq!(interval.pool_cap, dec!(4));
+///
+/// // Both tenants are capped by their own draw; six kWh fed the grid.
+/// assert_eq!(interval.total_allocated(), dec!(4));
+/// assert_eq!(interval.surplus_to_grid, dec!(6));
+/// assert_eq!(interval.total_net_grid_draw(), dec!(0));
+/// assert!(interval.participant("T1").unwrap().capped());
+/// # Ok::<(), metering::VirtualMeterError>(())
+/// ```
+pub fn compute_community_allocation<S: BuildHasher>(
+    plant_id: &str,
+    key: &AllocationKey,
+    sources: &SourceMap<S>,
+) -> Result<Vec<CommunityInterval>, VirtualMeterError> {
+    let ids = key.participant_ids();
+    require(sources, std::iter::once(plant_id))?;
+    require(sources, ids.iter().copied())?;
+
+    if let AllocationKey::Constant { fractions } = key {
+        let sum: Decimal = fractions.values().copied().sum();
+        if fractions.values().any(|f| *f <= Decimal::ZERO) || sum > Decimal::ONE {
+            return Err(VirtualMeterError::InvalidFractions { sum });
+        }
+    }
+
+    let index = SourceIndex::build(sources);
+    let aligned = aligned_timestamps(
+        std::iter::once(plant_id).chain(ids.iter().copied()),
+        sources,
+    );
+    let mut out = Vec::with_capacity(aligned.len());
+
+    for ts in aligned {
+        let Some(plant_iv) = index.get(plant_id, ts) else {
+            continue;
+        };
+        // Every participant must be present, or the denominator — and the
+        // surplus — would be formed over a different set than the numerator.
+        let Some(consumption): Option<Vec<(&str, &MeterInterval)>> = ids
+            .iter()
+            .map(|id| index.get(id, ts).map(|iv| (*id, iv)))
+            .collect()
+        else {
+            continue;
+        };
+
+        let total_consumption: Decimal = consumption.iter().map(|(_, iv)| iv.value).sum();
+        let generation = plant_iv.value;
+
+        let participants: Vec<ParticipantAllocation> = consumption
+            .iter()
+            .map(|(id, iv)| {
+                let share = allocation_share(match key {
+                    AllocationKey::Constant { fractions } => {
+                        fractions.get(*id).copied().unwrap_or(Decimal::ZERO) * generation
+                    }
+                    AllocationKey::Proportional { .. } => {
+                        if total_consumption > Decimal::ZERO {
+                            iv.value / total_consumption * generation
+                        } else {
+                            Decimal::ZERO
+                        }
+                    }
+                });
+                let (allocated, net_grid_draw) = ggv_split(iv.value, share);
+                ParticipantAllocation {
+                    id: (*id).to_owned(),
+                    consumption: iv.value,
+                    share,
+                    allocated,
+                    net_grid_draw,
+                }
+            })
+            .collect();
+
+        let allocated: Decimal = participants.iter().map(|p| p.allocated).sum();
+        let quality = consumption
+            .iter()
+            .fold(plant_iv.quality, |q, (_, iv)| q.worse_of(iv.quality));
+
+        out.push(CommunityInterval {
+            from: ts,
+            to: plant_iv.to,
+            generation,
+            total_consumption,
+            pool_cap: generation.min(total_consumption),
+            participants,
+            surplus_to_grid: (generation - allocated).max(Decimal::ZERO),
+            quality,
+        });
+    }
+    Ok(out)
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
@@ -1161,7 +1485,18 @@ mod ggv_allocation_tests {
             assert_eq!(iv.allocated, iv.share);
             total_share += iv.share;
         }
-        assert_eq!(total_share, dec!(9), "the shares exhaust the generation");
+        // The shares exhaust the generation to the last representable place,
+        // and never past it. Exhausting it *exactly* is what would require an
+        // unrepresentable share: 4 ÷ 12 × 9 is 2.999…7 at `Decimal`'s full
+        // width, and `ALLOCATION_DP` cuts it toward zero to 2.999999. Erring
+        // downwards is deliberate — it keeps `Σ share ≤ generation`, so the
+        // § 42b Abs. 5 ceiling holds without a second clamp.
+        assert!(total_share <= dec!(9), "never over the generation");
+        assert!(
+            dec!(9) - total_share < dec!(0.00001),
+            "and within a hundredth of a milliwatt-hour of it: {total_share}"
+        );
+        assert_eq!(total_share, dec!(8.999999));
     }
 
     /// A zero total is the Anwendungshilfe's division-by-zero guard. With
@@ -1252,5 +1587,295 @@ mod ggv_allocation_tests {
             ));
         }
         assert!(compute_ggv_allocation(&constant(dec!(1)), &src).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod community_tests {
+    use super::*;
+    use rust_decimal::dec;
+    use std::collections::{BTreeMap, HashMap};
+    use time::{Duration, macros::datetime};
+
+    const BASE: OffsetDateTime = datetime!(2026-06-01 12:00 UTC);
+
+    fn series(values: &[Decimal]) -> Vec<MeterInterval> {
+        values
+            .iter()
+            .enumerate()
+            .map(|(i, &value)| {
+                let from = BASE + Duration::minutes(15 * i as i64);
+                MeterInterval {
+                    from,
+                    to: from + Duration::minutes(15),
+                    value,
+                    quality: QualityFlag::Measured,
+                    obis_code: None,
+                }
+            })
+            .collect()
+    }
+
+    fn community() -> SourceMap {
+        let mut sources: SourceMap = HashMap::new();
+        sources.insert("PLANT".to_owned(), series(&[dec!(10), dec!(2), dec!(0)]));
+        sources.insert("T1".to_owned(), series(&[dec!(1), dec!(4), dec!(2)]));
+        sources.insert("T2".to_owned(), series(&[dec!(3), dec!(4), dec!(6)]));
+        sources
+    }
+
+    fn proportional() -> AllocationKey {
+        AllocationKey::Proportional {
+            participants: vec!["T1".to_owned(), "T2".to_owned()],
+        }
+    }
+
+    fn constant(t1: Decimal, t2: Decimal) -> AllocationKey {
+        AllocationKey::Constant {
+            fractions: BTreeMap::from([("T1".to_owned(), t1), ("T2".to_owned(), t2)]),
+        }
+    }
+
+    /// The three identities the output has to satisfy in every interval, for
+    /// both keys — all exact, because all three are `Decimal`.
+    #[test]
+    fn the_allocation_identities_hold_exactly() {
+        let sources = community();
+        for key in [proportional(), constant(dec!(0.25), dec!(0.5))] {
+            let out = compute_community_allocation("PLANT", &key, &sources).unwrap();
+            assert_eq!(out.len(), 3);
+            for iv in &out {
+                for p in &iv.participants {
+                    assert_eq!(p.consumption, p.allocated + p.net_grid_draw, "{p:?}");
+                    assert!(p.allocated <= p.consumption);
+                    assert!(p.allocated <= p.share);
+                }
+                assert_eq!(
+                    iv.generation,
+                    iv.total_allocated() + iv.surplus_to_grid,
+                    "generation splits into credited and exported",
+                );
+                assert_eq!(
+                    iv.total_consumption,
+                    iv.total_allocated() + iv.total_net_grid_draw(),
+                );
+            }
+        }
+    }
+
+    /// § 42b Abs. 5 caps the *pool*, and the per-participant `Pos()` cap
+    /// already implies it — so this is an assertion, not a clamp.
+    #[test]
+    fn the_pool_never_exceeds_the_paragraph_42b_ceiling() {
+        let sources = community();
+        for key in [
+            proportional(),
+            constant(dec!(0.25), dec!(0.5)),
+            constant(dec!(0.5), dec!(0.5)), // fully subscribed
+        ] {
+            for iv in compute_community_allocation("PLANT", &key, &sources).unwrap() {
+                assert_eq!(iv.pool_cap, iv.generation.min(iv.total_consumption));
+                assert!(
+                    iv.total_allocated() <= iv.pool_cap,
+                    "allocated {} over the cap {} at {}",
+                    iv.total_allocated(),
+                    iv.pool_cap,
+                    iv.from,
+                );
+            }
+        }
+    }
+
+    /// The community view and the per-tenant view must not drift: the same
+    /// input has to give the same tenant a byte-identical allocation.
+    #[test]
+    fn the_community_view_agrees_with_the_per_tenant_one() {
+        let sources = community();
+        let community = compute_community_allocation("PLANT", &proportional(), &sources).unwrap();
+
+        for tenant in ["T1", "T2"] {
+            let rule = AggregationRule::GgvProportionalAllocation {
+                plant_melo_id: "PLANT".to_owned(),
+                tenant_melo_id: tenant.to_owned(),
+                all_tenant_melo_ids: vec!["T1".to_owned(), "T2".to_owned()],
+            };
+            let per_tenant = compute_ggv_allocation(&rule, &sources).unwrap();
+            assert_eq!(per_tenant.len(), community.len());
+            for (single, whole) in per_tenant.iter().zip(&community) {
+                let p = whole.participant(tenant).expect("named participant");
+                assert_eq!(single.from, whole.from);
+                assert_eq!(single.consumption, p.consumption);
+                assert_eq!(single.share, p.share);
+                assert_eq!(single.allocated, p.allocated);
+                assert_eq!(single.net_grid_draw, p.net_grid_draw);
+                assert_eq!(single.capped(), p.capped());
+            }
+        }
+    }
+
+    /// The constant key is the one that *can* over-subscribe the plant, and
+    /// the community view is the only place the sum is visible.
+    #[test]
+    fn constant_fractions_must_not_over_subscribe_the_plant() {
+        let sources = community();
+        let over = compute_community_allocation("PLANT", &constant(dec!(0.7), dec!(0.5)), &sources);
+        assert_eq!(
+            over,
+            Err(VirtualMeterError::InvalidFractions { sum: dec!(1.2) }),
+        );
+
+        // Zero and negative shares are not shares.
+        assert!(
+            compute_community_allocation("PLANT", &constant(dec!(0), dec!(0.5)), &sources).is_err()
+        );
+
+        // Exactly fully subscribed is fine; the surplus is then only what the
+        // tenants could not use.
+        assert!(
+            compute_community_allocation("PLANT", &constant(dec!(0.5), dec!(0.5)), &sources)
+                .is_ok()
+        );
+    }
+
+    /// A participant missing in one interval drops that interval rather than
+    /// forming the denominator over a different set than the numerator.
+    #[test]
+    fn an_incomplete_interval_is_skipped_whole() {
+        let mut sources = community();
+        sources.insert("T2".to_owned(), series(&[dec!(3)])); // only the first
+        let out = compute_community_allocation("PLANT", &proportional(), &sources).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].total_consumption, dec!(4));
+    }
+
+    #[test]
+    fn a_missing_series_is_named() {
+        let sources = community();
+        let key = AllocationKey::Proportional {
+            participants: vec!["T1".to_owned(), "GHOST".to_owned()],
+        };
+        assert_eq!(
+            compute_community_allocation("PLANT", &key, &sources),
+            Err(VirtualMeterError::MissingSource("GHOST".to_owned())),
+        );
+        assert_eq!(
+            compute_community_allocation("NO_PLANT", &proportional(), &sources),
+            Err(VirtualMeterError::MissingSource("NO_PLANT".to_owned())),
+        );
+    }
+
+    /// Nothing generated and nothing drawn is zero, not a division by zero.
+    #[test]
+    fn a_dead_interval_allocates_nothing() {
+        let mut sources: SourceMap = HashMap::new();
+        sources.insert("PLANT".to_owned(), series(&[dec!(0)]));
+        sources.insert("T1".to_owned(), series(&[dec!(0)]));
+        sources.insert("T2".to_owned(), series(&[dec!(0)]));
+        let out = compute_community_allocation("PLANT", &proportional(), &sources).unwrap();
+        assert_eq!(out[0].pool_cap, Decimal::ZERO);
+        assert_eq!(out[0].total_allocated(), Decimal::ZERO);
+        assert_eq!(out[0].surplus_to_grid, Decimal::ZERO);
+    }
+
+    /// Listing the participants in another order is the same community.
+    #[test]
+    fn the_participant_order_does_not_change_the_result() {
+        let sources = community();
+        let forward = compute_community_allocation("PLANT", &proportional(), &sources).unwrap();
+        let reversed = AllocationKey::Proportional {
+            participants: vec!["T2".to_owned(), "T1".to_owned()],
+        };
+        let backward = compute_community_allocation("PLANT", &reversed, &sources).unwrap();
+        assert_eq!(forward, backward);
+    }
+
+    /// Quality is the worst contributor, plant included.
+    #[test]
+    fn a_substituted_tenant_reading_downgrades_the_whole_interval() {
+        let mut sources = community();
+        let mut t2 = series(&[dec!(3), dec!(4), dec!(6)]);
+        t2[1].quality = QualityFlag::Substituted;
+        sources.insert("T2".to_owned(), t2);
+        let out = compute_community_allocation("PLANT", &proportional(), &sources).unwrap();
+        assert_eq!(out[0].quality, QualityFlag::Measured);
+        assert_eq!(out[1].quality, QualityFlag::Substituted);
+    }
+}
+
+#[cfg(test)]
+mod allocation_precision_tests {
+    use super::*;
+    use rust_decimal::dec;
+    use std::collections::HashMap;
+    use time::macros::datetime;
+
+    fn one(value: Decimal) -> Vec<MeterInterval> {
+        vec![MeterInterval {
+            from: datetime!(2026-06-01 12:00 UTC),
+            to: datetime!(2026-06-01 12:15 UTC),
+            value,
+            quality: QualityFlag::Measured,
+            obis_code: None,
+        }]
+    }
+
+    /// Three tenants drawing equally from a plant that cannot cover them
+    /// divides by three. Without the cut, that quotient carries twenty-seven
+    /// decimal places into `consumption − allocated`, which then rounds and
+    /// breaks `consumption = allocated + net_grid_draw` by a few 1e-27 kWh.
+    #[test]
+    fn a_repeating_share_does_not_break_the_split_identity() {
+        let mut sources: SourceMap = HashMap::new();
+        sources.insert("PLANT".to_owned(), one(dec!(10)));
+        for t in ["T1", "T2", "T3"] {
+            sources.insert(t.to_owned(), one(dec!(40)));
+        }
+        let key = AllocationKey::Proportional {
+            participants: vec!["T1".to_owned(), "T2".to_owned(), "T3".to_owned()],
+        };
+        let out = compute_community_allocation("PLANT", &key, &sources).unwrap();
+        let iv = &out[0];
+
+        for p in &iv.participants {
+            assert_eq!(
+                p.consumption,
+                p.allocated + p.net_grid_draw,
+                "{}: {} != {} + {}",
+                p.id,
+                p.consumption,
+                p.allocated,
+                p.net_grid_draw,
+            );
+            // The share is a quantity somebody could write on an invoice.
+            assert!(p.share.scale() <= ALLOCATION_DP, "share {} is not", p.share);
+            assert_eq!(p.share, dec!(3.333333), "10 ÷ 3, cut toward zero");
+        }
+        assert_eq!(iv.total_consumption, dec!(120));
+        assert_eq!(iv.total_allocated(), dec!(9.999999));
+        // Cutting toward zero keeps the allocation inside the generation, so
+        // the surplus stays non-negative and the ceiling stays a theorem.
+        assert_eq!(iv.surplus_to_grid, dec!(0.000001));
+        assert!(iv.total_allocated() <= iv.pool_cap);
+    }
+
+    /// A participant whose whole draw is covered nets exactly zero, whatever
+    /// scale their meter delivered — the consumption is never truncated.
+    #[test]
+    fn a_fully_covered_participant_nets_exactly_zero() {
+        let mut sources: SourceMap = HashMap::new();
+        sources.insert("PLANT".to_owned(), one(dec!(100)));
+        // Seven decimal places, finer than ALLOCATION_DP.
+        sources.insert("T1".to_owned(), one(dec!(1.2345678)));
+        let key = AllocationKey::Proportional {
+            participants: vec!["T1".to_owned()],
+        };
+        let p = &compute_community_allocation("PLANT", &key, &sources).unwrap()[0].participants[0];
+        assert_eq!(
+            p.allocated,
+            dec!(1.2345678),
+            "credited exactly what was drawn"
+        );
+        assert_eq!(p.net_grid_draw, Decimal::ZERO);
+        assert!(p.capped());
     }
 }

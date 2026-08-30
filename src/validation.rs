@@ -40,8 +40,8 @@ use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive as _;
 use time::{Duration, OffsetDateTime};
 
+use crate::calendar::DayBoundary;
 use crate::interval::MeterInterval;
-use time_tz::{OffsetDateTimeExt as _, timezones};
 
 // ── ValidationSeverity ────────────────────────────────────────────────────────
 
@@ -92,6 +92,9 @@ pub enum ValidationRuleId {
     #[cfg_attr(feature = "serde", serde(rename = "V04"))]
     StatisticalOutlier,
     /// V05 — consecutive zero values suggest a stuck / frozen meter.
+    ///
+    /// One finding per run, anchored at its first interval and carrying the
+    /// length the run actually reached — not the threshold that armed it.
     #[cfg_attr(feature = "serde", serde(rename = "V05"))]
     SuspiciousZeroRun,
     /// V06 — interval length differs from the expected granularity.
@@ -140,11 +143,18 @@ impl ValidationRuleId {
         Self::ImplausiblePower,
     ];
 
-    /// The [`ValidationConfig`] field this rule needs before it can fire, or
-    /// `None` for a rule that is always on.
+    /// The [`ValidationConfig`] field that switches this rule on, or `None` for
+    /// one of the four that cannot be switched off.
     ///
     /// Lets a caller name the missing setting without knowing the rule table:
     /// *"V12 is off; set `ValidationConfig::max_plant_power_kw`"*.
+    ///
+    /// A field switches its rule off either by being `None`
+    /// (`expected_interval_secs`, `outlier_sigma`, `now`,
+    /// `max_plant_power_kw`) or by carrying a value that means "do not check"
+    /// (`negative_energy_is_error = false`, `zero_run_threshold = 0`). Either
+    /// way [`ValidationConfig::enabled_rules`] reports the outcome, so the
+    /// distinction never has to be reasoned about at a call site.
     ///
     /// ```rust
     /// use metering::{ValidationConfig, ValidationRuleId};
@@ -164,11 +174,11 @@ impl ValidationRuleId {
         match self {
             Self::GapDetected | Self::InconsistentIntervalLength => Some("expected_interval_secs"),
             Self::StatisticalOutlier => Some("outlier_sigma"),
+            Self::SuspiciousZeroRun => Some("zero_run_threshold"),
             Self::FutureTimestamp => Some("now"),
             Self::ImplausiblePower => Some("max_plant_power_kw"),
+            Self::NegativeEnergy => Some("negative_energy_is_error"),
             Self::OverlapDetected
-            | Self::NegativeEnergy
-            | Self::SuspiciousZeroRun
             | Self::DstAmbiguity
             | Self::NonBillableQuality
             | Self::UnorderedSeries => None,
@@ -386,6 +396,7 @@ pub struct ValidationIssue {
     /// a gap before the first one, for instance.
     pub interval_index: Option<usize>,
     /// The instant the finding is anchored at.
+    #[cfg_attr(feature = "serde", serde(with = "crate::wire::rfc3339_option"))]
     pub affected_from: Option<OffsetDateTime>,
     /// The measured value at the affected interval, when there is one.
     pub affected_value: Option<Decimal>,
@@ -473,13 +484,16 @@ pub struct ValidationConfig {
     /// test into "deviates by more than `min_sigma`".
     ///
     /// Default: `0.0`, which suits electricity. See
-    /// [`QualityConfig::for_sparte`](crate::QualityConfig::for_sparte)(crate::QualityConfig::for_sparte) for the
+    /// [`QualityConfig::for_sparte`](crate::QualityConfig::for_sparte) for the
     /// media-specific values.
     pub outlier_min_sigma: f64,
 
     /// Number of consecutive zero-value intervals that triggers V05.
     ///
-    /// Default: `4` — one hour at quarter-hour granularity.
+    /// Default: `4` — one hour at quarter-hour granularity. **`0` disables the
+    /// rule**, and [`enabled_rules`](Self::enabled_rules) reports it as off.
+    ///
+    /// The finding carries the run's real length, not this threshold.
     pub zero_run_threshold: usize,
 
     /// Treat negative energy as an Error (V03).
@@ -509,6 +523,19 @@ pub struct ValidationConfig {
     /// over its own interval exceeds this is physically impossible for the
     /// metered plant. `None` disables the check.
     pub max_plant_power_kw: Option<Decimal>,
+
+    /// Where a **daily** series is cut, for the V06 length check.
+    ///
+    /// Only consulted when [`expected_interval_secs`](Self::expected_interval_secs)
+    /// is `86_400`. A German day is 82 800 s each spring and 90 000 s each
+    /// autumn, so a daily series is judged against the calendar rather than
+    /// against the flat second count — and the gas market's day starts at
+    /// 06:00, so which day an interval belongs to depends on the boundary.
+    ///
+    /// [`DayBoundary::Midnight`] by default; a daily gas series wants
+    /// [`DayBoundary::Gastag`], or it draws a length warning on both transition
+    /// days every year for being exactly right.
+    pub day_boundary: DayBoundary,
 }
 
 impl Default for ValidationConfig {
@@ -523,6 +550,7 @@ impl Default for ValidationConfig {
             negative_energy_is_error: true,
             now: None,
             max_plant_power_kw: None,
+            day_boundary: DayBoundary::Midnight,
         }
     }
 }
@@ -599,6 +627,23 @@ impl ValidationConfig {
         self
     }
 
+    /// Cut daily intervals on `boundary` for the V06 length check
+    /// (builder style).
+    ///
+    /// ```rust
+    /// use metering::{ValidationConfig, calendar::DayBoundary};
+    ///
+    /// // A daily gas series is a whole number of Gastage, 23–25 h each.
+    /// let cfg = ValidationConfig { expected_interval_secs: Some(86_400), ..Default::default() }
+    ///     .on(DayBoundary::Gastag);
+    /// assert_eq!(cfg.day_boundary, DayBoundary::Gastag);
+    /// ```
+    #[must_use]
+    pub const fn on(mut self, boundary: DayBoundary) -> Self {
+        self.day_boundary = boundary;
+        self
+    }
+
     /// The rules this configuration permits to fire.
     ///
     /// Config-level only. Whether a rule then *ran* on a particular series is
@@ -608,12 +653,17 @@ impl ValidationConfig {
         use ValidationRuleId as R;
         let mut set = RuleSet::EMPTY
             .with(R::OverlapDetected)
-            .with(R::SuspiciousZeroRun)
             .with(R::DstAmbiguity)
             .with(R::NonBillableQuality)
             .with(R::UnorderedSeries);
         if self.negative_energy_is_error {
             set = set.with(R::NegativeEnergy);
+        }
+        // A threshold of zero is not "report every zero"; it is off, and
+        // `enabled_rules` has to say so or a caller reads a clean report as
+        // "no stuck meter" when nothing looked.
+        if self.zero_run_threshold > 0 {
+            set = set.with(R::SuspiciousZeroRun);
         }
         if self.expected_interval_secs.is_some_and(|s| s > 0) {
             set = set.with(R::GapDetected).with(R::InconsistentIntervalLength);
@@ -797,6 +847,7 @@ pub fn validate_intervals(
     }
 
     issues.extend(per_interval_rules(intervals, &order, config));
+    issues.extend(zero_run_rule(intervals, &order, config));
     issues.extend(outlier_rule(intervals, &order, config));
     issues.extend(gap_rules(intervals, &order, config));
 
@@ -826,9 +877,8 @@ fn per_interval_rules(
     config: &ValidationConfig,
 ) -> Vec<ValidationIssue> {
     let mut issues = Vec::new();
-    let mut zero_run = 0usize;
 
-    for (pos, &idx) in order.iter().enumerate() {
+    for &idx in order {
         let iv = &intervals[idx];
 
         // V03 — negative energy
@@ -862,37 +912,10 @@ fn per_interval_rules(
             );
         }
 
-        // V05 — zero run. Emitted once, when the threshold is first reached.
-        if iv.value.is_zero() {
-            zero_run += 1;
-            if zero_run == config.zero_run_threshold
-                && config.zero_run_threshold > 0
-                // The run cannot be longer than the positions walked so far, so
-                // this holds — but it is a `usize` subtraction, and an
-                // invariant three lines away is not a guard.
-                && let Some(start) = (pos + 1).checked_sub(config.zero_run_threshold)
-            {
-                let start_idx = order[start];
-                issues.push(
-                    ValidationIssue::new(
-                        ValidationRuleId::SuspiciousZeroRun,
-                        ValidationSeverity::Warning,
-                        format!(
-                            "{} consecutive zero intervals from {}",
-                            config.zero_run_threshold, intervals[start_idx].from
-                        ),
-                    )
-                    .at(start_idx, &intervals[start_idx]),
-                );
-            }
-        } else {
-            zero_run = 0;
-        }
-
         // V06 — interval length consistency
         if let Some(expected_secs) = config.expected_interval_secs {
             let actual_secs = (iv.to - iv.from).whole_seconds();
-            if actual_secs != expected_length_secs(iv, expected_secs) {
+            if actual_secs != expected_length_secs(iv, expected_secs, config.day_boundary) {
                 issues.push(
                     ValidationIssue::new(
                         ValidationRuleId::InconsistentIntervalLength,
@@ -948,21 +971,83 @@ fn per_interval_rules(
 /// each autumn, so a gas or water series read once a day would draw a V06
 /// warning on both transition days every year — for being exactly right.
 ///
-/// When the expectation is 86 400 s **and** the interval starts at a Berlin
-/// local midnight, the real length of that calendar day is used instead. The
-/// midnight condition matters: a fixed 24-hour window that happens to be
-/// 86 400 s long is a different thing from a calendar day, and only the latter
-/// gets the DST allowance.
-fn expected_length_secs(iv: &MeterInterval, expected_secs: u32) -> i64 {
+/// When the expectation is 86 400 s **and** the interval starts exactly on a
+/// day boundary, the real length of that day is used instead. The boundary
+/// condition matters: a fixed 24-hour window that happens to be 86 400 s long
+/// is a different thing from a calendar day, and only the latter gets the DST
+/// allowance.
+///
+/// Which boundary is [`ValidationConfig::day_boundary`], so a daily **gas**
+/// series on the 06:00 Gastag gets the same allowance as an electricity series
+/// on the Liefertag. The two transition days are not even the same date for
+/// the two boundaries: the clocks move at 02:00/03:00, inside the Gastag that
+/// began the previous morning.
+fn expected_length_secs(iv: &MeterInterval, expected_secs: u32, boundary: DayBoundary) -> i64 {
     const ONE_DAY: u32 = 86_400;
     if expected_secs != ONE_DAY {
         return i64::from(expected_secs);
     }
-    let local = iv.from.to_timezone(timezones::db::europe::BERLIN);
-    if local.time() != time::Time::MIDNIGHT {
+    let day = boundary.local_day(iv.from);
+    if boundary.day_start_utc(day) != iv.from {
         return i64::from(ONE_DAY);
     }
-    crate::calendar::day_length(local.date()).whole_seconds()
+    boundary.day_length(day).whole_seconds()
+}
+
+// ── V05 — stuck meter ────────────────────────────────────────────────────────
+
+/// Report each run of consecutive zero intervals that reaches the threshold,
+/// with the length the run **actually** reached.
+///
+/// Emitted when the run closes, not when it crosses the threshold: a meter
+/// stuck for three weeks says three weeks, not the four intervals that armed
+/// the rule.
+///
+/// One finding per run, anchored at its first interval, so a series with two
+/// separate outages reports two.
+fn zero_run_rule(
+    intervals: &[MeterInterval],
+    order: &[usize],
+    config: &ValidationConfig,
+) -> Vec<ValidationIssue> {
+    if config.zero_run_threshold == 0 {
+        return Vec::new();
+    }
+    let mut issues = Vec::new();
+    let mut run: Option<(usize, usize)> = None; // (first index, length)
+
+    let close = |run: Option<(usize, usize)>, issues: &mut Vec<ValidationIssue>| {
+        let Some((start_idx, len)) = run else { return };
+        if len < config.zero_run_threshold {
+            return;
+        }
+        let first = &intervals[start_idx];
+        issues.push(
+            ValidationIssue::new(
+                ValidationRuleId::SuspiciousZeroRun,
+                ValidationSeverity::Warning,
+                format!(
+                    "{len} consecutive zero intervals from {} — at or above the \
+                     configured threshold of {}",
+                    first.from, config.zero_run_threshold
+                ),
+            )
+            .at(start_idx, first),
+        );
+    };
+
+    for &idx in order {
+        if intervals[idx].value.is_zero() {
+            run = Some(match run {
+                Some((start_idx, len)) => (start_idx, len + 1),
+                None => (idx, 1),
+            });
+        } else {
+            close(run.take(), &mut issues);
+        }
+    }
+    close(run, &mut issues);
+    issues
 }
 
 // ── V04 — robust statistical outlier ─────────────────────────────────────────
@@ -974,14 +1059,10 @@ fn expected_length_secs(iv: &MeterInterval, expected_secs: u32) -> i64 {
 /// the statistics, so validation and quality scoring cannot disagree about what
 /// an outlier is.
 ///
-/// The rule it replaced compared each value against the **mean of the whole
-/// series** and flagged anything above `factor × mean`. Two things were wrong
-/// with that. The mean includes the spike, so a single large value raises its
-/// own threshold — with a factor of 10, one interval had to exceed roughly ten
-/// times the average of a series it was itself inflating, which for a short
-/// series is unreachable. And a global mean has no notion of the daily shape,
-/// so on any profile with a real day/night swing the quiet hours are compared
-/// against a threshold set by the busy ones.
+/// A mean-based test cannot do this job. The mean includes the spike, so a
+/// large value raises its own threshold; and a global mean has no notion of the
+/// daily shape, so the quiet hours are judged against a threshold set by the
+/// busy ones.
 /// Whether a series of `len` intervals is long enough for the V04 window.
 ///
 /// A window needs more points than it has room for, or every point is its own
@@ -1149,16 +1230,13 @@ fn gap_rules(
 ///
 /// ## The test is the repeated hour, not the day
 ///
-/// An earlier version compared the whole day's covered duration against 25
-/// hours. That cannot tell a collapsed hour from an ordinary gap: *any* two
-/// missing quarter-hours anywhere on a fall-back day produced a confident
-/// report that "the repeated hour 02:00–03:00 was collapsed", which was simply
-/// untrue and sent the reader looking in the wrong place.
-///
 /// The two passes occupy `[transition − 1 h, transition + 1 h)` in UTC — one at
-/// UTC+2, one at UTC+1. This looks only there. A gap at midday is a V01 gap and
-/// nothing else; a genuinely collapsed hour shows up here even on a day that is
-/// otherwise complete.
+/// UTC+2, one at UTC+1 — and this looks only there. Comparing the whole day's
+/// covered duration against 25 hours instead would report any two missing
+/// quarter-hours anywhere on the day as a collapsed hour, which sends the
+/// reader to the wrong place. A gap at midday is a V01 gap and nothing else; a
+/// genuinely collapsed hour shows up here even on a day that is otherwise
+/// complete.
 ///
 /// The rule only judges a series that demonstrably **spans** that window, so a
 /// truncated query window is short rather than corrupt.
@@ -1734,5 +1812,257 @@ mod rule_set_tests {
         assert_eq!(partial.grade, crate::QualityGrade::A);
         assert!(!partial.covers_every_rule());
         assert_eq!(partial.skipped_rules().to_string(), "V08, V12");
+    }
+}
+
+#[cfg(test)]
+mod zero_run_tests {
+    use super::*;
+    use crate::interval::QualityFlag;
+    use rust_decimal::dec;
+    use time::macros::datetime;
+
+    /// `n` quarter-hours from `start`, with the values given.
+    fn series(values: &[Decimal]) -> Vec<MeterInterval> {
+        values
+            .iter()
+            .enumerate()
+            .map(|(i, &value)| {
+                let from = datetime!(2026-06-01 0:00 UTC) + Duration::minutes(15 * i as i64);
+                MeterInterval {
+                    from,
+                    to: from + Duration::minutes(15),
+                    value,
+                    quality: QualityFlag::Measured,
+                    obis_code: None,
+                }
+            })
+            .collect()
+    }
+
+    fn cfg() -> ValidationConfig {
+        ValidationConfig {
+            outlier_sigma: None,
+            ..ValidationConfig::default()
+        }
+    }
+
+    /// The number in the message is the run, not the threshold: it is the
+    /// figure a reader acts on.
+    #[test]
+    fn the_finding_carries_the_real_run_length() {
+        let mut values = vec![dec!(2); 40];
+        for v in values.iter_mut().skip(4).take(30) {
+            *v = Decimal::ZERO;
+        }
+        let result = validate_intervals(&series(&values), &cfg());
+        let found: Vec<&ValidationIssue> = result
+            .by_rule(ValidationRuleId::SuspiciousZeroRun)
+            .collect();
+        assert_eq!(found.len(), 1, "one finding per run: {found:?}");
+        assert!(
+            found[0].message.starts_with("30 consecutive"),
+            "{}",
+            found[0].message
+        );
+        assert_eq!(
+            found[0].interval_index,
+            Some(4),
+            "anchored at the run start"
+        );
+    }
+
+    /// Two outages are two findings, not one merged one and not one per zero.
+    #[test]
+    fn each_run_is_reported_once() {
+        let mut values = vec![dec!(2); 40];
+        for i in [4, 5, 6, 7, 20, 21, 22, 23, 24] {
+            values[i] = Decimal::ZERO;
+        }
+        let result = validate_intervals(&series(&values), &cfg());
+        let lengths: Vec<&str> = result
+            .by_rule(ValidationRuleId::SuspiciousZeroRun)
+            .map(|i| i.message.split(' ').next().unwrap_or(""))
+            .collect();
+        assert_eq!(lengths, ["4", "5"]);
+    }
+
+    /// A run still open at the end of the series is reported — the earlier
+    /// implementation happened to catch it, and the new one must too.
+    #[test]
+    fn a_run_that_never_ends_is_still_reported() {
+        let mut values = vec![dec!(2); 10];
+        for v in values.iter_mut().skip(6) {
+            *v = Decimal::ZERO;
+        }
+        let result = validate_intervals(&series(&values), &cfg());
+        assert_eq!(
+            result.by_rule(ValidationRuleId::SuspiciousZeroRun).count(),
+            1
+        );
+    }
+
+    /// A run below the threshold is silence, and a threshold of zero is the
+    /// rule switched off — which `enabled_rules` has to admit.
+    #[test]
+    fn the_threshold_is_a_switch_the_ruleset_reports() {
+        let values = vec![dec!(2), Decimal::ZERO, Decimal::ZERO, dec!(2)];
+        let result = validate_intervals(&series(&values), &cfg());
+        assert!(
+            result.is_clean(),
+            "two zeros is under the threshold of four"
+        );
+
+        let off = ValidationConfig {
+            zero_run_threshold: 0,
+            ..cfg()
+        };
+        assert!(
+            !off.enabled_rules()
+                .contains(ValidationRuleId::SuspiciousZeroRun),
+            "a zero threshold is off, and a clean report must not claim otherwise"
+        );
+        assert!(
+            off.disabled_rules()
+                .contains(ValidationRuleId::SuspiciousZeroRun)
+        );
+        assert_eq!(
+            ValidationRuleId::SuspiciousZeroRun.enabling_field(),
+            Some("zero_run_threshold"),
+        );
+
+        let all_zero = vec![Decimal::ZERO; 20];
+        assert!(validate_intervals(&series(&all_zero), &off).is_clean());
+    }
+
+    /// Shuffled input reports the same runs: the rule walks timestamp order.
+    #[test]
+    fn runs_are_found_in_timestamp_order_not_slice_order() {
+        let mut values = vec![dec!(2); 20];
+        for v in values.iter_mut().skip(8).take(6) {
+            *v = Decimal::ZERO;
+        }
+        let ordered = series(&values);
+        let mut shuffled = ordered.clone();
+        shuffled.reverse();
+
+        let a = validate_intervals(&ordered, &cfg());
+        let b = validate_intervals(&shuffled, &cfg());
+        let msg = |r: &ValidationResult| {
+            r.by_rule(ValidationRuleId::SuspiciousZeroRun)
+                .map(|i| i.message.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(msg(&a), msg(&b));
+        assert!(msg(&a)[0].starts_with("6 consecutive"), "{:?}", msg(&a));
+    }
+}
+
+#[cfg(test)]
+mod daily_length_tests {
+    use super::*;
+    use crate::calendar;
+    use crate::interval::QualityFlag;
+    use rust_decimal::dec;
+    use time::Date;
+    use time::macros::date;
+
+    /// One interval per day of `days`, cut on `boundary`.
+    fn daily(first: Date, days: i64, boundary: DayBoundary) -> Vec<MeterInterval> {
+        let mut out = Vec::new();
+        let mut day = first;
+        for _ in 0..days {
+            out.push(MeterInterval {
+                from: boundary.day_start_utc(day),
+                to: boundary.day_end_utc(day),
+                value: dec!(100),
+                quality: QualityFlag::Measured,
+                obis_code: None,
+            });
+            day = day.next_day().expect("in range");
+        }
+        out
+    }
+
+    fn daily_cfg(boundary: DayBoundary) -> ValidationConfig {
+        ValidationConfig {
+            expected_interval_secs: Some(86_400),
+            outlier_sigma: None,
+            ..ValidationConfig::default()
+        }
+        .on(boundary)
+    }
+
+    /// The 23- and 25-hour days are the right length, on either boundary — a
+    /// midnight-only allowance would warn on a daily Gastag series for being
+    /// exactly right.
+    #[test]
+    fn a_daily_series_is_judged_against_its_own_boundarys_calendar() {
+        for (boundary, spring, autumn) in [
+            // The calendar day that holds the transition…
+            (
+                DayBoundary::Midnight,
+                date!(2026 - 03 - 29),
+                date!(2026 - 10 - 25),
+            ),
+            // …is the Saturday before it for gas: the clocks move at
+            // 02:00/03:00, inside the Gastag that began the previous morning.
+            (
+                DayBoundary::Gastag,
+                date!(2026 - 03 - 28),
+                date!(2026 - 10 - 24),
+            ),
+        ] {
+            assert_eq!(boundary.day_length(spring).whole_hours(), 23);
+            assert_eq!(boundary.day_length(autumn).whole_hours(), 25);
+
+            for day in [spring, autumn] {
+                let series = daily(day, 1, boundary);
+                let result = validate_intervals(&series, &daily_cfg(boundary));
+                assert!(
+                    result
+                        .by_rule(ValidationRuleId::InconsistentIntervalLength)
+                        .next()
+                        .is_none(),
+                    "{boundary:?} {day}: {:?}",
+                    result.issues
+                );
+            }
+        }
+    }
+
+    /// A week over the autumn transition validates clean end to end — no gap,
+    /// no length warning, on either boundary.
+    #[test]
+    fn a_week_of_gas_days_across_the_transition_is_clean() {
+        let series = daily(date!(2026 - 10 - 21), 7, DayBoundary::Gastag);
+        let cfg = daily_cfg(DayBoundary::Gastag).over_period(
+            calendar::gas_day_start_utc(date!(2026 - 10 - 21)),
+            calendar::gas_day_end_utc(date!(2026 - 10 - 27)),
+        );
+        let result = validate_intervals(&series, &cfg);
+        assert!(result.is_clean(), "{:?}", result.issues);
+    }
+
+    /// The allowance is for a *calendar* day only: a fixed 24-hour window that
+    /// starts somewhere else is still held to 86 400 s.
+    #[test]
+    fn an_off_boundary_24_hour_window_gets_no_dst_allowance() {
+        let from = calendar::day_start_utc(date!(2026 - 10 - 25)) + Duration::hours(9);
+        let series = vec![MeterInterval {
+            from,
+            to: from + Duration::hours(25),
+            value: dec!(100),
+            quality: QualityFlag::Measured,
+            obis_code: None,
+        }];
+        let result = validate_intervals(&series, &daily_cfg(DayBoundary::Midnight));
+        assert_eq!(
+            result
+                .by_rule(ValidationRuleId::InconsistentIntervalLength)
+                .count(),
+            1,
+            "a 25-hour window that is not a calendar day is 25 hours too long"
+        );
     }
 }

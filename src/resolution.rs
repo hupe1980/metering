@@ -246,6 +246,58 @@ impl IntervalResolution {
         }
     }
 
+    /// The resolution a **measured** spacing of `secs` seconds indicates.
+    ///
+    /// [`from_seconds`](Self::from_seconds) is exact; this is the tolerant
+    /// counterpart for a number read off real data, where a transmission
+    /// timestamp wanders by a few seconds and a daily series is 23, 24 or 25
+    /// hours long depending on the date.
+    ///
+    /// | Observed | Resolution |
+    /// |---|---|
+    /// | 750…1 050 s | [`QuarterHour`](Self::QuarterHour) |
+    /// | 1 650…1 950 s | [`HalfHour`](Self::HalfHour) |
+    /// | 3 300…3 900 s | [`Hour`](Self::Hour) |
+    /// | 82 800…90 000 s | [`Day`](Self::Day) — the Berlin calendar day |
+    /// | anything else | [`from_seconds`](Self::from_seconds) exactly |
+    ///
+    /// The daily band is why this exists and why it answers `Day` rather than
+    /// `Custom(86_400)`: a series read once a day legitimately contains all
+    /// three lengths, and a fixed 24-hour window is a different thing from a
+    /// German calendar day.
+    ///
+    /// `None` for a non-positive spacing, and for one too large to be a
+    /// resolution at all.
+    ///
+    /// ```rust
+    /// use metering::IntervalResolution;
+    ///
+    /// assert_eq!(IntervalResolution::from_observed_seconds(898), Some(IntervalResolution::QuarterHour));
+    /// // A 25-hour autumn day is still a day.
+    /// assert_eq!(IntervalResolution::from_observed_seconds(90_000), Some(IntervalResolution::Day));
+    /// // ...while a fixed 24-hour window read exactly is not.
+    /// assert_eq!(IntervalResolution::from_observed_seconds(300), IntervalResolution::from_seconds(300));
+    /// assert_eq!(IntervalResolution::from_observed_seconds(0), None);
+    /// ```
+    #[must_use]
+    pub const fn from_observed_seconds(secs: i64) -> Option<Self> {
+        match secs {
+            750..=1_050 => Some(Self::QuarterHour),
+            1_650..=1_950 => Some(Self::HalfHour),
+            3_300..=3_900 => Some(Self::Hour),
+            // 23 h … 25 h — a Berlin calendar day at either DST transition.
+            82_800..=90_000 => Some(Self::Day),
+            other => {
+                // `u32::try_from` is not const; the bounds check is the same.
+                if other <= 0 || other > u32::MAX as i64 {
+                    None
+                } else {
+                    Self::from_seconds(other as u32)
+                }
+            }
+        }
+    }
+
     /// `true` when this resolution supports real-time or near-real-time data.
     ///
     /// Quarter-hour and half-hour are the relevant resolutions for iMSys / SMGW.
@@ -257,8 +309,12 @@ impl IntervalResolution {
 
 impl fmt::Display for IntervalResolution {
     /// Writes the ISO 8601 duration form, which [`FromStr`] reads back.
+    ///
+    /// Width, fill and alignment are honoured, as they are for
+    /// [`ObisCode`](crate::ObisCode) and every coded enum here, so `{:>6}`
+    /// lines a resolution up in a table.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.to_iso8601())
+        f.pad(&self.to_iso8601())
     }
 }
 
@@ -395,9 +451,9 @@ mod tests {
     }
 
     /// A named length is never reachable as a `Custom`, so one duration has one
-    /// value — the hole that let `Custom(900)` and `QuarterHour` be two
-    /// distinct keys for one 15-minute grid, with `Custom(900).to_string()`
-    /// parsing back as the other one.
+    /// value: `Custom(900)` and `QuarterHour` would otherwise be two distinct
+    /// keys for one 15-minute grid, and `Custom(900).to_string()` would parse
+    /// back as the other one.
     #[test]
     fn a_named_length_is_never_a_custom() {
         for named in [900u32, 1800, 3600] {
@@ -453,6 +509,12 @@ mod tests {
         }
         assert_eq!(IntervalResolution::QuarterHour.to_string(), "PT15M");
         assert_eq!(IntervalResolution::Day.to_string(), "P1D");
+        // Width and alignment are honoured, so a channel listing lines up.
+        assert_eq!(format!("{:>6}", IntervalResolution::Day), "   P1D");
+        assert_eq!(
+            format!("{:<6}|", IntervalResolution::QuarterHour),
+            "PT15M |"
+        );
         assert_eq!(
             IntervalResolution::from_seconds(300).unwrap().to_string(),
             "PT300S"

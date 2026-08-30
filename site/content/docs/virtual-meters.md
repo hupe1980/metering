@@ -1,7 +1,7 @@
 +++
 title = "Virtual meters"
 description = "§ 42b EnWG Gemeinschaftliche Gebäudeversorgung: constant and proportional PV allocation, and the two caps that apply."
-weight = 10
+weight = 11
 +++
 
 A virtual meter derives one series from others.
@@ -103,7 +103,8 @@ Internal tagging needs a self-describing format, so this type will not
 round-trip through bincode or postcard. That is the right way round: a rule is
 configuration, stored once per delivery point in a queryable document, and the
 hot types a binary format is chosen for — `MeterInterval`, `ObisCode` — are
-untouched.
+untouched. Both halves are pinned by a test; see
+[design](@/docs/design.md#the-hot-types-survive-a-non-self-describing-format).
 
 ## Intersection semantics
 
@@ -113,3 +114,87 @@ A gap in any one source propagates rather than silently producing a wrong total
 that was never measured.
 
 Source series must share a timestamp grid; resample first if they do not.
+
+## The whole community at once
+
+`compute_ggv_allocation` answers for one tenant, which is the shape a persisted
+`virtual_meter_configs` row has. `compute_community_allocation` answers for the
+community, which is the shape a settlement, a dashboard and an optimiser want —
+and it is not the same computation run N times:
+
+- the proportional denominator is formed once instead of once per tenant, and
+  the source index once instead of N times, so a year of quarter-hours across a
+  twenty-flat building stops being quadratic in the tenant count;
+- the **surplus** that fed the grid is a number, not something to reconstruct by
+  subtracting N results from the generation;
+- and the § 42b Abs. 5 pool ceiling becomes computable at all, because it is
+  defined over the whole participant set.
+
+```rust
+use metering::{AllocationKey, compute_community_allocation};
+
+let key = AllocationKey::Proportional {
+    participants: vec!["T1".to_owned(), "T2".to_owned()],
+};
+let out = compute_community_allocation("PLANT", &key, &sources)?;
+let interval = &out[0];
+
+assert_eq!(interval.pool_cap, interval.generation.min(interval.total_consumption));
+assert!(interval.total_allocated() <= interval.pool_cap);
+assert_eq!(interval.generation, interval.total_allocated() + interval.surplus_to_grid);
+```
+
+### The pool cap is a theorem, not a step
+
+§ 42b Abs. 5 caps *"die rechnerisch aufteilbare Strommenge … auf die Strommenge,
+die innerhalb eines 15-Minuten-Zeitintervalls in der Solaranlage erzeugt oder
+von allen teilnehmenden Letztverbrauchern verbraucht wird, je nachdem welche
+dieser Strommengen geringer ist."*
+
+The function does not clamp to that figure, because it does not have to: with
+fractions summing to at most 1, the per-participant `Pos()` cap already implies
+it. `Σ min(cᵢ, shareᵢ) ≤ Σ cᵢ` and `Σ shareᵢ ≤ generation`, so the allocated
+total never exceeds either limb. Clamping a second time would be a rule the
+statute does not contain, applied to a quantity that already satisfies it.
+
+`pool_cap` reports the ceiling so a caller can assert against it, and
+`tests/allocation_invariants.rs` holds the inequality under proptest — an
+argument about a billed quantity is worth a proof obligation.
+
+### A share is a quantity, so it has a scale
+
+The proportional key divides, and a `Decimal` quotient carries up to 28
+significant digits. `ALLOCATION_DP` cuts the derived share to **six** decimal
+places, toward zero, for two reasons.
+
+It makes the share a number somebody can write down: no invoice, no MSCONS field
+and no settlement system has a place for 0.333…3 kWh to twenty-seven places.
+
+And it is what makes `consumption = allocated + net_grid_draw` hold exactly.
+An uncut proportional share leaves `consumption − allocated` needing more
+significant digits than a `Decimal` has, and the identity misses by a few
+1e-27 kWh.
+
+Cutting *toward zero* is not stylistic: truncating can only lower a share, so
+`Σ allocated ≤ Σ share ≤ generation` survives it and the ceiling above stays a
+theorem. The consumption itself is never cut — it is the caller's measurement —
+so a participant whose whole draw is covered is credited exactly what they drew
+and nets exactly zero, at whatever scale their meter delivered.
+
+## § 42c Energy Sharing uses the same arithmetic
+
+Energy Sharing has **no published allocation formula**. § 42c Abs. 3 Nr. 2
+requires the *contract* to state
+
+> einen Aufteilungsschlüssel, aus dem sich der Umfang des Rechts zur Nutzung der
+> Elektrizität ergibt
+
+so the key is an input rather than a constant, and both `AllocationKey` variants
+express one. The per-participant `min(consumption, share)` carries over as
+physics rather than law — nobody can be credited energy they did not draw.
+
+What does **not** carry over is `pool_cap`: § 42c contains no counterpart to
+§ 42b Abs. 5, so under a sharing contract that field is an observation, not a
+ceiling. Eligibility — which delivery points can produce quarter-hour values at
+all — is [`sharing`](@/docs/regulatory-basis.md), a separate question from the
+allocation.

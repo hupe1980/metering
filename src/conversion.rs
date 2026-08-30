@@ -55,29 +55,62 @@ use rust_decimal::Decimal;
 use crate::interval::MeasurementUnit;
 
 /// Parameters for Gas m³ → kWh_Hs conversion.
-#[derive(Debug, Clone)]
+///
+/// Both are **operator data**, published per supply area and billing period —
+/// which is why there is no `Default`. A typical-value Brennwert is a direct
+/// multiplier on a billed quantity: a 10.55 stand-in against a real 11.20
+/// understates every gas invoice in the portfolio by 6 %, with nothing in the
+/// output to show for it. The same refusal as
+/// [`LastgangConfig`](crate::reading::LastgangConfig)'s missing register width.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct GasConversionParams {
     /// Superior calorific value (Brennwert Ho / Hs) in kWh/m³.
     ///
-    /// Published monthly by the gas distributor per supply area.
-    /// Source: Messstellenbetreiber / NB monthly data per supply area.
+    /// Published by the gas distributor per supply area — OBIS `7-0:54.0.ee`,
+    /// where E selects the averaging period (16 hourly, 20 daily, 22 monthly).
+    /// German Erdgas H runs roughly 9.5–12.0 kWh/m³.
     pub hs_kwh_per_m3: Decimal,
     /// Volume conversion factor (Zustandszahl, dimensionless).
     ///
-    /// Accounts for pressure and temperature at the meter.
-    /// Neutral default when not separately metered: 1.0.
+    /// Accounts for pressure and temperature at the meter — OBIS `7-0:52.0.22`,
+    /// typically 0.92–1.06. Use [`already_converted`](Self::already_converted)
+    /// for a volume a Mengenumwerter has already state-converted.
     pub zustandszahl: Decimal,
 }
 
 impl GasConversionParams {
-    /// Default conversion parameters when no measurement data is available.
-    ///
-    /// Uses `Hs = 10.55 kWh/m³` (typical German Erdgas H average) and
-    /// `Zustandszahl = 1.0` (neutral).
+    /// Conversion parameters for a **Betriebsvolumen** — the volume at meter
+    /// conditions, OBIS `7-0:3.0.0`.
     #[must_use]
-    pub fn default_erdgas_h() -> Self {
+    pub const fn new(hs_kwh_per_m3: Decimal, zustandszahl: Decimal) -> Self {
         Self {
-            hs_kwh_per_m3: Decimal::from_str_exact("10.55").unwrap_or(Decimal::from(10u32)),
+            hs_kwh_per_m3,
+            zustandszahl,
+        }
+    }
+
+    /// Conversion parameters for a volume the Mengenumwerter has **already**
+    /// state-converted — `7-0:13.2.0` Normvolumen umgewertet, or `7-0:3.2.0`
+    /// Normvolumen gemessen.
+    ///
+    /// The Zustandszahl is `1`, because it has already been applied. Passing
+    /// the real one a second time overstates the energy by its deviation from
+    /// 1 — a few percent, silently, on a billed quantity.
+    ///
+    /// ```rust
+    /// use metering::{GasConversionParams, normalize_to_kwh};
+    /// use rust_decimal::dec;
+    ///
+    /// // 100 m³ of Normvolumen at 11.2 kWh/m³ is exactly 1 120 kWh.
+    /// let params = GasConversionParams::already_converted(dec!(11.2));
+    /// assert_eq!(normalize_to_kwh(dec!(100), "m3", Some(&params), None)?, dec!(1120.0));
+    /// # Ok::<(), metering::ConversionError>(())
+    /// ```
+    #[must_use]
+    pub const fn already_converted(hs_kwh_per_m3: Decimal) -> Self {
+        Self {
+            hs_kwh_per_m3,
             zustandszahl: Decimal::ONE,
         }
     }
@@ -221,11 +254,9 @@ pub fn gas_m3_to_kwh_hs_rounded(
 ///
 /// # Errors
 ///
-/// Returns [`ConversionError`] rather than guessing. The previous signature
-/// returned a bare `Decimal` and fell through to *"assume already kWh"* for any
-/// unit it did not recognise, so `"MWh"` — which the crate's own
-/// [`MeasurementUnit::parse_scaled`] reads correctly — passed through
-/// unconverted and understated the reading by a factor of a thousand, silently.
+/// Returns [`ConversionError`] rather than guessing. An unrecognised unit is
+/// never assumed to be kWh already: `"MWh"` treated that way understates a
+/// reading by a factor of a thousand, silently.
 ///
 /// # Example
 ///
@@ -323,11 +354,21 @@ mod tests {
         assert_eq!(gas_m3_to_kwh_hs(dec!(0), dec!(10.55), dec!(1.0)), dec!(0));
     }
 
+    /// A Normvolumen has already been state-converted, so the Zustandszahl to
+    /// apply to it is `1`. Applying the real one again overstates the energy
+    /// by its deviation from unity — silently, on a billed quantity.
     #[test]
-    fn default_erdgas_h_params() {
-        let p = GasConversionParams::default_erdgas_h();
-        assert_eq!(p.hs_kwh_per_m3, dec!(10.55));
+    fn an_already_converted_volume_carries_no_zustandszahl() {
+        let p = GasConversionParams::already_converted(dec!(11.2));
         assert_eq!(p.zustandszahl, Decimal::ONE);
+        assert_eq!(p, GasConversionParams::new(dec!(11.2), Decimal::ONE));
+
+        // 100 m³ Normvolumen at 11.2 kWh/m³ is exactly 1 120 kWh…
+        let normvolumen = gas_m3_to_kwh_hs(dec!(100), p.hs_kwh_per_m3, p.zustandszahl);
+        assert_eq!(normvolumen, dec!(1120.0));
+        // …and applying a 0.98 Zustandszahl on top of it loses 2 %.
+        let doubled = gas_m3_to_kwh_hs(dec!(100), dec!(11.2), dec!(0.98));
+        assert!(doubled < normvolumen);
     }
 }
 

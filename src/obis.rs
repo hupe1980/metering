@@ -610,7 +610,7 @@ impl ObisCode {
     /// A Fehlerregister counts fault occurrences. Its value must never be
     /// summed into an Arbeitsmenge.
     #[must_use]
-    pub fn is_fehlerregister(&self) -> bool {
+    pub const fn is_fehlerregister(&self) -> bool {
         self.e == Self::TARIFF_FEHLERREGISTER
     }
 
@@ -632,45 +632,92 @@ impl ObisCode {
         self.e == 2
     }
 
-    /// Default expected interval resolution for this OBIS code.
+    /// The grid a series on this channel is ordinarily delivered on.
     ///
-    /// RLM and iMSys electricity meters use 15-minute intervals.
-    /// Gas meters and SLP typically use hourly or daily totals.
+    /// A *default*, not a guarantee: it is the expectation an ingest path
+    /// starts from when the message carries no explicit resolution. What the
+    /// series actually holds is
+    /// [`detect_interval_length`](crate::detect_interval_length).
     ///
-    /// Returns `None` for codes where no standard resolution applies
-    /// (e.g. status codes, the Fehlerregister).
+    /// `None` where the channel is **not an equidistant series at all**, which
+    /// is a different answer from "some resolution we cannot name" and the
+    /// reason this returns an `Option`:
+    ///
+    /// | Channel | Answer | Why |
+    /// |---|---|---|
+    /// | Fehlerregister, E = 63 | `None` | counts faults, not energy over time |
+    /// | Maximum, electricity D = 6 | `None` | one figure per billing period |
+    /// | Vorschub, electricity D = 9 | `None` | an arbitrary period, by definition off-grid |
+    /// | Momentanwert, electricity D = 7 | `None` | an instant, not an interval |
+    /// | electricity Zählerstand / Lastgang, C = 1…8 | `PT15M` | § 2 Satz 1 Nr. 27 MsbG |
+    /// | gas Zustandszahl / Brennwert, C = 52 / 54 | from value group E | 16 hourly, 20 daily, 22 monthly |
+    /// | other gas | `PT1H` | § 2 Satz 1 Nr. 27 MsbG: *stündlich* for gas |
+    /// | heat, cooling (A = 5, 6) | `PT1H` | |
+    /// | cold, hot water (A = 8, 9) | `P1D` | submetering is read daily at best |
+    ///
+    /// The Messart exclusions apply on the **electricity** axis only. Value
+    /// group C carries a different vocabulary for gas — Messgröße, Quelle,
+    /// Richtung and Qualifikation at once — and D is not a Messart there.
+    ///
+    /// ```rust
+    /// use metering::{IntervalResolution, ObisCode};
+    ///
+    /// assert_eq!(
+    ///     ObisCode::STROM_BEZUG_LASTGANG.default_resolution(),
+    ///     Some(IntervalResolution::QuarterHour),
+    /// );
+    /// // A Brennwert published as a monthly mean is not an hourly series.
+    /// assert_eq!(
+    ///     ObisCode::GAS_BRENNWERT_MONATSMITTEL.default_resolution(),
+    ///     Some(IntervalResolution::Month),
+    /// );
+    /// // A maximum register is one number per period, whether active…
+    /// assert_eq!(ObisCode::STROM_BEZUG_MAXIMUM.default_resolution(), None);
+    /// // …or reactive.
+    /// assert_eq!("1-0:5.6.0".parse::<ObisCode>()?.default_resolution(), None);
+    /// # Ok::<(), metering::ParseError>(())
+    /// ```
     #[must_use]
-    pub fn default_resolution(&self) -> Option<crate::resolution::IntervalResolution> {
-        use crate::resolution::IntervalResolution;
+    pub const fn default_resolution(&self) -> Option<crate::resolution::IntervalResolution> {
+        use crate::resolution::IntervalResolution as R;
         // A fault counter is not a time series at any resolution.
         if self.is_fehlerregister() {
             return None;
         }
-        // Lastgang (D = 29) — the 15-minute series itself.
-        if self.a == 1 && self.is_lastgang() {
-            return Some(IntervalResolution::QuarterHour);
+        match self.a {
+            // Electricity: the Messart says whether this is a series at all,
+            // and the Messgröße whether it is a quantity this crate names.
+            1 => match (self.c, self.d) {
+                // Zählerstand (Zeitintegral 1) and Lastgang (Zeitintegral 5),
+                // active and reactive alike — the quarter-hour grid of
+                // § 2 Satz 1 Nr. 27 MsbG.
+                (1..=8, 8 | 29) => Some(R::QuarterHour),
+                // Maximum (6), Vorschub (9), Momentanwert (7) and anything
+                // else: not an equidistant series.
+                _ => None,
+            },
+            // Cooling and heat meters deliver hourly.
+            5 | 6 => Some(R::Hour),
+            // Gas: value group E names the averaging period of the two
+            // conversion parameters the Codeliste publishes as Mittelwerte.
+            // Treating `7-0:54.0.22` as an hourly channel called a monthly
+            // Brennwert an hourly one.
+            7 => match (self.c, self.e) {
+                (52 | 54, 16) => Some(R::Hour),
+                (52 | 54, 20) => Some(R::Day),
+                (52 | 54, 22) => Some(R::Month),
+                (52 | 54, _) => None,
+                // Volumes and energies: *stündlich ermittelte Zählerstände von
+                // Gasmengen*. An SLP delivery point is allocated daily, but
+                // that is a settlement grid the caller chooses, not a property
+                // of the channel.
+                _ => Some(R::Hour),
+            },
+            // Water — cold (8) and hot (9). Submetering is read daily at best.
+            8 | 9 => Some(R::Day),
+            // Abstract (0), Heizkostenverteiler (4) and everything unmodelled.
+            _ => None,
         }
-        // Active energy electricity — RLM / iMSys: 15 min
-        if self.a == 1 && (self.c == 1 || self.c == 2) && self.d == 8 {
-            return Some(IntervalResolution::QuarterHour);
-        }
-        // Reactive energy, incl. the Q I–Q IV quadrants — 15-min alongside active
-        if self.a == 1 && matches!(self.c, 3..=8) {
-            return Some(IntervalResolution::QuarterHour);
-        }
-        // Gas volume — typically hourly or daily (SLP: daily, RLM Gas: hourly)
-        if self.a == 7 {
-            return Some(IntervalResolution::Hour);
-        }
-        // Thermal energy (cooling 5, heat 6) — usually hourly
-        if matches!(self.a, 5 | 6) {
-            return Some(IntervalResolution::Hour);
-        }
-        // Water (cold 8, hot 9) — submetering is read daily at best
-        if matches!(self.a, 8 | 9) {
-            return Some(IntervalResolution::Day);
-        }
-        None
     }
 
     /// The physical unit this register counts in, derived from the value
@@ -1112,13 +1159,10 @@ mod serde_impl {
 
     impl<'de> Deserialize<'de> for ObisCode {
         /// Accepts either spelling, from borrowing and non-borrowing
-        /// deserialisers alike.
-        ///
-        /// The previous `serde(try_from = "&str")` required the deserialiser to
-        /// hand out a borrowed `&str`, so `serde_json::from_reader`, bincode,
-        /// postcard and MessagePack all failed with "expected a borrowed
-        /// string" no matter what the input said. A visitor has no such
-        /// requirement.
+        /// deserialisers alike — `serde_json::from_reader`, bincode, postcard
+        /// and MessagePack included. A visitor is what makes that work; a
+        /// `try_from = "&str"` bridge would demand a borrowed `&str` and fail
+        /// on all four.
         fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
             deserializer.deserialize_str(ObisCodeVisitor)
         }
@@ -1558,5 +1602,105 @@ mod media_group_tests {
             Some(IntervalResolution::Day)
         );
         assert_eq!(heat.default_resolution(), Some(IntervalResolution::Hour));
+    }
+}
+
+#[cfg(test)]
+mod default_resolution_tests {
+    use super::*;
+    use crate::resolution::IntervalResolution as R;
+
+    fn code(s: &str) -> ObisCode {
+        s.parse().unwrap_or_else(|_| panic!("{s} must parse"))
+    }
+
+    /// A channel that is not an equidistant series has no resolution, and the
+    /// answer must not depend on whether the Messgröße is active or reactive:
+    /// `1-0:5.6.0` and `1-0:1.6.0` are the same Maximum register one Messgröße
+    /// apart, and both have none.
+    #[test]
+    fn a_register_that_is_not_a_series_has_no_resolution() {
+        for s in [
+            "1-0:1.6.0",  // Wirkleistung Maximum
+            "1-0:5.6.0",  // Blindleistung Q I Maximum
+            "1-0:1.9.0",  // Vorschub — an arbitrary period
+            "1-0:3.9.0",  // Blindarbeit Vorschub
+            "1-0:1.7.0",  // Momentanwert
+            "1-0:1.8.63", // Fehlerregister
+            "4-0:1.0.0",  // Heizkostenverteiler — Verbrauchseinheiten
+            "0-0:96.1.0", // an abstract code
+        ] {
+            assert_eq!(code(s).default_resolution(), None, "{s}");
+        }
+    }
+
+    /// § 2 Satz 1 Nr. 27 MsbG: quarter-hourly for electricity, hourly for gas.
+    #[test]
+    fn the_series_channels_carry_the_msbg_cadences() {
+        for s in ["1-0:1.8.0", "1-0:2.8.2", "1-0:1.29.0", "1-0:8.8.0"] {
+            assert_eq!(code(s).default_resolution(), Some(R::QuarterHour), "{s}");
+        }
+        for s in ["7-0:3.0.0", "7-0:13.2.0"] {
+            assert_eq!(code(s).default_resolution(), Some(R::Hour), "{s}");
+        }
+        assert_eq!(
+            ObisCode::WAERME_ENERGY.default_resolution(),
+            Some(R::Hour),
+            "a heat meter delivers hourly"
+        );
+        assert_eq!(
+            ObisCode::WASSER_KALT_VOLUME.default_resolution(),
+            Some(R::Day),
+            "water submetering is read daily at best"
+        );
+    }
+
+    /// For the two gas conversion parameters, value group E **is** the
+    /// averaging period. Reporting a monthly Brennwert as an hourly channel
+    /// contradicted this file's own documentation of the same code.
+    #[test]
+    fn a_gas_mittelwert_takes_its_period_from_value_group_e() {
+        assert_eq!(code("7-0:54.0.16").default_resolution(), Some(R::Hour));
+        assert_eq!(code("7-0:54.0.20").default_resolution(), Some(R::Day));
+        assert_eq!(
+            ObisCode::GAS_BRENNWERT_MONATSMITTEL.default_resolution(),
+            Some(R::Month),
+        );
+        assert_eq!(
+            ObisCode::GAS_ZUSTANDSZAHL.default_resolution(),
+            Some(R::Month),
+        );
+        // An E this crate cannot read as a period is not guessed at.
+        assert_eq!(code("7-0:54.0.5").default_resolution(), None);
+    }
+
+    /// Whatever it answers, it never claims a length a calendar period does
+    /// not have — the invariant `IntervalResolution` exists to hold.
+    #[test]
+    fn a_calendar_answer_never_claims_a_fixed_length() {
+        for a in [0u8, 1, 4, 5, 6, 7, 8, 9] {
+            for c in [1u8, 2, 3, 5, 8, 13, 52, 54, 99] {
+                for d in [0u8, 2, 6, 7, 8, 9, 29] {
+                    for e in [0u8, 1, 16, 20, 22, 63] {
+                        let code = ObisCode {
+                            a,
+                            b: 0,
+                            c,
+                            d,
+                            e,
+                            f: ObisCode::STORAGE_UNUSED,
+                        };
+                        if let Some(r) = code.default_resolution() {
+                            assert_eq!(
+                                r.is_calendar(),
+                                matches!(r, R::Day | R::Month | R::Year),
+                                "{code}"
+                            );
+                            assert!(!matches!(r, R::Custom(_)), "{code} must not be Custom");
+                        }
+                    }
+                }
+            }
+        }
     }
 }

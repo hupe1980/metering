@@ -14,6 +14,12 @@ check-digit-validated MaLo-IDs and Jahresprognose.
 
 > 🧊 **Zero I/O** · ⏱️ **no async** · 🕰️ **no clock** · 🔢 **exact decimal quantities**
 
+Four runtime dependencies — `rust_decimal`, `thiserror`, `time` and `time-tz`,
+whose `db` feature embeds the IANA tz database rather than reading one from
+disk — plus `serde` behind an optional feature. Nothing in the tree opens a
+file, a socket or a system entropy source. `time` *can* read the clock; this
+crate never calls it, and a CI lane greps to keep it that way.
+
 It computes **quantities, not money**: what leaves this crate is kWh, m³ and kW,
 which a billing layer then prices.
 
@@ -144,13 +150,14 @@ it. It asserts its own invariants, so CI runs it as a test.
 |---|---|---|
 | **Calendar** | Berlin days, months, years **and the 06:00 Gastag**; `DayBoundary` carries the choice into resampling and gap filling; DST-correct interval counts; Bundesland holidays | [→](https://hupe1980.github.io/metering/docs/time-and-calendar/) |
 | **Readings** | Zählerstandsgang → Lastgang, register rollover, meter exchange | [→](https://hupe1980.github.io/metering/docs/readings/) |
-| **Identifiers** | `MaloId` with the BDEW check digit verified at the parse; `MeloId` | [→](https://hupe1980.github.io/metering/docs/identifiers/) |
-| **Validation** | Order-independent rules V01–V12 (V10 retired), Hampel outlier test, A/B/C/F grading, and a `RuleSet` saying which rules actually ran | [→](https://hupe1980.github.io/metering/docs/validation/) |
+| **Identifiers** | `MaloId` with the BDEW check digit verified at the parse; `MeloId`; `BdewCode` Marktpartner-ID | [→](https://hupe1980.github.io/metering/docs/identifiers/) |
+| **Validation** | Order-independent rules V01–V12 (V10 retired), Hampel outlier test, A/B/C/F grading, and a `RuleSet` saying which rules actually ran; DST- and Gastag-aware daily lengths | [→](https://hupe1980.github.io/metering/docs/validation/) |
 | **Ersatzwerte** | Four methods, calendar-aware grid, audit trail of what actually ran | [→](https://hupe1980.github.io/metering/docs/substitute-values/) |
-| **Tariff registers** | HT/NT and §14a Modul 3 in one mechanism | [→](https://hupe1980.github.io/metering/docs/tariff-registers/) |
+| **Tariff registers** | HT/NT and §14a Modul 3 in one mechanism, plus a Modul 3 conformance check for curated DSO calendars | [→](https://hupe1980.github.io/metering/docs/tariff-registers/) |
+| **§14a steering** | `P_min,14a` with the published Gleichzeitigkeitsfaktor table, and the netzwirksamer Leistungsbezug | [→](https://hupe1980.github.io/metering/docs/paragraph-14a/) |
 | **Gas & units** | m³→kWh_Hs, G 685 rounding, the SigLinDe gas SLP, exact-rational unit normalisation | [→](https://hupe1980.github.io/metering/docs/gas-and-units/) |
-| **Power quality** | EN 50160 as the statistical test it actually is | [→](https://hupe1980.github.io/metering/docs/power-quality/) |
-| **Virtual meters** | Sum, Residual, GGV allocation (§42b EnWG) — net grid draw *and* the allocated share | [→](https://hupe1980.github.io/metering/docs/virtual-meters/) |
+| **Power quality** | EN 50160 as the statistical test it actually is; VDE-AR-N 4100 Unsymmetrieleistung | [→](https://hupe1980.github.io/metering/docs/power-quality/) |
+| **Virtual meters** | Sum, Residual, GGV allocation (§42b EnWG) — per tenant and per community, with the §42b Abs. 5 pool ceiling | [→](https://hupe1980.github.io/metering/docs/virtual-meters/) |
 | **End to end** | The full MSB pipeline as a runnable example | [→](https://hupe1980.github.io/metering/docs/pipeline/) |
 
 ---
@@ -166,10 +173,17 @@ This crate computes quantities. Four neighbouring concerns are deliberately
 | EDIFACT / XML market messages | parsing a MSCONS is not arithmetic | [`mako`](https://github.com/hupe1980/mako) |
 | Fristen — counting Werktage to a deadline | a process-engine concern | your process engine |
 | SMGW certificates, device inventory | PKI and asset tracking, not quantities | your device management |
+| Levy and subsidy apportionment (MiSpeL, §21 EnFG, §19 EEG) | the quantities exist to size a payment, and the rule is still a bracketed draft | your grid/settlement layer |
 
-The third is the least obvious. The crate *does* carry a German statutory
-holiday calendar, because SLP day typing and tariff-register classification
-cannot be done without one — but it counts no business days.
+Two of those need a word. The crate *does* carry a German statutory holiday
+calendar, because SLP day typing and tariff-register classification cannot be
+done without one — but it counts no business days, so **Fristen** stay out.
+
+And **MiSpeL** apportions storage and bidirectional-charging flows so that
+Umlageprivilegien and Marktprämien can be computed on them. The arithmetic is
+quantity-shaped, but it is defined *by* the payment rules it feeds, and its
+Bekanntgabe is still written `[01.10.2026]` in square brackets with part of it
+waiting on EU state-aid approval.
 
 ---
 
@@ -181,6 +195,13 @@ cannot be done without one — but it counts no business days.
 - **Exact decimals for quantities, `f64` only for statistics.** The two meet in
   one place — the outlier rule converts values to run the Hampel filter — and
   nothing a float touches is written back into a quantity.
+- **"Exact" means no float, and one rounding at most.** Sums, differences and
+  products of quantities do not round at all, so the conservation laws hold to
+  the digit: a register split reconstructs its Arbeitsmenge, a filled series
+  covers its grid, an allocation splits a consumption, a Lastgang sums to its
+  register difference. Division is where a choice has to be made, and the
+  quotients a consumer stores are cut to a documented number of places
+  (`ALLOCATION_DP`, `FORECAST_DP`, …) rather than handed back at twenty-eight.
 - **One value, one string — and one meaning, one value.** `ObisCode` and
   `IntervalResolution` each have exactly one canonical spelling, and two
   distinct values can never mean the same thing: `IntervalResolution::Custom`
@@ -188,16 +209,25 @@ cannot be done without one — but it counts no business days.
 - **Every coded enum carries the whole contract** — `ALL`, `CODES`, `as_str`,
   `Display`, `FromStr`, and a `serde` tag that *is* the code. Generate a
   database `CHECK` constraint from `CODES` and it cannot drift from what the
-  crate writes; one test asserts all six properties for all thirty-four enums.
+  crate writes; one test asserts all six properties for every one of them, and
+  another reads the source so a new enum cannot skip that list.
 - **A clean validation report says which rules ran.** Four of the eleven are
-  opt-in — they need a number the library will not invent — so
-  `ValidationResult::evaluated` and `ValidationConfig::disabled_rules()` make
-  the difference between "found nothing" and "never looked" a fact you can log
-  or assert on.
+  opt-in — they need a number the library will not invent — and two more can be
+  switched off, so `ValidationResult::evaluated` and
+  `ValidationConfig::disabled_rules()` make the difference between "found
+  nothing" and "never looked" a fact you can log or assert on.
+- **Order in, order out.** `aggregate`, `resample`, `validate_intervals`,
+  `fill_gaps`, `split_energy` and `to_lastgang` all give the same answer for a
+  shuffled series, and a proptest suite asserts it rather than the docs
+  promising it. Two defects hid behind that promise until the suite existed,
+  and both needed a *tie* to surface.
 - **No second copy of a fact.** A register's unit comes from its OBIS code, a
   meter exchange's date from its instant, a series' worst quality from its
   intervals — never from a field that can drift out of step.
-- **Serde tags are semver-covered**, pinned literally by a test.
+- **Serde tags are semver-covered**, pinned literally by a test. Instants
+  travel as RFC 3339 and dates as ISO 8601 in JSON, and keep `time`'s compact
+  tuple in bincode and postcard — where the hot types round-trip, which the
+  crate claimed before it was true.
 - **Domain enums are exhaustive**; only error enums are `#[non_exhaustive]`.
 - **Unknown is not good.** Where a quantity cannot be determined the API says
   so — an `Option`, or an error — rather than returning a benign-looking
@@ -233,12 +263,24 @@ Beyond the unit tests:
 
 - `tests/code_contract.rs` — every coded enum, six properties each: `ALL` vs
   `CODES`, `as_str` is `Display`, `FromStr` inverts it, codes are distinct, the
-  `serde` tag *is* the code, and an unknown code is an error
-- `tests/berlin_calendar.rs` — DST interval counts against the tz database
+  `serde` tag *is* the code, and an unknown code is an error — plus a scan of
+  the crate source so a new enum cannot quietly skip the list
+- `tests/berlin_calendar.rs` — DST interval counts against the tz database, and
+  proptest over 1996–2065: days tile on both boundaries, a coarse interval count
+  is the sum of the fine ones, stepping back `n` days and counting forward
+  returns `n`
 - `tests/string_canonicalisation.rs` — proptest: stability, totality,
   idempotence, injectivity of every string form
 - `tests/serde_representation.rs` — every wire tag pinned literally
 - `tests/proptest_validation.rs` — validation invariants under random input
+- `tests/order_independence.rs` — proptest: a shuffled series gives an
+  identical result from every entry point that promises one
+- `tests/allocation_invariants.rs` — proptest: the §42b/§42c allocation
+  identities, and the §42b Abs. 5 pool ceiling, over generated communities
+- `tests/quantity_invariants.rs` — proptest: the conservation laws and bounds
+  of every arithmetic module — differencing, resampling, gap filling, the
+  register split, the Jahresprognose, unit and gas conversion, the gas SLP,
+  Mehr-/Mindermengen, §14a and EN 50160
 - `tests/regulatory_showcase.rs` — worked examples from the published sources
 - `tests/doc_samples.rs` — every code block in this README and on the
   documentation site, compiled and run

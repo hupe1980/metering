@@ -72,6 +72,11 @@ reconstruct the Arbeitsmenge, including across both DST transitions:
 let period    = aggregate(&intervals, &AggregationConfig::rlm());
 let registers = zzd.split_energy(&intervals);
 assert_eq!(registers.values().sum::<Decimal>(), period.arbeitsmenge);
+
+// The keys borrow from the definition, so they are exactly the strings
+// `registers()` lists and a lookup allocates nothing.
+let ht: Decimal = registers.get(&Some(HT)).copied().unwrap_or_default();
+assert!(ht > Decimal::ZERO);
 ```
 
 A 00:00–06:00 low-tariff band holds **20** quarter-hours on the spring-forward
@@ -83,3 +88,77 @@ in a `None` bucket so it is visible rather than lost.
 
 `aggregate` does not compute the split: it returns one Arbeitsmenge, and the
 breakdown is a separate question composed at the call site.
+
+## Is this calendar a valid Modul 3?
+
+A portfolio of curated DSO calendars is worth refusing at the door rather than
+at the optimiser. `assess_modul_3` checks a `Zaehlzeitdefinition` against the
+BDEW *Anwendungshilfe für die Umsetzung von Modul 3* v1.1 (07.02.2025) §2:
+
+| Rule | Checked |
+|---|---|
+| three Netzentgelttarife HT/NT/ST | ✓ |
+| each of them reachable on some day of some month | ✓ |
+| every instant books into one of them | ✓ |
+| HT at least two hours per day | ✓ |
+| windows *ganzjährig identisch* | ✓ |
+| billed in at least two quarters, not necessarily adjacent | ✓ |
+| set per calendar year | ✓ |
+| only with Modul 1, iMSys, no RLM | ✓ from `Modul3Context` |
+| HT ≤ 100 % Aufschlag, NT 10–40 % of ST, ST = SLP-Arbeitspreis | ✗ |
+| Netzentgeltgleichheit for an H0 customer | ✗ |
+| publication on the vorläufiges Preisblatt | ✗ |
+
+```rust
+use metering::zaehlzeit::{Modul3Conformance, Modul3Context, Quarter, assess_modul_3};
+
+let ctx = Modul3Context::default()
+    .billed_in([Quarter::Q1, Quarter::Q4])   // need not be adjacent
+    .at_a_conforming_delivery_point();   // Modul 1, no RLM, iMSys
+
+let (verdict, findings) = assess_modul_3(&zzd, &ctx);
+assert_eq!(verdict, Modul3Conformance::Conforms, "{findings:?}");
+```
+
+### The three that are missing on purpose
+
+The first two of them are **price corridors**, and this crate computes
+quantities, not money. It has no Arbeitspreis type to compare against, and
+inventing one so a validator could use it would be the wrong end of the
+telescope. Check those where the price sheet is parsed.
+
+The third is a **Fristen** question, which belongs in a process engine — and the
+AWH states its 15.10. date for the first year (2024, for 2025) rather than as a
+standing rule, so a general check here would be an extrapolation the document
+does not support.
+
+### The two-hour rule is read per day *class*
+
+*"min. an 2 Stunden pro Tag"* is checked on every kind of day the definition can
+distinguish: an ordinary weekday, a Saturday, a Sunday and — where
+`holiday_land` is set — a statutory holiday. A definition whose HT applies only
+Monday to Friday therefore reports `HochtarifBelowTwoHours`, because on a Sunday
+it offers no Hochtarif at all.
+
+### Missing input is `Unknown`, not clean
+
+`Modul3Context` is all optional, because a curated portfolio is routinely
+incomplete. A rule that could not be checked reports a finding whose
+`is_unknown()` is true and lands the verdict on `Unknown`; a rule that was
+broken lands it on `Violates`. A breach outranks an unknown, and nothing
+reports `Conforms` on data it never saw.
+
+## Whose calendar is it?
+
+`id` is *NB-assigned*, so it identifies a definition only inside one operator's
+price sheet: `HT/NT-1` from two Netzbetreiber are two different calendars under
+one name. `netzbetreiber` carries the Marktpartner-ID that published it.
+
+```rust
+let zzd = zzd.published_by("9900987654321".parse()?);
+```
+
+There is deliberately **no `year` field**: that is `valid_from` and `valid_to`,
+and a second copy of one fact is a second thing to keep in step. Nor a `source`
+URL or hash — where a calendar was fetched from is a property of the fetch, not
+of the calendar.

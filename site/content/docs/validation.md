@@ -18,11 +18,11 @@ weight = 5
 | Future timestamp | V08 | Warning | An interval starting after the reference instant |
 | Non-billable quality | V09 | Error | `Faulty` or `Unknown` |
 | Unordered series | V11 | Warning | Input was not ascending by `from` |
+| Implausible power | V12 | Error | Average power above the plant's physical capacity |
 
 A rule's id is its `Vnn` code everywhere — `Display`, `as_str` and the `serde`
 tag all say `V01` — so a stored finding reads back through the vocabulary it was
 written with.
-| Implausible power | V12 | Error | Average power above the plant's physical capacity |
 
 **V10 is deliberately unused.** A rollover is a property of a *register*, and a
 `MeterInterval` carries interval energy rather than a cumulative Zählerstand, so
@@ -40,6 +40,17 @@ to invent, and leaving the field `None` turns the rule off:
 | `outlier_sigma` | V04 `StatisticalOutlier` |
 | `now` | V08 `FutureTimestamp` |
 | `max_plant_power_kw` | V12 `ImplausiblePower` |
+
+Two more are **opt-out** — on by default, and switched off by a value rather
+than by a `None`:
+
+| Field | Rule it disables |
+|---|---|
+| `negative_energy_is_error = false` | V03 `NegativeEnergy` |
+| `zero_run_threshold = 0` | V05 `SuspiciousZeroRun` |
+
+`enabled_rules()` reports both kinds, so a `0` threshold cannot leave a clean
+report claiming a stuck meter was looked for.
 
 This matters in practice: **`QualityConfig::for_sparte` — the per-commodity
 configuration — sets no `max_plant_power_kw`**, because a nameplate capacity is
@@ -81,6 +92,21 @@ supplies, so a shuffled series cannot produce spurious gaps or overlaps. The
 disorder itself is reported once as V11, and every `interval_index` still points
 into the caller's slice.
 
+The same promise holds for `aggregate`, `resample`, `fill_gaps`,
+`split_energy`, `to_lastgang` and the grader, and it is not left as prose:
+`tests/order_independence.rs` shuffles a generated series and asserts an
+identical result for each of them under proptest. Two real defects hid there
+until it existed, and both needed a **tie** to show — a tied peak power, and two
+quality flags that shared a severity rank — which is why the generator draws
+half its series from a coarse half-kWh value grid.
+
+## V05 counts the run, not the threshold
+
+A stuck meter is reported once per run, anchored at the run's first interval,
+carrying the length the run actually reached. `zero_run_threshold` decides
+*whether* to report it, never what number appears in the finding — a meter
+frozen for three weeks says three weeks.
+
 ## Declare the period, or gaps at the edges are invisible
 
 ```rust
@@ -104,6 +130,33 @@ assert!(validate_intervals(&delivered, &cfg).has_errors());
 A month whose last week never arrived validates clean without a declared period.
 That is the failure mode that matters most at billing time.
 
+## V06 knows a calendar day is not 86 400 seconds
+
+A daily series read once a day is 23 hours long each spring and 25 each autumn.
+Where `expected_interval_secs` is `86_400` and an interval starts exactly on a
+day boundary, V06 measures it against the calendar rather than the flat second
+count — otherwise every gas and water series drew a warning on both transition
+days every year, for being exactly right.
+
+Which boundary is `ValidationConfig::day_boundary`, so a daily **gas** series on
+the 06:00 Gastag gets the same allowance as an electricity series on the
+Liefertag. The transition days are not even the same date for the two: the
+clocks move at 02:00/03:00, inside the Gastag that began the previous morning.
+
+```rust
+use metering::{ValidationConfig, calendar::DayBoundary};
+
+let gas_daily = ValidationConfig {
+    expected_interval_secs: Some(86_400),
+    ..Default::default()
+}
+.on(DayBoundary::Gastag);
+assert_eq!(gas_daily.day_boundary, DayBoundary::Gastag);
+```
+
+A fixed 24-hour window that merely happens to be 86 400 s long is a different
+thing from a calendar day and gets no allowance.
+
 ## V01 reports **any** uncovered span
 
 Not only a whole missing interval. A series of exactly-900-second intervals that
@@ -125,13 +178,12 @@ UTC+1 — and the two passes occupy a two-hour UTC window either side of the
 transition. A series converted from local time without carrying the offset keeps
 only one of them, and an hour of energy vanishes.
 
-V07 looks only at that window. An earlier version compared the whole day's
-covered duration against 25 hours, which could not tell a collapsed hour from an
-ordinary gap: *any* two missing quarter-hours anywhere on a fall-back day
-produced a confident report that "the repeated hour was collapsed" — untrue, and
-it sent the reader looking in the wrong place.
+V07 looks only at that window. Comparing the whole day's covered duration
+against 25 hours instead cannot tell a collapsed hour from an ordinary gap: any
+two missing quarter-hours anywhere on a fall-back day would be reported as "the
+repeated hour was collapsed", which sends the reader to the wrong place.
 
-A gap at midday is now a V01 gap and nothing else. A genuinely collapsed hour is
+A gap at midday is a V01 gap and nothing else. A genuinely collapsed hour is
 caught even on a day that is otherwise complete.
 
 **Every fall-back day the series spans is examined, not only the first** — a
@@ -181,3 +233,17 @@ gap does not.
 The grader computes no statistics of its own: every rule has one
 implementation, in the validation engine, and a test asserts the grade and the
 findings can never disagree.
+
+### A shuffled series grades `B`, on purpose
+
+V11 is a finding like any other, so a series that is otherwise spotless but
+arrived out of order has one finding and cannot be an `A`. That is intended: a
+shuffled MSCONS delivery usually means a broken merge upstream, and "bill it and
+note it" is the right verdict.
+
+It is worth knowing before it surprises you — a series read back out of a
+`HashMap` will grade `B` for no reason visible in the data. V11 is a Warning, so
+it can only ever cost the `A`; it can never reach `C`, which needs a blocking
+finding. Every other quantity the report carries — coverage, the zero run, the
+counts, `evaluated` — is identical either way, and
+`tests/order_independence.rs` pins exactly that.

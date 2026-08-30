@@ -155,8 +155,10 @@ crate::codes::string_codes! {
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct RolloutMilestone {
     /// Window start (None for the stock quotas, which have no flow window).
+    #[cfg_attr(feature = "serde", serde(with = "crate::wire::iso_date_option"))]
     pub window_from: Option<Date>,
     /// Deadline by which the quota must be met.
+    #[cfg_attr(feature = "serde", serde(with = "crate::wire::iso_date"))]
     pub deadline: Date,
     /// Required share in percent.
     pub quota_pct: u8,

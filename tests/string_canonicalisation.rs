@@ -269,12 +269,87 @@ mod market_ids {
     }
 }
 
+// ── BdewCode ─────────────────────────────────────────────────────────────────
+
+mod marktpartner_id {
+    use metering::{BdewCode, CodeVergabestelle};
+    use proptest::prelude::*;
+
+    /// Any thirteen digits — the structure `BdewCode` enforces. The check
+    /// digit is deliberately *not* imposed, because the Bildungsvorschrift
+    /// exempts GS1-issued GLNs from it and the type accepts those.
+    pub fn arb_bdew_code() -> impl Strategy<Value = BdewCode> {
+        "[0-9]{13}".prop_map(|s| s.parse().expect("thirteen digits"))
+    }
+
+    proptest! {
+        /// Stability + totality: thirteen digits out, the same value back.
+        #[test]
+        fn bdew_code_round_trips(id in arb_bdew_code()) {
+            let s = id.to_string();
+            prop_assert_eq!(s.len(), BdewCode::LEN);
+            prop_assert!(s.bytes().all(|b| b.is_ascii_digit()));
+            prop_assert_eq!(s.parse::<BdewCode>(), Ok(id));
+        }
+
+        /// Injectivity: two different codes cannot share a spelling.
+        #[test]
+        fn bdew_codes_are_injective(x in arb_bdew_code(), y in arb_bdew_code()) {
+            prop_assert_eq!(x == y, x.to_string() == y.to_string());
+        }
+
+        /// Surrounding whitespace is tolerated on the way in and never written
+        /// on the way out — the same leniency every parser here has.
+        #[test]
+        fn bdew_code_tolerates_padding(id in arb_bdew_code()) {
+            let padded = format!("  {id}\t");
+            prop_assert_eq!(padded.parse::<BdewCode>(), Ok(id));
+        }
+
+        /// The Vergabestelle is the first two digits and nothing else.
+        #[test]
+        fn the_vergabestelle_is_the_leading_pair(id in arb_bdew_code()) {
+            let expected = match &id.to_string()[..2] {
+                "99" => CodeVergabestelle::BdewStrom,
+                "98" => CodeVergabestelle::DvgwGas,
+                _ => CodeVergabestelle::Gs1OrOther,
+            };
+            prop_assert_eq!(id.vergabestelle(), expected);
+        }
+
+        /// A code built from twelve digits plus the computed thirteenth always
+        /// satisfies the BDEW procedure; changing one digit of the body almost
+        /// never does.
+        #[test]
+        fn the_check_digit_is_advisory_but_correct(body in "[0-9]{12}") {
+            let check = BdewCode::compute_check_digit(&body).expect("twelve digits");
+            let consistent: BdewCode = format!("{body}{check}").parse().unwrap();
+            prop_assert!(consistent.has_bdew_check_digit());
+            prop_assert_eq!(consistent.check_digit(), check);
+
+            // A wrong check digit still *parses* — that is the whole point.
+            let wrong = (check + 1) % 10;
+            let mismatched: BdewCode = format!("{body}{wrong}").parse().unwrap();
+            prop_assert!(!mismatched.has_bdew_check_digit());
+        }
+
+        /// Anything that is not thirteen digits is refused.
+        #[test]
+        fn malformed_codes_are_refused(s in "[0-9]{0,12}|[0-9]{14,20}|[A-Za-z0-9]{13}") {
+            let ok = s.len() == BdewCode::LEN && s.bytes().all(|b| b.is_ascii_digit());
+            prop_assert_eq!(s.parse::<BdewCode>().is_ok(), ok, "{}", s);
+        }
+    }
+}
+
 // ── The serde form is the same string ────────────────────────────────────────
 
 #[cfg(feature = "serde")]
 mod serde_agrees_with_display {
+    use super::market_ids::arb_malo;
+    use super::marktpartner_id::arb_bdew_code;
     use super::{arb_obis, arb_resolution};
-    use metering::{IntervalResolution, ObisCode};
+    use metering::{BdewCode, IntervalResolution, MaloId, MeloId, ObisCode};
     use proptest::prelude::*;
 
     proptest! {
@@ -292,6 +367,38 @@ mod serde_agrees_with_display {
             let encoded = serde_json::to_string(&r).unwrap();
             prop_assert_eq!(&encoded, &format!("\"{r}\""));
             prop_assert_eq!(serde_json::from_str::<IntervalResolution>(&encoded).unwrap(), r);
+        }
+
+        /// The identifiers travel as their digits too — the same rule, and
+        /// previously asserted for neither.
+        #[test]
+        fn malo_serde_form_is_the_display_form(id in arb_malo()) {
+            let encoded = serde_json::to_string(&id).unwrap();
+            prop_assert_eq!(&encoded, &format!("\"{id}\""));
+            prop_assert_eq!(serde_json::from_str::<MaloId>(&encoded).unwrap(), id);
+        }
+
+        #[test]
+        fn bdew_code_serde_form_is_the_display_form(id in arb_bdew_code()) {
+            let encoded = serde_json::to_string(&id).unwrap();
+            prop_assert_eq!(&encoded, &format!("\"{id}\""));
+            prop_assert_eq!(serde_json::from_str::<BdewCode>(&encoded).unwrap(), id);
+        }
+
+        /// …and so does the Zählpunktbezeichnung, uppercased on the way in.
+        ///
+        /// Two letters, the six-digit Netzbetreiber number, then twenty-five
+        /// free alphanumerics: 33 characters exactly.
+        #[test]
+        fn melo_serde_form_is_the_display_form(
+            nb in "[0-9]{6}",
+            tail in "[A-Za-z0-9]{25}",
+        ) {
+            let raw = format!("DE{nb}{tail}");
+            let id: MeloId = raw.parse().unwrap();
+            let encoded = serde_json::to_string(&id).unwrap();
+            prop_assert_eq!(&encoded, &format!("\"{id}\""));
+            prop_assert_eq!(serde_json::from_str::<MeloId>(&encoded).unwrap(), id);
         }
     }
 

@@ -102,7 +102,7 @@ fn measurement_source_shape_is_stable() {
     let mscons = MeasurementSource::Mscons {
         pid: 13005,
         message_ref: Some("REF-1".to_owned()),
-        sender_mp_id: "9900357000004".to_owned(),
+        sender_mp_id: "9900357000004".parse().unwrap(),
     };
     assert_eq!(
         json(&mscons),
@@ -553,5 +553,432 @@ fn an_aggregation_rule_carries_one_discriminator() {
     assert!(
         serde_json::from_str::<AggregationRule>(r#"{"Sum":{"source_malo_ids":["A"]}}"#).is_err(),
         "the pre-0.19 shape is gone, not quietly tolerated"
+    );
+}
+
+/// Everything the 0.20.0 round put on the wire.
+///
+/// The § 14a quantities, the Modul 3 conformance vocabulary, the
+/// Marktpartner-ID and the community allocation are all things a consumer
+/// stores: a curated DSO calendar with its verdict, a readiness report, a
+/// settlement run. Their tags are covered by semver from here.
+#[test]
+fn tags_added_in_0_20_are_pinned() {
+    use metering::CodeVergabestelle;
+    use metering::para14a::{SteuVeFallgruppe, Verursachungsregel};
+    use metering::power_quality::Phase;
+    use metering::zaehlzeit::{Modul3Conformance, Modul3Finding, Quarter};
+
+    // Every coded enum added this round writes its `as_str` code…
+    for v in SteuVeFallgruppe::ALL {
+        assert_eq!(json(&v), format!("\"{}\"", v.as_str()), "{v:?}");
+    }
+    for v in Verursachungsregel::ALL {
+        assert_eq!(json(&v), format!("\"{}\"", v.as_str()), "{v:?}");
+    }
+    for v in Phase::ALL {
+        assert_eq!(json(&v), format!("\"{}\"", v.as_str()), "{v:?}");
+    }
+    for v in Quarter::ALL {
+        assert_eq!(json(&v), format!("\"{}\"", v.as_str()), "{v:?}");
+    }
+    for v in Modul3Finding::ALL {
+        assert_eq!(json(&v), format!("\"{}\"", v.as_str()), "{v:?}");
+    }
+    for v in Modul3Conformance::ALL {
+        assert_eq!(json(&v), format!("\"{}\"", v.as_str()), "{v:?}");
+    }
+    for v in CodeVergabestelle::ALL {
+        assert_eq!(json(&v), format!("\"{}\"", v.as_str()), "{v:?}");
+    }
+
+    // …and the two whose Rust name and market spelling disagree are pinned
+    // literally, because `SCREAMING_SNAKE_CASE` would split them.
+    assert_eq!(
+        json(&Verursachungsregel::SteuVeZuletzt),
+        r#""STEUVE_ZULETZT""#
+    );
+    assert_eq!(
+        json(&Modul3Finding::Modul1NotSelected),
+        r#""MODUL_1_NOT_SELECTED""#
+    );
+    assert_eq!(json(&Quarter::Q1), r#""Q1""#);
+    assert_eq!(json(&Phase::L1), r#""L1""#);
+    assert_eq!(json(&CodeVergabestelle::Gs1OrOther), r#""GS1_OR_OTHER""#);
+}
+
+/// A Marktpartner-ID travels as its digits, like every other identifier here.
+#[test]
+fn a_bdew_code_is_a_string_on_the_wire() {
+    use metering::BdewCode;
+
+    let code: BdewCode = "9900987654321".parse().unwrap();
+    assert_eq!(json(&code), r#""9900987654321""#);
+    assert_eq!(json(&code), format!("\"{code}\""), "serde is Display");
+
+    let back: BdewCode = serde_json::from_str(r#""9900987654321""#).expect("reads back");
+    assert_eq!(back, code);
+
+    // Thirteen digits or nothing — the structure is enforced on the way in.
+    assert!(serde_json::from_str::<BdewCode>(r#""99009876543""#).is_err());
+}
+
+/// The § 14a inputs and parameters, field by field.
+#[test]
+fn para14a_field_names_are_stable() {
+    use metering::para14a::{Para14aConfig, SteuVe, SteuVeFallgruppe};
+
+    let device = SteuVe::new(SteuVeFallgruppe::Waermepumpe, dec!(20));
+    assert_eq!(
+        json(&device),
+        r#"{"fallgruppe":"WAERMEPUMPE","netzanschlussleistung_kw":"20"}"#,
+    );
+
+    let cfg = Para14aConfig::default();
+    let value: serde_json::Value = serde_json::from_str(&json(&cfg)).unwrap();
+    assert_eq!(value["mindestleistung_kw"], "4.2");
+    assert_eq!(value["skalierung_schwelle_kw"], "11");
+    assert_eq!(value["skalierungsfaktor"], "0.4");
+}
+
+/// Per-phase apparent power, field by field.
+#[test]
+fn phase_apparent_power_field_names_are_stable() {
+    use metering::power_quality::{Phase, PhaseApparentPower};
+
+    let p = PhaseApparentPower::single_phase(Phase::L2, dec!(4.6));
+    assert_eq!(json(&p), r#"{"l1_kva":"0","l2_kva":"4.6","l3_kva":"0"}"#);
+}
+
+/// An allocation key carries one discriminator at a fixed path, like
+/// `AggregationRule` — a settlement stores it and queries on it.
+#[test]
+fn an_allocation_key_carries_one_discriminator() {
+    use metering::AllocationKey;
+    use std::collections::BTreeMap;
+
+    let constant = AllocationKey::Constant {
+        fractions: BTreeMap::from([("T1".to_owned(), dec!(0.25))]),
+    };
+    let value: serde_json::Value = serde_json::from_str(&json(&constant)).unwrap();
+    assert_eq!(value["kind"], "CONSTANT");
+    assert_eq!(value["fractions"]["T1"], "0.25");
+
+    let proportional = AllocationKey::Proportional {
+        participants: vec!["T1".to_owned(), "T2".to_owned()],
+    };
+    let value: serde_json::Value = serde_json::from_str(&json(&proportional)).unwrap();
+    assert_eq!(value["kind"], "PROPORTIONAL");
+    assert_eq!(value["participants"][1], "T2");
+
+    for key in [constant, proportional] {
+        let back: AllocationKey = serde_json::from_str(&json(&key)).expect("round trips");
+        assert_eq!(back, key);
+    }
+}
+
+/// A community allocation is a settlement record, so every field name it
+/// carries is part of the wire format.
+#[test]
+fn community_allocation_field_names_are_stable() {
+    use metering::{AllocationKey, MeterInterval, QualityFlag, compute_community_allocation};
+    use std::collections::HashMap;
+
+    let iv = |kwh| {
+        vec![MeterInterval {
+            from: datetime!(2026-06-01 12:00 UTC),
+            to: datetime!(2026-06-01 12:15 UTC),
+            value: kwh,
+            quality: QualityFlag::Measured,
+            obis_code: None,
+        }]
+    };
+    let mut sources = HashMap::new();
+    sources.insert("PLANT".to_owned(), iv(dec!(10)));
+    sources.insert("T1".to_owned(), iv(dec!(1)));
+
+    let key = AllocationKey::Proportional {
+        participants: vec!["T1".to_owned()],
+    };
+    let out = compute_community_allocation("PLANT", &key, &sources).unwrap();
+    let value: serde_json::Value = serde_json::from_str(&json(&out[0])).unwrap();
+
+    assert_eq!(value["from"], "2026-06-01T12:00:00Z");
+    assert_eq!(value["generation"], "10");
+    assert_eq!(value["total_consumption"], "1");
+    assert_eq!(value["pool_cap"], "1");
+    assert_eq!(value["surplus_to_grid"], "9");
+    assert_eq!(value["quality"], "MEASURED");
+    assert_eq!(value["participants"][0]["id"], "T1");
+    assert_eq!(value["participants"][0]["consumption"], "1");
+    assert_eq!(value["participants"][0]["share"], "10");
+    assert_eq!(value["participants"][0]["allocated"], "1");
+    assert_eq!(value["participants"][0]["net_grid_draw"], "0");
+}
+
+/// Instants travel as **RFC 3339** and dates as **ISO 8601** — the spellings a
+/// `TIMESTAMPTZ` cast, a JSON Schema `format: date-time` and every log viewer
+/// already understand.
+///
+/// `time`'s own representation — `[2026, 152, 12, 0, 0, 0, 0, 0, 0]`, the
+/// year, the **ordinal day**, the clock and the offset — is stable and
+/// deliberately compact, and unusable as a stored one: `WHERE from >
+/// '2026-06-01'` has no meaning against an ordinal tuple, and no schema
+/// language recognises it.
+#[test]
+fn instants_are_rfc3339_and_dates_are_iso8601() {
+    use metering::power_quality::PowerQualityInterval;
+    use metering::reading::MeterReading;
+
+    let iv = MeterInterval {
+        from: datetime!(2026-06-01 12:00 UTC),
+        to: datetime!(2026-06-01 12:15 UTC),
+        value: dec!(2.5),
+        quality: QualityFlag::Measured,
+        obis_code: Some(ObisCode::STROM_BEZUG_TOTAL),
+    };
+    assert_eq!(
+        json(&iv),
+        r#"{"from":"2026-06-01T12:00:00Z","to":"2026-06-01T12:15:00Z","value":"2.5","quality":"MEASURED","obis_code":"1-0:1.8.0"}"#,
+    );
+
+    // A sub-second instant keeps its precision.
+    let precise = MeterReading::measured(datetime!(2026-10-25 00:30:15.25 UTC), dec!(1000));
+    let value: serde_json::Value = serde_json::from_str(&json(&precise)).unwrap();
+    assert_eq!(value["at"], "2026-10-25T00:30:15.25Z");
+
+    // Every instant-bearing type, not just the hot one.
+    let pq = PowerQualityInterval::empty(
+        datetime!(2026-06-01 0:00 UTC),
+        datetime!(2026-06-01 0:10 UTC),
+    );
+    let value: serde_json::Value = serde_json::from_str(&json(&pq)).unwrap();
+    assert_eq!(value["from"], "2026-06-01T00:00:00Z");
+
+    // Dates are dates, not midnight instants: a validity bound is a German
+    // calendar day and carries no time and no offset.
+    let milestone = metering::ROLLOUT_MILESTONES
+        .iter()
+        .find(|m| m.window_from.is_some())
+        .expect("a flow milestone");
+    let value: serde_json::Value = serde_json::from_str(&json(milestone)).unwrap();
+    assert_eq!(value["deadline"], "2026-12-31");
+    assert_eq!(value["window_from"], "2025-02-25");
+
+    // `None` is `null`, not a missing key or an empty string.
+    let stock = metering::ROLLOUT_MILESTONES
+        .iter()
+        .find(|m| m.window_from.is_none())
+        .expect("a stock milestone");
+    let value: serde_json::Value = serde_json::from_str(&json(stock)).unwrap();
+    assert!(value["window_from"].is_null());
+}
+
+/// Every instant- and date-bearing type reads back what it wrote, through both
+/// a human-readable format and a binary one.
+#[test]
+fn timestamps_round_trip_through_json_and_postcard() {
+    use metering::lifecycle::{MeterLifecycleEvent, MeterLifecycleEventType};
+    use metering::measurement_series::{ProvenanceEntry, ProvenanceEventType};
+    use metering::reading::MeterReading;
+
+    let iv = MeterInterval {
+        from: datetime!(2026-06-01 12:00 UTC),
+        to: datetime!(2026-06-01 12:15 UTC),
+        value: dec!(2.5),
+        quality: QualityFlag::Measured,
+        obis_code: None,
+    };
+    let reading = MeterReading::measured(datetime!(2026-03-29 01:00 UTC), dec!(42.125));
+    let entry = ProvenanceEntry {
+        occurred_at: datetime!(2026-01-02 09:30 UTC),
+        event_type: ProvenanceEventType::Ingested,
+        actor: "MSCONS".to_owned(),
+        note: None,
+    };
+    let event = MeterLifecycleEvent {
+        event_id: "EV-1".to_owned(),
+        meter_serial: "1ESY0000".to_owned(),
+        melo_id: "DE00056266802AO6G56M11SN51G21M24S".parse().unwrap(),
+        event_type: MeterLifecycleEventType::Replaced,
+        occurred_at: datetime!(2026-06-01 08:00 UTC),
+        reading: Some(dec!(17_845)),
+        obis_code: None,
+        reason: None,
+        triggered_by_pid: Some(23003),
+    };
+
+    macro_rules! both_ways {
+        ($value:expr) => {{
+            let v = $value;
+            let text = serde_json::to_string(&v).expect("json");
+            assert_eq!(
+                serde_json::from_str::<_>(&text).ok(),
+                Some(v.clone()),
+                "json"
+            );
+            let bytes = postcard::to_allocvec(&v).expect("postcard");
+            assert_eq!(postcard::from_bytes::<_>(&bytes).ok(), Some(v), "postcard");
+            bytes
+        }};
+    }
+
+    let interval_bytes = both_ways!(iv);
+    both_ways!(reading);
+    both_ways!(entry);
+    both_ways!(event);
+
+    // The binary form is the compact tuple, not the string: an RFC 3339
+    // timestamp is twenty bytes, and `MeterInterval` carries two of them. The
+    // split on `is_human_readable` is what keeps the hot type cheap in the
+    // formats a binary encoding is chosen for.
+    assert!(
+        !interval_bytes.windows(4).any(|w| w == b"2026"),
+        "postcard must not carry the textual year: {interval_bytes:?}",
+    );
+    assert!(
+        interval_bytes.len() < 40,
+        "two instants, a Decimal and two enums in {} bytes",
+        interval_bytes.len(),
+    );
+}
+
+/// The hot types round-trip through a **non-self-describing** binary format,
+/// and the internally-tagged configuration types deliberately do not.
+///
+/// The crate states that trade-off — *"no bincode/postcard for that type; the
+/// hot types are unaffected"* — and it was not true. `MeterInterval` carries a
+/// `Decimal`, whose default `Deserialize` calls `deserialize_any`, and
+/// `deserialize_any` is the one question a format without a self-describing
+/// wire cannot answer. Enabling `rust_decimal/serde-str` moves it to
+/// `deserialize_str`, changing nothing in JSON — a `Decimal` already travelled
+/// as its exact string — and making the claim true.
+#[test]
+fn the_hot_types_survive_a_binary_format_and_the_tagged_ones_do_not() {
+    use metering::{AggregationRule, AllocationKey};
+
+    // Hot path: intervals, channels, readings.
+    let iv = MeterInterval {
+        from: datetime!(2026-06-01 12:00 UTC),
+        to: datetime!(2026-06-01 12:15 UTC),
+        value: dec!(2.5),
+        quality: QualityFlag::Measured,
+        obis_code: Some(ObisCode::STROM_BEZUG_TOTAL),
+    };
+    let bytes = postcard::to_allocvec(&iv).expect("serialises");
+    assert_eq!(
+        postcard::from_bytes::<MeterInterval>(&bytes).expect("reads back"),
+        iv,
+    );
+
+    let code = ObisCode::GAS_BRENNWERT_MONATSMITTEL;
+    let bytes = postcard::to_allocvec(&code).expect("serialises");
+    assert_eq!(postcard::from_bytes::<ObisCode>(&bytes).unwrap(), code);
+
+    // A bare Decimal, which is what actually blocked the whole hot path.
+    let value = dec!(-12345.6789);
+    let bytes = postcard::to_allocvec(&value).expect("serialises");
+    assert_eq!(
+        postcard::from_bytes::<rust_decimal::Decimal>(&bytes).unwrap(),
+        value
+    );
+
+    // Configuration: internal tagging needs a self-describing format, which is
+    // the documented cost of putting the discriminator at a fixed, queryable
+    // path. Pinned so the trade-off cannot silently move in either direction.
+    let rule = AggregationRule::Sum {
+        source_malo_ids: vec!["A".to_owned()],
+    };
+    let bytes = postcard::to_allocvec(&rule).expect("serialises");
+    assert!(
+        postcard::from_bytes::<AggregationRule>(&bytes).is_err(),
+        "internally tagged types are JSON-shaped on purpose",
+    );
+
+    let key = AllocationKey::Proportional {
+        participants: vec!["T1".to_owned()],
+    };
+    let bytes = postcard::to_allocvec(&key).expect("serialises");
+    assert!(postcard::from_bytes::<AllocationKey>(&bytes).is_err());
+}
+
+/// No timestamp field escapes the wire format.
+///
+/// `src/wire.rs` only applies where a field asks for it, and a field that
+/// forgets falls silently back to `time`'s ordinal tuple — in JSON, in one
+/// struct, next to siblings that are RFC 3339 strings. Nothing fails to compile
+/// and nothing fails to round-trip; the format is just inconsistent, which is
+/// the worst kind of wire bug to find later.
+///
+/// Three fields were missed on the first pass — `BillingPeriod`'s peak instant
+/// and both of `AnnualForecast`'s window bounds — so this reads the crate
+/// source and refuses the omission rather than trusting a careful edit.
+///
+/// This is a test, so it may read files; the no-I/O guarantee is about `src/`.
+#[test]
+fn no_timestamp_field_escapes_the_wire_format() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut missing: Vec<String> = Vec::new();
+    let mut checked = 0usize;
+
+    for entry in std::fs::read_dir(root.join("src")).expect("src/ is readable") {
+        let path = entry.expect("readable entry").path();
+        if path.extension().is_none_or(|e| e != "rs") {
+            continue;
+        }
+        let text = std::fs::read_to_string(&path).expect("readable source");
+        let file = path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+
+        // Walk struct bodies that derive `Serialize`, keeping each field's
+        // preceding attribute lines with it.
+        let mut rest = text.as_str();
+        while let Some(at) = rest.find("pub struct ") {
+            let (head, tail) = rest.split_at(at);
+            let derives_serde = head
+                .rsplit("\n\n")
+                .next()
+                .is_some_and(|attrs| attrs.contains("Serialize"));
+            let Some(open) = tail.find('{') else { break };
+            let Some(close) = tail.find("\n}") else { break };
+            if derives_serde && open < close {
+                let mut pending_attrs = String::new();
+                for line in tail[open + 1..close].lines() {
+                    let trimmed = line.trim();
+                    if trimmed.starts_with("#[") {
+                        pending_attrs.push_str(trimmed);
+                        continue;
+                    }
+                    if let Some(decl) = trimmed.strip_prefix("pub ")
+                        && (decl.ends_with(": OffsetDateTime,")
+                            || decl.ends_with(": Option<OffsetDateTime>,")
+                            || decl.ends_with(": Date,")
+                            || decl.ends_with(": Option<Date>,"))
+                    {
+                        checked += 1;
+                        if !pending_attrs.contains("crate::wire") {
+                            missing.push(format!("{file}: {decl}"));
+                        }
+                    }
+                    if !trimmed.starts_with("///") && !trimmed.is_empty() {
+                        pending_attrs.clear();
+                    }
+                }
+            }
+            rest = &tail[close..];
+        }
+    }
+
+    assert!(
+        checked > 15,
+        "the scan found only {checked} timestamp fields — it has stopped working, not the crate",
+    );
+    assert!(
+        missing.is_empty(),
+        "timestamp fields with no wire format, so they travel as `time`'s \
+         ordinal tuple while their siblings are RFC 3339: {missing:#?}",
     );
 }

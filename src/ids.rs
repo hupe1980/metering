@@ -154,17 +154,9 @@ impl MaloId {
     /// `None` unless `digits` is exactly ten ASCII digits.
     #[must_use]
     pub fn compute_check_digit(digits: &str) -> Option<u8> {
-        let bytes = digits.as_bytes();
-        if bytes.len() != 10 || !bytes.iter().all(u8::is_ascii_digit) {
-            return None;
-        }
-        let digit = |i: usize| u32::from(bytes[i] - b'0');
-        // a) odd positions (1-based 1,3,5,7,9), b) even positions summed, ×2.
-        let odd: u32 = (0..10).step_by(2).map(digit).sum();
-        let even: u32 = (1..10).step_by(2).map(digit).sum();
-        let total = odd + even * 2;
-        // d) difference to the next multiple of 10; 10 becomes 0.
-        Some(((10 - (total % 10)) % 10) as u8)
+        (digits.len() == 10)
+            .then(|| lok_waggon_check_digit(digits))
+            .flatten()
     }
 
     /// The check digit this ID carries (its eleventh digit).
@@ -230,6 +222,233 @@ impl TryFrom<&str> for MaloId {
 
 impl From<MaloId> for String {
     fn from(id: MaloId) -> String {
+        id.as_str().to_owned()
+    }
+}
+
+// ── the Lok- und Waggon-Kennzeichnungsverfahren ───────────────────────────────
+
+/// The check digit for a run of leading digits, by the *Lok- und
+/// Waggon-Kennzeichnungsverfahren*.
+///
+/// BDEW *Identifikatoren in der Marktkommunikation*, §6.1, verbatim:
+///
+/// > a) Quersumme aller Ziffern in ungerader Position
+/// > b) Quersumme aller Ziffern auf gerader Position multipliziert mit 2
+/// > c) Summe von a) und b)
+/// > d) Differenz von c) zum nächsten Vielfachen von 10 (ergibt sich hier 10,
+/// >    wird die Prüfziffer 0 genommen)
+///
+/// One implementation, because the same document applies it to **three**
+/// identifiers: the MaLo-ID (§3.3), the BDEW-/DVGW-Codenummer (§2.3) and the
+/// NeLo-ID (§4.3). Note it is *not* Luhn: the even-position **sum** is doubled,
+/// not each digit.
+///
+/// `None` unless every byte is an ASCII digit.
+fn lok_waggon_check_digit(digits: &str) -> Option<u8> {
+    let bytes = digits.as_bytes();
+    if bytes.is_empty() || !bytes.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    let digit = |i: usize| u32::from(bytes[i] - b'0');
+    let odd: u32 = (0..bytes.len()).step_by(2).map(digit).sum();
+    let even: u32 = (1..bytes.len()).step_by(2).map(digit).sum();
+    let total = odd + even * 2;
+    Some(((10 - (total % 10)) % 10) as u8)
+}
+
+// ── BdewCode ──────────────────────────────────────────────────────────────────
+
+/// Which Codevergabestelle issued a [`BdewCode`], read off its first two
+/// digits.
+///
+/// BDEW *Identifikatoren in der Marktkommunikation* v1.2, §2.2, prints the
+/// Bildungsvorschrift as a table: positions 1+2 are the
+/// *Vergabestelle/Sparte*, `99` = BDEW/Strom and `98` = DVGW/Gas.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "SCREAMING_SNAKE_CASE"))]
+pub enum CodeVergabestelle {
+    /// `99` — BDEW / Energie Codes und Services GmbH, Sparte Strom.
+    BdewStrom,
+    /// `98` — DVGW Service & Consult GmbH, Sparte Gas.
+    DvgwGas,
+    /// Anything else, which in practice is a GS1 **GLN** used as a
+    /// Marktpartner-ID.
+    ///
+    /// A documented case rather than an unknown one: the same Anwendungshilfe
+    /// §2.3 says *"Bei einer von GS1 vergebenen GLN (= Globale
+    /// Lokationsnummer) gilt das von GS1 verwendete Prüfzifferverfahren"*, so
+    /// such a code is well-formed and simply not issued by BDEW or DVGW.
+    Gs1OrOther,
+}
+
+impl CodeVergabestelle {
+    /// Every variant, in declaration order.
+    pub const ALL: [Self; 3] = [Self::BdewStrom, Self::DvgwGas, Self::Gs1OrOther];
+
+    /// Stable DB/wire label. Matches the `serde` tag and
+    /// [`FromStr`] input.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::BdewStrom => "BDEW_STROM",
+            Self::DvgwGas => "DVGW_GAS",
+            Self::Gs1OrOther => "GS1_OR_OTHER",
+        }
+    }
+}
+
+crate::codes::string_codes! {
+    CodeVergabestelle;
+}
+
+/// A 13-digit **Marktpartner-Identifikationsnummer** — the BDEW- or
+/// DVGW-Codenummer every market participant is addressed by.
+///
+/// The identifier MSCONS carries in `NAD+MS`/`NAD+MR`, UTILMD in the
+/// Marktpartner segments, and every Netzbetreiber publishes on its price
+/// sheet. It is what makes a Zählzeitdefinition attributable: an
+/// NB-assigned `HT/NT-1` means nothing until you know *whose*.
+///
+/// # Bildungsvorschrift
+///
+/// BDEW *Identifikatoren in der Marktkommunikation* v1.2, §2.2:
+///
+/// | Position | Content |
+/// |---|---|
+/// | 1–2 | Vergabestelle/Sparte — `99` BDEW/Strom, `98` DVGW/Gas |
+/// | 3 | `0`–`8` for BDEW, `0`–`9` for DVGW |
+/// | 4–12 | digits `0`–`9` |
+/// | 13 | Prüfziffer |
+///
+/// # The check digit is verified, but not enforced
+///
+/// §2.3 says the Prüfziffer uses the same *Lok- und
+/// Waggon-Kennzeichnungsverfahren* as the [`MaloId`] — and then carves out an
+/// exception in the next sentence: *"Bei einer von GS1 vergebenen GLN
+/// (= Globale Lokationsnummer) gilt das von GS1 verwendete
+/// Prüfzifferverfahren."*
+///
+/// So a well-formed Marktpartner-ID may legitimately fail the BDEW procedure,
+/// and this type **parses it anyway**. [`has_bdew_check_digit`] reports the
+/// outcome instead, so a caller can warn without a library refusing data the
+/// market issued. This is the same restraint the crate applies wherever a rule
+/// cannot be verified end to end — [`MaloId`], whose Bildungsvorschrift has no
+/// such carve-out and whose worked example is printed in the same document, is
+/// checked at the parse and rejects a mismatch.
+///
+/// [`has_bdew_check_digit`]: Self::has_bdew_check_digit
+///
+/// ```rust
+/// use metering::{BdewCode, CodeVergabestelle};
+///
+/// let nb: BdewCode = "9900987654321".parse()?;
+/// assert_eq!(nb.vergabestelle(), CodeVergabestelle::BdewStrom);
+/// assert_eq!(nb.to_string(), "9900987654321");
+///
+/// // Twelve digits plus the computed thirteenth is always self-consistent.
+/// let check = BdewCode::compute_check_digit("990098765432").unwrap();
+/// let consistent: BdewCode = format!("990098765432{check}").parse()?;
+/// assert!(consistent.has_bdew_check_digit());
+/// # Ok::<(), metering::ParseError>(())
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct BdewCode {
+    /// The thirteen ASCII digits.
+    digits: [u8; 13],
+}
+
+/// The shape [`BdewCode`] accepts, as rendered in a [`ParseError`].
+const BDEW_CODE_FORMAT: &str =
+    "a 13-digit BDEW/DVGW Marktpartner-ID, e.g. 9900987654321 (99 = BDEW/Strom, 98 = DVGW/Gas)";
+
+impl BdewCode {
+    /// The identifier's length: always thirteen digits.
+    pub const LEN: usize = 13;
+
+    /// The check digit for the twelve leading digits, by the *Lok- und
+    /// Waggon-Kennzeichnungsverfahren* of the Anwendungshilfe §6.1.
+    ///
+    /// `None` unless `digits` is exactly twelve ASCII digits. Does not apply to
+    /// a GS1-issued GLN — see the [type docs](Self).
+    #[must_use]
+    pub fn compute_check_digit(digits: &str) -> Option<u8> {
+        (digits.len() == 12)
+            .then(|| lok_waggon_check_digit(digits))
+            .flatten()
+    }
+
+    /// The check digit this code carries (its thirteenth digit).
+    #[must_use]
+    pub const fn check_digit(&self) -> u8 {
+        self.digits[12] - b'0'
+    }
+
+    /// `true` when the thirteenth digit matches the BDEW procedure.
+    ///
+    /// **Advisory.** `false` does not mean the code is invalid: a GS1-issued
+    /// GLN uses a different procedure and is a legitimate Marktpartner-ID. Use
+    /// it to raise a warning, never to reject.
+    #[must_use]
+    pub fn has_bdew_check_digit(&self) -> bool {
+        let Some(expected) = Self::compute_check_digit(&self.as_str()[..12]) else {
+            return false;
+        };
+        expected == self.check_digit()
+    }
+
+    /// Which Codevergabestelle issued this code, read off the first two digits.
+    #[must_use]
+    pub const fn vergabestelle(&self) -> CodeVergabestelle {
+        match (self.digits[0], self.digits[1]) {
+            (b'9', b'9') => CodeVergabestelle::BdewStrom,
+            (b'9', b'8') => CodeVergabestelle::DvgwGas,
+            _ => CodeVergabestelle::Gs1OrOther,
+        }
+    }
+
+    /// The thirteen digits as a `&str`.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        // Always valid UTF-8: only ASCII digits are ever stored.
+        std::str::from_utf8(&self.digits).unwrap_or_default()
+    }
+}
+
+impl fmt::Display for BdewCode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.pad(self.as_str())
+    }
+}
+
+impl FromStr for BdewCode {
+    type Err = ParseError;
+
+    /// Parses thirteen digits, ignoring surrounding whitespace.
+    ///
+    /// The **check digit is not enforced** — see the [type docs](Self).
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let t = s.trim();
+        let bytes = t.as_bytes();
+        if bytes.len() != Self::LEN || !bytes.iter().all(u8::is_ascii_digit) {
+            return Err(ParseError::format("BdewCode", s, BDEW_CODE_FORMAT));
+        }
+        let mut digits = [0u8; Self::LEN];
+        digits.copy_from_slice(bytes);
+        Ok(Self { digits })
+    }
+}
+
+impl TryFrom<&str> for BdewCode {
+    type Error = ParseError;
+    fn try_from(s: &str) -> Result<Self, Self::Error> {
+        s.parse()
+    }
+}
+
+impl From<BdewCode> for String {
+    fn from(id: BdewCode) -> String {
         id.as_str().to_owned()
     }
 }
@@ -347,7 +566,7 @@ impl From<MeloId> for String {
 
 #[cfg(feature = "serde")]
 mod serde_impl {
-    use super::{MaloId, MeloId};
+    use super::{BdewCode, MaloId, MeloId};
     use serde::de::{self, Visitor};
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
     use std::fmt;
@@ -376,6 +595,33 @@ mod serde_impl {
     impl<'de> Deserialize<'de> for MaloId {
         fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
             deserializer.deserialize_str(MaloIdVisitor)
+        }
+    }
+
+    impl Serialize for BdewCode {
+        /// Writes the canonical thirteen-digit string.
+        fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            serializer.collect_str(self)
+        }
+    }
+
+    struct BdewCodeVisitor;
+
+    impl Visitor<'_> for BdewCodeVisitor {
+        type Value = BdewCode;
+
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("a 13-digit Marktpartner-ID such as \"9900987654321\"")
+        }
+
+        fn visit_str<E: de::Error>(self, v: &str) -> Result<BdewCode, E> {
+            v.parse().map_err(de::Error::custom)
+        }
+    }
+
+    impl<'de> Deserialize<'de> for BdewCode {
+        fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            deserializer.deserialize_str(BdewCodeVisitor)
         }
     }
 

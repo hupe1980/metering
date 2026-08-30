@@ -15,13 +15,14 @@
 //! | [`interval`] | `MeterInterval` — the Lastgang; `Sparte`, `QualityFlag` |
 //! | [`reading`] | `MeterReading` — the Zählerstand, and the ZSG → Lastgang conversion |
 //! | [`obis`] | Typed `ObisCode`, one canonical string per channel |
-//! | [`ids`] | Typed `MaloId` (check-digit validated) and `MeloId` |
+//! | [`ids`] | Typed `MaloId` (check-digit validated), `MeloId` and `BdewCode` |
 //! | [`calendar`] | Europe/Berlin days, months, years **and the 06:00 Gastag** — DST-correct; `DayBoundary` |
 //! | [`holiday`] | Bundesland statutory holidays; SLP day typing |
 //! | [`resolution`] | `IntervalResolution` — fixed vs calendar lengths |
 //! | [`conversion`] | Gas m³ → kWh_Hs, unit normalisation, HeizkostenV warm water |
 //! | [`aggregation`] | Billing period: Arbeitsmenge, Spitzenleistung, coverage |
-//! | [`zaehlzeit`] | Tariff registers — HT/NT and § 14a Modul 3 |
+//! | [`zaehlzeit`] | Tariff registers — HT/NT and § 14a Modul 3, with a conformance check |
+//! | [`para14a`] | § 14a netzorientierte Steuerung — `P_min,14a` and the netzwirksamer Leistungsbezug |
 //! | [`mod@resample`] | Down-sampling to Berlin calendar buckets |
 //! | [`validation`] | The rule engine — V01–V09, V11, V12 — order-independent, and it reports which rules ran |
 //! | [`quality`] | Hampel filter, and an A/B/C/F grade over the findings |
@@ -30,11 +31,11 @@
 //! | [`load_profile`] | SLP classes incl. BDEW 2025 (H25/G25/L25/P25/S25) |
 //! | [`gas_slp`] | Gas SLP arithmetic — SigLinDe, Allokationstemperatur, Kundenwert |
 //! | [`classification`] | SLP / RLM / iMSys detection from the observed series |
-//! | [`virtual_meter`] | Sum / Residual / GGV virtual meters (§ 42b EnWG) |
+//! | [`virtual_meter`] | Sum / Residual / GGV virtual meters (§ 42b EnWG), per tenant and per community |
 //! | [`aggregation_rule`] | The rules `virtual_meter` evaluates |
 //! | [`imbalance`] | Jahresmehr-/-mindermengen (GPKE Kap. 8.4) |
 //! | [`losses`] | Netzverlust balance (§ 22 Abs. 1 EnWG) |
-//! | [`power_quality`] | EN 50160 — statistical, over a week of 10-minute means |
+//! | [`power_quality`] | EN 50160 — statistical, over a week of 10-minute means; VDE-AR-N 4100 Unsymmetrie |
 //! | [`measurement_point`] | What is metered, and on whose account |
 //! | [`measurement_series`] | A named series with its provenance |
 //! | [`lifecycle`] | Meter installation, exchange and retirement events |
@@ -58,6 +59,46 @@
 //! `f64` to run the Hampel filter over them. That comparison decides whether to
 //! *flag* an interval; it never alters one. Nothing a float touches is ever
 //! written back into a quantity.
+//!
+//! ## What "exact" means here
+//!
+//! **No float, and one rounding at most.** The first half is absolute: a
+//! metered quantity is a `Decimal` from the wire to the invoice and never
+//! passes through `f64`. The second half is the part worth stating, because
+//! "exact decimal" is often read as "never rounds", and that is not true of any
+//! decimal type. `Decimal` carries 28–29 significant digits, and a division
+//! whose quotient does not terminate is rounded to that width — `2 ÷ 3` is
+//! `0.666…7` here as anywhere.
+//!
+//! Addition, subtraction and multiplication of quantities at realistic scales
+//! do not round at all, which is why the **conservation laws hold exactly**: a
+//! register split reconstructs its Arbeitsmenge, a filled series covers its
+//! grid, an allocation splits a consumption into a credited and a drawn part,
+//! a resampling preserves the energy it buckets.
+//! `tests/quantity_invariants.rs` asserts each of them over generated input.
+//!
+//! Division is where a choice has to be made, and the crate makes it one of two
+//! ways:
+//!
+//! - **Cut to a documented number of places** when the quotient is a value a
+//!   consumer stores, prints or settles on, or when an identity depends on it:
+//!   [`ALLOCATION_DP`] (6), [`FORECAST_DP`] (3),
+//!   [`SigLinDe::H_VALUE_DP`](gas_slp::SigLinDe::H_VALUE_DP) (6),
+//!   [`KUNDENWERT_DP`](gas_slp::KUNDENWERT_DP) (4). A share carrying
+//!   twenty-seven decimal places is not a quantity, and it breaks the
+//!   subtraction that follows it.
+//! - **Leave it at full width** when it is an intermediate nothing downstream
+//!   can distinguish: [`allocation_temperature`] feeds only `h_value`, which
+//!   crosses into `f64` at once.
+//!
+//! Where a rounding rule is the *market's* rather than this crate's it is a
+//! parameter instead, with a documented default —
+//! [`G685Rounding`] is the case where published
+//! Netzbetreiber practice demonstrably disagrees with itself.
+//!
+//! A cut quantity is therefore homogeneous only to its last reported place:
+//! doubling every reading doubles a projection to within `2 × 10⁻³` kWh, not
+//! exactly, because `round(2x)` and `2·round(x)` differ at a rounding boundary.
 //!
 //! # Determinism
 //!
@@ -111,10 +152,12 @@
 //! **A day is cut in one of two places.** Electricity settles on the Liefertag,
 //! which begins at 00:00 local; gas settles on the **Gastag**, which begins at
 //! 06:00. [`DayBoundary`] carries that choice through
-//! [`ResampleConfig::on`] and [`FillGapsConfig::on`], so a daily, monthly or
-//! yearly gas figure is a whole number of Gastage rather than a calendar total
-//! shifted six hours. The length is unaffected — both are "one day" — which is
-//! why the boundary is a separate parameter and not a resolution.
+//! [`ResampleConfig::on`], [`FillGapsConfig::on`] and [`ValidationConfig::on`],
+//! so a daily, monthly or yearly gas figure is a whole number of Gastage rather
+//! than a calendar total shifted six hours — and a daily gas series is judged
+//! against the Gastag's own 23, 24 or 25 hours rather than against a flat
+//! 86 400 s. The length is unaffected — both are "one day" — which is why the
+//! boundary is a separate parameter and not a resolution.
 //!
 //! Where a local wall-clock time has to become an instant, the two awkward
 //! cases resolve once and consistently: the repeated autumn hour takes the
@@ -190,21 +233,49 @@
 //! is a breaking change and will be released as one. `tests/serde_representation.rs`
 //! pins every tag literally so the commitment is mechanical rather than a promise.
 //!
-//! Each unit enum's tag is identical to its `as_str` code, and the two types
-//! with a canonical string ([`ObisCode`], [`IntervalResolution`]) serialise *as*
-//! that string, so `serde`, [`std::fmt::Display`] and [`std::str::FromStr`]
-//! never disagree. `ObisCode` in particular is stable for a further reason: it
-//! is an IEC 62056 identifier and `IntervalResolution` an ISO 8601 duration —
-//! both external standards, which no refactor in this crate can rename.
+//! Each unit enum's tag is identical to its `as_str` code, and the types with a
+//! canonical string ([`ObisCode`], [`IntervalResolution`], [`MaloId`],
+//! [`MeloId`], [`BdewCode`]) serialise *as* that string, so `serde`,
+//! [`std::fmt::Display`] and [`std::str::FromStr`] never disagree. `ObisCode` in
+//! particular is stable for a further reason: it is an IEC 62056 identifier and
+//! `IntervalResolution` an ISO 8601 duration — both external standards, which no
+//! refactor in this crate can rename.
+//!
+//! ## Instants are RFC 3339, dates are ISO 8601 — in a readable format
+//!
+//! An instant travels as `"2026-06-01T12:00:00Z"` and a calendar date as
+//! `"2026-06-01"`, which is what a `TIMESTAMPTZ` cast, a JSON Schema
+//! `format: date-time` and every log viewer already understand.
+//!
+//! In a **binary** format they keep `time`'s own compact tuple instead. That
+//! split is deliberate: [`MeterInterval`] carries two instants and is the
+//! hottest type here, and a twenty-byte string per boundary is a poor trade in
+//! a format chosen for its packing. `serde` is asked which kind of format it is
+//! and the answer decides — see the private `wire` module.
+//!
+//! ## The hot types survive a non-self-describing format
+//!
+//! `MeterInterval`, `ObisCode`, [`MeterReading`] and the identifiers round-trip
+//! through bincode and postcard. The types with an internally tagged `serde`
+//! shape — [`AggregationRule`], [`AllocationKey`] — deliberately do not: a
+//! discriminator at a fixed, queryable path is worth more for configuration
+//! stored once per delivery point than binary compactness is.
+//!
+//! Both halves are pinned by a test. The `rust_decimal/serde-str` feature is
+//! what makes the first half hold: the default deserialiser asks
+//! `deserialize_any`, which is the one question a format without a
+//! self-describing wire cannot answer.
 //!
 //! # A clean report is not the same as a clean series
 //!
 //! Four of the eleven validation rules are **opt-in**: they need a number this
 //! library refuses to invent — a grid spacing, an outlier threshold, a
 //! reference instant, a plant capacity — and leaving the corresponding
-//! [`ValidationConfig`] field `None` turns the rule off. A
-//! [`ValidationResult`] with no issues therefore means *"the rules that ran
-//! found nothing"*, which is weaker than "nothing is wrong".
+//! [`ValidationConfig`] field `None` turns the rule off. Two more are
+//! **opt-out**: `negative_energy_is_error = false` retires V03, and a
+//! `zero_run_threshold` of `0` retires V05. A [`ValidationResult`] with no
+//! issues therefore means *"the rules that ran found nothing"*, which is weaker
+//! than "nothing is wrong".
 //!
 //! So the crate says which ran: [`ValidationConfig::disabled_rules`] before a
 //! run, [`ValidationResult::evaluated`] after one, and
@@ -222,6 +293,24 @@
 //! );
 //! ```
 //!
+//! # Order in, order out
+//!
+//! Where a function takes a slice of intervals, the order of that slice does
+//! not change the answer. A MSCONS delivery merged from two files, a database
+//! query without an `ORDER BY` and a `HashMap` iteration all arrive shuffled,
+//! so [`aggregate`], [`mod@resample`], [`validate_intervals`], [`fill_gaps`],
+//! [`Zaehlzeitdefinition::split_energy`] and [`to_lastgang`] each sort, index
+//! or fold over an operation that commutes.
+//!
+//! A **tie** is where the promise is easiest to break, so both places one can
+//! occur are settled explicitly: [`QualityFlag::severity_rank`] gives every
+//! flag a distinct rank, and [`aggregate`] breaks a tied peak by the earliest
+//! instant. `tests/order_independence.rs` asserts the whole property under
+//! proptest.
+//!
+//! [`spitzenleistung_at`]: BillingPeriod::spitzenleistung_at
+//! [`Zaehlzeitdefinition::split_energy`]: zaehlzeit::Zaehlzeitdefinition::split_energy
+//!
 //! # Enum exhaustiveness
 //!
 //! **Domain enums here are exhaustive; only error enums are
@@ -233,7 +322,10 @@
 //! what it means, not a silent fallback filing a reading under the wrong one.
 //! For output that ends up on an invoice, a compile error at upgrade time is
 //! the cheaper failure. An unfamiliar *error* needs no such protection — a
-//! wildcard still reports a failure — so [`VirtualMeterError`] is marked.
+//! wildcard still reports a failure — so exactly three types carry the
+//! attribute, and all three are failure vocabularies: [`VirtualMeterError`],
+//! [`ConversionError`] and [`AnomalyKind`], the reason an [`Anomaly`] refused a
+//! difference.
 //!
 //! So **adding a variant to a domain enum is a breaking change here** and is
 //! released as one, and exhaustive `match` over any `ALL` is a supported
@@ -311,6 +403,7 @@
 
 #[macro_use]
 mod codes;
+mod wire;
 
 pub mod aggregation;
 pub mod aggregation_rule;
@@ -330,6 +423,7 @@ pub mod losses;
 pub mod measurement_point;
 pub mod measurement_series;
 pub mod obis;
+pub mod para14a;
 pub mod power_quality;
 pub mod quality;
 pub mod reading;
@@ -352,16 +446,17 @@ pub use calendar::{
 };
 pub use classification::{Messtyp, SeriesOrigin, classify_messtyp, detect_interval_length};
 pub use conversion::{
-    G685FinalRounding, G685Rounding, GasConversionParams, WarmWaterAdjustments, gas_m3_to_kwh_hs,
-    gas_m3_to_kwh_hs_rounded, normalize_to_kwh, warm_water_heat_kwh, warm_water_heat_kwh_unmetered,
+    ConversionError, G685FinalRounding, G685Rounding, GasConversionParams, WarmWaterAdjustments,
+    gas_m3_to_kwh_hs, gas_m3_to_kwh_hs_rounded, normalize_to_kwh, warm_water_heat_kwh,
+    warm_water_heat_kwh_unmetered,
 };
 pub use error::ParseError;
-pub use forecast::{AnnualForecast, project_annual_consumption};
+pub use forecast::{AnnualForecast, FORECAST_DP, project_annual_consumption};
 pub use gas_slp::{
     SigLinDe, WeekdayFactors, allocation_temperature, gas_daily_quantity, kundenwert,
 };
 pub use holiday::{Bundesland, Holiday, slp_day_type};
-pub use ids::{MaloId, MaloIssuer, MeloId};
+pub use ids::{BdewCode, CodeVergabestelle, MaloId, MaloIssuer, MeloId};
 pub use imbalance::{ImbalanceSaldo, compute_imbalance};
 pub use interval::{MeasurementUnit, MeterInterval, QualityFlag, Sparte, UnitScale};
 pub use lifecycle::{
@@ -374,9 +469,14 @@ pub use measurement_series::{
     MeasurementSeries, MeasurementSource, ProvenanceEntry, ProvenanceEventType,
 };
 pub use obis::{ObisCode, RegisterUnit};
+pub use para14a::{
+    GLEICHZEITIGKEITSFAKTOREN, MINDESTLEISTUNG_KW, Para14aConfig, STEUVE_SCHWELLE_KW, SteuVe,
+    SteuVeFallgruppe, Verursachungsregel, gleichzeitigkeitsfaktor,
+    mindestleistung_direktansteuerung, mindestleistung_ems, netzwirksamer_leistungsbezug,
+};
 pub use power_quality::{
-    En50160Limits, En50160Report, LimitOutcome, PowerQualityInterval, assess_en50160,
-    exceedance_pct, voltage_percentile,
+    En50160Limits, En50160Report, LimitOutcome, Phase, PhaseApparentPower, PowerQualityInterval,
+    UNSYMMETRIE_LIMIT_KVA, assess_en50160, exceedance_pct, voltage_percentile,
 };
 pub use quality::{
     K_MAD, QualityConfig, QualityGrade, QualityReport, hampel_filter, hampel_filter_with_floor,
@@ -395,6 +495,7 @@ pub use rollout::{
 pub use sharing::{
     Bilanzierungsmethode, Capability, Delivery, DeliveryEvidenceInput, EligibilityBasis, Finding,
     MeteringCapabilityInput, SharingReadiness, Zaehlertyp, assess_capability, assess_delivery,
+    combine_readiness,
 };
 pub use substitute::{
     FillGapsConfig, FilledSeries, SubstituteEntry, SubstituteMethod, SubstitutionReason, fill_gaps,
@@ -404,6 +505,10 @@ pub use validation::{
     ValidationSeverity, validate_intervals,
 };
 pub use virtual_meter::{
-    GgvInterval, VirtualMeterError, compute_ggv_allocation, compute_virtual_meter,
+    ALLOCATION_DP, AllocationKey, CommunityInterval, GgvInterval, ParticipantAllocation,
+    VirtualMeterError, compute_community_allocation, compute_ggv_allocation, compute_virtual_meter,
 };
-pub use zaehlzeit::{DayGroup, ZaehlzeitFenster, Zaehlzeitdefinition};
+pub use zaehlzeit::{
+    DayGroup, Modul3Conformance, Modul3Context, Modul3Finding, Quarter, ZaehlzeitFenster,
+    Zaehlzeitdefinition, assess_modul_3,
+};

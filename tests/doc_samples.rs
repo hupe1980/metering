@@ -89,6 +89,35 @@ fn modul_3_section() {
     assert_eq!(zzd.register_for(datetime!(2026-01-05 17:00 UTC)), Some(HT));
     assert_eq!(zzd.register_for(datetime!(2026-01-05 2:00 UTC)), Some(NT));
     assert_eq!(zzd.register_for(datetime!(2026-01-05 9:00 UTC)), Some(ST));
+
+    // Docs — "Splitting a series": the keys borrow from the definition, so a
+    // lookup is `Some(HT)` and allocates nothing.
+    let start = calendar::day_start_utc(date!(2026 - 01 - 05));
+    let day: Vec<MeterInterval> = (0..96)
+        .map(|i| MeterInterval {
+            from: start + time::Duration::minutes(i * 15),
+            to: start + time::Duration::minutes(i * 15 + 15),
+            value: dec!(1),
+            quality: QualityFlag::Measured,
+            obis_code: None,
+        })
+        .collect();
+
+    let period = aggregate(&day, &AggregationConfig::rlm());
+    let registers = zzd.split_energy(&day);
+    assert_eq!(
+        registers.values().sum::<rust_decimal::Decimal>(),
+        period.arbeitsmenge,
+    );
+    let ht = registers
+        .get(&Some(HT))
+        .copied()
+        .unwrap_or(rust_decimal::Decimal::ZERO);
+    assert_eq!(ht, dec!(12), "17:00–20:00 is twelve quarter-hours");
+    assert!(
+        !registers.contains_key(&None),
+        "Modul 3 covers every instant"
+    );
 }
 
 /// Docs — "Declare the period, or gaps at the edges are invisible".
@@ -744,4 +773,364 @@ fn reading_cadence_section() {
 
     let cfg = LastgangConfig::strom().with_capacity_kw(dec!(30), cadence);
     assert_eq!(cfg.max_delta, Some(dec!(7.5)));
+}
+
+/// Docs — "V06 knows a calendar day is not 86 400 seconds".
+///
+/// The allowance follows `ValidationConfig::day_boundary`, so a daily gas
+/// series on the 06:00 Gastag is judged against the Gastag's own length rather
+/// than against a Berlin midnight.
+#[test]
+fn daily_gas_length_section() {
+    use metering::{ValidationConfig, ValidationRuleId, calendar::DayBoundary, validate_intervals};
+
+    let gas_daily = ValidationConfig {
+        expected_interval_secs: Some(86_400),
+        ..Default::default()
+    }
+    .on(DayBoundary::Gastag);
+    assert_eq!(gas_daily.day_boundary, DayBoundary::Gastag);
+
+    // The 25-hour Gastag is the Saturday's: the clocks move at 03:00 local,
+    // inside the gas day that began the previous morning.
+    let saturday = date!(2026 - 10 - 24);
+    assert_eq!(
+        DayBoundary::Gastag.day_length(saturday).whole_hours(),
+        25,
+        "the long Gastag is named after the Saturday"
+    );
+
+    let series = vec![MeterInterval {
+        from: calendar::gas_day_start_utc(saturday),
+        to: calendar::gas_day_end_utc(saturday),
+        value: dec!(310),
+        quality: QualityFlag::Measured,
+        obis_code: None,
+    }];
+    let result = validate_intervals(&series, &gas_daily);
+    assert!(
+        result
+            .by_rule(ValidationRuleId::InconsistentIntervalLength)
+            .next()
+            .is_none(),
+        "a 25-hour Gastag is the right length: {:?}",
+        result.issues
+    );
+
+    // The same series judged on the Liefertag is not a calendar day at all,
+    // so it gets no allowance.
+    let liefertag = gas_daily.on(DayBoundary::Midnight);
+    assert_eq!(
+        validate_intervals(&series, &liefertag)
+            .by_rule(ValidationRuleId::InconsistentIntervalLength)
+            .count(),
+        1,
+    );
+}
+
+/// Docs — "Two more are opt-out".
+#[test]
+fn opt_out_rules_section() {
+    use metering::{ValidationConfig, ValidationRuleId as R};
+
+    let off = ValidationConfig {
+        zero_run_threshold: 0,
+        negative_energy_is_error: false,
+        ..ValidationConfig::default()
+    };
+    assert!(off.disabled_rules().contains(R::SuspiciousZeroRun));
+    assert!(off.disabled_rules().contains(R::NegativeEnergy));
+    assert_eq!(
+        R::SuspiciousZeroRun.enabling_field(),
+        Some("zero_run_threshold")
+    );
+    assert_eq!(
+        R::NegativeEnergy.enabling_field(),
+        Some("negative_energy_is_error"),
+    );
+
+    // The defaults arm both.
+    let on = ValidationConfig::default();
+    assert!(on.enabled_rules().contains(R::SuspiciousZeroRun));
+    assert!(on.enabled_rules().contains(R::NegativeEnergy));
+}
+
+/// Docs — "V05 counts the run, not the threshold".
+#[test]
+fn zero_run_length_section() {
+    use metering::{ValidationConfig, ValidationRuleId, validate_intervals};
+
+    let base = datetime!(2026-06-01 0:00 UTC);
+    let series: Vec<MeterInterval> = (0..40)
+        .map(|i| MeterInterval {
+            from: base + time::Duration::minutes(15 * i),
+            to: base + time::Duration::minutes(15 * i + 15),
+            // Stuck for thirty intervals out of forty.
+            value: if (4..34).contains(&i) {
+                dec!(0)
+            } else {
+                dec!(2)
+            },
+            quality: QualityFlag::Measured,
+            obis_code: None,
+        })
+        .collect();
+
+    let cfg = ValidationConfig {
+        outlier_sigma: None,
+        ..ValidationConfig::default()
+    };
+    let found: Vec<_> = validate_intervals(&series, &cfg)
+        .by_rule(ValidationRuleId::SuspiciousZeroRun)
+        .map(|i| i.message.clone())
+        .collect();
+    assert_eq!(found.len(), 1, "one finding per run");
+    assert!(
+        found[0].starts_with("30 consecutive"),
+        "the run, not the threshold of 4: {}",
+        found[0]
+    );
+}
+
+/// Docs — "Gas and units", the already-converted volume.
+#[test]
+fn normvolumen_section() {
+    use metering::{GasConversionParams, normalize_to_kwh};
+
+    // A Normvolumen has already been state-converted; its Zustandszahl is 1.
+    let params = GasConversionParams::already_converted(dec!(11.2));
+    assert_eq!(
+        normalize_to_kwh(dec!(100), "m3", Some(&params), None).unwrap(),
+        dec!(1120.0),
+    );
+
+    // A Betriebsvolumen needs both.
+    let betriebs = GasConversionParams::new(dec!(11.2), dec!(0.98));
+    assert!(normalize_to_kwh(dec!(100), "m3", Some(&betriebs), None).unwrap() < dec!(1120));
+}
+
+/// Docs — the default resolution of a channel.
+#[test]
+fn default_resolution_section() {
+    // A Brennwert published as a monthly mean is not an hourly series, and a
+    // maximum register is not a series at all — active or reactive.
+    assert_eq!(
+        ObisCode::GAS_BRENNWERT_MONATSMITTEL.default_resolution(),
+        Some(IntervalResolution::Month),
+    );
+    assert_eq!(ObisCode::STROM_BEZUG_MAXIMUM.default_resolution(), None);
+    assert_eq!(
+        "1-0:5.6.0"
+            .parse::<ObisCode>()
+            .unwrap()
+            .default_resolution(),
+        None,
+    );
+    assert_eq!(
+        ObisCode::STROM_BEZUG_LASTGANG.default_resolution(),
+        Some(IntervalResolution::QuarterHour),
+    );
+}
+
+/// Docs — "§ 14a steering", the netzwirksamer Leistungsbezug.
+#[test]
+fn netzwirksamer_leistungsbezug_section() {
+    use metering::para14a::{Verursachungsregel, netzwirksamer_leistungsbezug};
+
+    // 10 kW from the grid, a 6 kW wallbox, 8 kW of other load, 4 kW of PV.
+    assert_eq!(
+        netzwirksamer_leistungsbezug(dec!(10), dec!(6), None, Verursachungsregel::SteuVeZuletzt),
+        Some(dec!(6)),
+    );
+    let anteilig = netzwirksamer_leistungsbezug(
+        dec!(10),
+        dec!(6),
+        Some(dec!(8)),
+        Verursachungsregel::Anteilig,
+    )
+    .unwrap();
+    assert!(anteilig < dec!(4.3));
+    assert!(
+        anteilig < dec!(6),
+        "pro rata is never the more conservative one"
+    );
+
+    // The pro-rata rule refuses to invent the rest of the installation.
+    assert_eq!(
+        netzwirksamer_leistungsbezug(dec!(10), dec!(6), None, Verursachungsregel::Anteilig),
+        None,
+    );
+}
+
+/// Docs — "§ 14a steering", the Mindestleistung and its two traps.
+#[test]
+fn mindestleistung_section() {
+    use metering::para14a::{
+        Para14aConfig, SteuVe, SteuVeFallgruppe as F, gleichzeitigkeitsfaktor,
+        mindestleistung_direktansteuerung, mindestleistung_ems,
+    };
+
+    let cfg = Para14aConfig::default();
+
+    let plain = [
+        SteuVe::new(F::Ladepunkt, dec!(11)),
+        SteuVe::new(F::Waermepumpe, dec!(9)),
+        SteuVe::new(F::Stromspeicher, dec!(10)),
+    ];
+    assert_eq!(mindestleistung_ems(&plain, &cfg), Some(dec!(10.500)));
+
+    let scaled = [
+        SteuVe::new(F::Ladepunkt, dec!(11)),
+        SteuVe::new(F::Waermepumpe, dec!(20)),
+        SteuVe::new(F::Stromspeicher, dec!(10)),
+    ];
+    assert_eq!(mindestleistung_ems(&scaled, &cfg), Some(dec!(14.300)));
+
+    // Only Fallgruppe b and c scale, and only above 11 kW.
+    let wallbox = SteuVe::new(F::Ladepunkt, dec!(22));
+    let heat_pump = SteuVe::new(F::Waermepumpe, dec!(20));
+    assert_eq!(
+        mindestleistung_direktansteuerung(&wallbox, &cfg),
+        Some(dec!(4.2))
+    );
+    assert_eq!(
+        mindestleistung_direktansteuerung(&heat_pump, &cfg),
+        Some(dec!(8.0))
+    );
+
+    // Ziff. 2.4.1 admits only devices above 4,2 kW; a smaller one is not a
+    // steuVE and has no Mindestleistung.
+    let tiny = SteuVe::new(F::Waermepumpe, dec!(3));
+    assert_eq!(mindestleistung_direktansteuerung(&tiny, &cfg), None);
+    assert_eq!(mindestleistung_ems(&[tiny], &cfg), None);
+
+    // The published Gleichzeitigkeitsfaktor table.
+    let published = [
+        (2u32, dec!(0.80)),
+        (3, dec!(0.75)),
+        (4, dec!(0.70)),
+        (5, dec!(0.65)),
+        (6, dec!(0.60)),
+        (7, dec!(0.55)),
+        (8, dec!(0.50)),
+        (9, dec!(0.45)),
+    ];
+    for (n, gzf) in published {
+        assert_eq!(gleichzeitigkeitsfaktor(n), Some(gzf), "n = {n}");
+    }
+    assert_eq!(gleichzeitigkeitsfaktor(1), None);
+}
+
+/// Docs — "Tariff registers", the Modul 3 conformance check and provenance.
+#[test]
+fn modul_3_conformance_section() {
+    use metering::zaehlzeit::{
+        Modul3Conformance, Modul3Context, Quarter, Zaehlzeitdefinition, assess_modul_3,
+    };
+
+    let zzd = Zaehlzeitdefinition::modul_3(
+        "NB-14A-3",
+        date!(2026 - 01 - 01),
+        (17 * 60, 20 * 60),
+        (22 * 60, 6 * 60),
+    )
+    .until(date!(2026 - 12 - 31));
+
+    let ctx = Modul3Context::default()
+        .billed_in([Quarter::Q1, Quarter::Q4])
+        .at_a_conforming_delivery_point();
+
+    let (verdict, findings) = assess_modul_3(&zzd, &ctx);
+    assert_eq!(verdict, Modul3Conformance::Conforms, "{findings:?}");
+
+    // Provenance: whose calendar is it?
+    let nb: metering::BdewCode = "9900987654321".parse().unwrap();
+    let published = zzd.published_by(nb);
+    assert_eq!(published.netzbetreiber, Some(nb));
+}
+
+/// Docs — "Identifiers", the Marktpartner-ID.
+#[test]
+fn bdew_code_section() {
+    use metering::{BdewCode, CodeVergabestelle};
+
+    let nb: BdewCode = "9900987654321".parse().unwrap();
+    assert_eq!(nb.vergabestelle(), CodeVergabestelle::BdewStrom);
+    assert_eq!(nb.to_string(), "9900987654321");
+
+    let gas: BdewCode = "9800987654321".parse().unwrap();
+    assert_eq!(gas.vergabestelle(), CodeVergabestelle::DvgwGas);
+
+    // A GS1-issued GLN is a legitimate Marktpartner-ID under another scheme.
+    let gln: BdewCode = "4012345678901".parse().unwrap();
+    assert_eq!(gln.vergabestelle(), CodeVergabestelle::Gs1OrOther);
+
+    // Structure is enforced; the check digit is reported, not enforced.
+    assert!("99009876543".parse::<BdewCode>().is_err(), "too short");
+    assert!("99009876543AB".parse::<BdewCode>().is_err(), "not digits");
+    let check = BdewCode::compute_check_digit("990098765432").unwrap();
+    let consistent: BdewCode = format!("990098765432{check}").parse().unwrap();
+    assert!(consistent.has_bdew_check_digit());
+}
+
+/// Docs — "Virtual meters", the whole community at once.
+#[test]
+fn community_allocation_section() {
+    use metering::{AllocationKey, compute_community_allocation};
+    use std::collections::HashMap;
+
+    let iv = |kwh| {
+        vec![MeterInterval {
+            from: datetime!(2026-06-01 12:00 UTC),
+            to: datetime!(2026-06-01 12:15 UTC),
+            value: kwh,
+            quality: QualityFlag::Measured,
+            obis_code: None,
+        }]
+    };
+    let mut sources = HashMap::new();
+    sources.insert("PLANT".to_owned(), iv(dec!(10)));
+    sources.insert("T1".to_owned(), iv(dec!(1)));
+    sources.insert("T2".to_owned(), iv(dec!(3)));
+
+    let key = AllocationKey::Proportional {
+        participants: vec!["T1".to_owned(), "T2".to_owned()],
+    };
+    let out = compute_community_allocation("PLANT", &key, &sources).unwrap();
+    let interval = &out[0];
+
+    assert_eq!(
+        interval.pool_cap,
+        interval.generation.min(interval.total_consumption),
+    );
+    assert!(interval.total_allocated() <= interval.pool_cap);
+    assert_eq!(
+        interval.generation,
+        interval.total_allocated() + interval.surplus_to_grid,
+    );
+    assert_eq!(interval.surplus_to_grid, dec!(6));
+}
+
+/// Docs — "Power quality", the VDE-AR-N 4100 Unsymmetrieleistung.
+#[test]
+fn unsymmetrie_section() {
+    use metering::power_quality::{Phase, PhaseApparentPower};
+
+    let single = PhaseApparentPower::single_phase(Phase::L1, dec!(7.2));
+    assert_eq!(single.unbalance_kva(), dec!(7.2));
+    assert!(!single.within_limit(None));
+    assert_eq!(single.excess_kva(None), dec!(2.6));
+
+    let spread = PhaseApparentPower::default()
+        .plus(Phase::L1, dec!(4.6))
+        .plus(Phase::L2, dec!(4.6))
+        .plus(Phase::L3, dec!(4.6));
+    assert_eq!(spread.unbalance_kva(), dec!(0.0));
+    assert!(spread.within_limit(None));
+
+    // kVA, not kW: 4,5 kW at cos φ = 0,9 is 5,0 kVA and over the limit.
+    let by_kw = PhaseApparentPower::single_phase(Phase::L1, dec!(4.5));
+    let by_kva = PhaseApparentPower::single_phase(Phase::L1, dec!(4.5) / dec!(0.9));
+    assert!(by_kw.within_limit(None));
+    assert!(!by_kva.within_limit(None));
 }

@@ -56,3 +56,47 @@ the message it arrived in is still available to report.
 The keys of a virtual-meter `SourceMap` deliberately stay `String`: they are
 arbitrary series labels a caller chooses (`"PLANT"`, `"T2"`), not asserted to
 be MaLo-IDs.
+
+## `BdewCode` — the Marktpartner-ID
+
+The 13-digit BDEW- or DVGW-Codenummer every market participant is addressed by:
+`NAD+MS`/`NAD+MR` in MSCONS, the Marktpartner segments in UTILMD, and the number
+on every Netzbetreiber's price sheet. BDEW *Identifikatoren in der
+Marktkommunikation* v1.2 §2.2 prints the Bildungsvorschrift:
+
+| Position | Content |
+|---|---|
+| 1–2 | Vergabestelle/Sparte — `99` BDEW/Strom, `98` DVGW/Gas |
+| 3 | `0`–`8` for BDEW, `0`–`9` for DVGW |
+| 4–12 | digits `0`–`9` |
+| 13 | Prüfziffer |
+
+```rust
+use metering::{BdewCode, CodeVergabestelle};
+
+let nb: BdewCode = "9900987654321".parse()?;
+assert_eq!(nb.vergabestelle(), CodeVergabestelle::BdewStrom);
+```
+
+`MeasurementPoint::accountable_mp_id` and `MeasurementSource::Mscons`'s
+`sender_mp_id` carry it, and `Zaehlzeitdefinition::netzbetreiber` says whose
+tariff calendar a definition is.
+
+### The check digit is verified, but not enforced
+
+§2.3 says the Prüfziffer uses the **same** Lok- und
+Waggon-Kennzeichnungsverfahren as the MaLo-ID — and carves out an exception in
+the very next sentence:
+
+> Bei einer von GS1 vergebenen GLN (= Globale Lokationsnummer) gilt das von GS1
+> verwendete Prüfzifferverfahren.
+
+So a perfectly well-formed Marktpartner-ID may legitimately fail the BDEW
+procedure. `BdewCode` parses it anyway and reports the outcome through
+`has_bdew_check_digit()` instead, so a caller can warn without a library
+refusing data the market issued.
+
+`MaloId` is the other way round — checked at the parse, rejecting a mismatch —
+because its Bildungsvorschrift has no such carve-out and its worked example is
+printed in the same document. The asymmetry is the point: enforce what can be
+verified end to end, report what cannot.

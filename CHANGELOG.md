@@ -4,6 +4,366 @@ All notable changes to `metering` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the crate follows
 semver, with the `serde` representation explicitly in scope (see the crate docs).
 
+## [0.20.0] — 2026-08-30
+
+Order independence, which the crate documents in five places, turned out to be
+false in two of them — and both failures needed a **tie** to show, which is why
+no example-based test had ever caught them. A `Vec<MeterInterval>` arrives
+shuffled every time it is merged from two MSCONS files or read back without an
+`ORDER BY`, so the promise is one consumers rely on without noticing. It is now
+a proptest suite rather than a sentence.
+
+Alongside that: a channel classifier that contradicted its own file's
+documentation, a daily length check that had never learned about the Gastag the
+crate added in 0.19.0, a stuck-meter finding that reported the threshold instead
+of the run, and a mandatory dependency on a system entropy source in a library
+whose first line is that it reads no ambient state.
+
+Then a round of consumer feedback from a home-energy-management workspace, which
+brought § 14a EnWG's two control quantities, a conformance check for the
+hundreds of DSO tariff calendars such a system curates, and a community-level
+view of the § 42b allocation. Writing the property test for that last one
+uncovered a **false exactness claim** that had been in the crate since 0.19.0.
+Three of the seven requests were declined, with reasons, in the notes below.
+Every removal is a hard cut; no deprecated shims.
+
+### Fixed
+
+- **Instants and dates were unreadable and unqueryable on the wire.** Every
+  `OffsetDateTime` in the crate travelled as `time`'s own nine-element tuple —
+  `[2026, 152, 12, 0, 0, 0, 0, 0, 0]`, the year, the **ordinal day**, the clock
+  and the offset. That is a stable and deliberately compact choice on `time`'s
+  part, and it is unusable as a *stored* format: `WHERE from > '2026-06-01'` has
+  no meaning against an ordinal tuple, no JSON Schema, OpenAPI document or
+  Parquet column type recognises it, and nobody can read it in a log. A crate
+  that documents its timestamps as always-UTC and expects them in databases and
+  topics owes them the spelling those systems speak.
+
+  An instant is now `"2026-06-01T12:00:00Z"` (RFC 3339) and a calendar date
+  `"2026-06-01"` (ISO 8601) — **in a human-readable format**. In a binary one
+  they keep the compact tuple, because `MeterInterval` carries two instants and
+  is the hottest type here. `time`'s own `serde-human-readable` feature splits
+  the same way and is not used: its string is `2026-06-01 12:00:00.0
+  +00:00:00`, which is readable but is not RFC 3339 and so is not what a
+  `TIMESTAMPTZ` cast or a `format: date-time` validator expects. The split lives
+  in a private `wire` module. **This is a wire-format break for anyone storing
+  timestamps.**
+
+  The crate had been paying for `time/serde-well-known` — whose only
+  contribution is the `time::serde::rfc3339` module — and using nothing from it,
+  while that feature also pulled `time`'s serde into builds that had not asked
+  for serde at all. `time/serde` now sits behind this crate's own `serde`
+  feature.
+- **The hot types could not survive a binary format, which the crate claimed
+  they could.** `AggregationRule`'s docs said internal tagging costs
+  bincode/postcard support and *"the hot types a binary format is chosen for
+  (`MeterInterval`, `ObisCode`) are unaffected"*. `MeterInterval` carries a
+  `Decimal`, whose default `Deserialize` calls `deserialize_any` — the one
+  question a format without a self-describing wire cannot answer — so it did not
+  round-trip through postcard at all. `rust_decimal/serde-str` moves it to
+  `deserialize_str`. The JSON is byte-identical, because a `Decimal` already
+  travelled as its exact string. `postcard` is now a dev-dependency and a test
+  holds **both** halves of the trade-off, including that the internally tagged
+  types still deliberately fail.
+- **`assess_modul_3` passed a calendar whose Niedertarif was unreachable.** A
+  wrapping band written as a single `22:00–06:00` window — the mistake
+  `ZaehlzeitFenster::spanning` exists to prevent — matches nothing, so NT was
+  declared, never applied, and every other rule passed: three registers listed,
+  the day fully covered by the ST fallback, HT untouched. The verdict was
+  `Conforms` on a broken DSO calendar. New finding
+  `Modul3Finding::RegisterNeverReached`.
+- **…and the *ganzjährig identisch* check missed a seasonal NT/ST swap.** It
+  compared only the Hochtarif and the uncovered minutes across the twelve
+  months, so restricting the Niedertarif to the winter half — leaving the
+  fallback to cover the summer — moved neither number and went unreported. The
+  comparison is now over the whole per-register profile.
+
+- **Three doc comments promised an exactness the arithmetic does not deliver.**
+  Found by stating the identity and generating the numbers, which is the only
+  way any of them could have been found — each needs a quotient that does not
+  terminate, and a human writing an example picks numbers that divide cleanly.
+  - `allocation_temperature` said *"the division is exact"*. The **weights**
+    are exact — eighths, so the formula is `(8ϑ + 4ϑ + 2ϑ + ϑ) / 15` in
+    integers and no float is involved — but `8/15` does not terminate, so
+    `ϑ_allok × 15` does not recover the numerator. Left at full width, because
+    its only consumer is `h_value`, which crosses into `f64` at once; the doc
+    now says so and says to round before printing.
+  - `UnitScale` said multiplying before dividing *"keeps the result exact"*. It
+    keeps the **defining identities** exact — 3.6 GJ is 1 000 kWh and 3.6 × 10⁶ J
+    is 1 kWh, to the digit, where a stored `277.777…8` factor would round twice
+    and systematically — and rounds everything else once, at the end.
+  - `AnnualForecast` rounded `projected_annual` and both interval bounds to
+    three places and **said so nowhere**. Now [`FORECAST_DP`], documented, with
+    the consequence named: a cut quantity is homogeneous only to its last
+    reported place, so doubling every reading doubles the projection to within
+    `2 × 10⁻³` kWh rather than exactly.
+
+  The crate now states the contract once, at the top: **"exact" means no float,
+  and one rounding at most.** Sums, differences and products of quantities do
+  not round, which is why the conservation laws hold to the digit; division is
+  where a choice has to be made, and the rule for making it is written down.
+- **`QualityFlag::severity_rank` is a strict total order.** `Corrected` and
+  `Substituted` shared rank 2, and `Faulty` and `Unknown` rank 5. `worse_of`
+  keeps `self` on a tie, so the **worst quality of a set depended on the order
+  the set arrived in** — a resampled bucket, a virtual meter, a differenced
+  Lastgang and `MeasurementSeries::worst_quality` all took whichever of two
+  equally-ranked flags the caller happened to list first. The eight flags now
+  have eight distinct ranks, ordered by distance from a measurement:
+  `Corrected` (2) has a measurement behind it and `Substituted` (3) does not;
+  `Faulty` (6) is known bad and `Unknown` (7) is not even that.
+- **`aggregate` breaks a tied peak by the earliest interval.** A flat load
+  reaches its maximum in many quarter-hours, and `spitzenleistung_at` reported
+  whichever of them came first *in the slice*. The Leistungspreis is the most
+  disputed line on an RLM invoice, and "when?" is not allowed to depend on how
+  the series was sorted on the way in.
+- **`ObisCode::default_resolution` no longer contradicts the file it lives
+  in.** `7-0:54.0.22` is documented three paragraphs above it as a **monthly**
+  Brennwert mean — value group E selects the averaging period, 16 hourly,
+  20 daily, 22 monthly — and was reported as an hourly channel. Separately, the
+  reactive branch ignored value group D altogether, so `1-0:5.6.0` claimed a
+  quarter-hour grid while `1-0:1.6.0`, the same Maximum register one Messgröße
+  over, correctly claimed none. The function is now structured by medium and
+  Messart: a Maximum (D = 6), a Vorschub (D = 9), a Momentanwert (D = 7) and
+  the Fehlerregister are not equidistant series and answer `None`, active and
+  reactive alike.
+- **V06 knows a daily gas series is cut at 06:00.** The DST allowance that
+  keeps a 23- or 25-hour daily interval from drawing a length warning tested for
+  a Berlin *midnight*, so a daily series on the Gastag — the whole point of the
+  `DayBoundary` added in 0.19.0 — drew a V06 warning on both transition days
+  every year, for being exactly right. `ValidationConfig::day_boundary` and
+  `ValidationConfig::on` carry the choice, and `QualityConfig::for_sparte(Gas)`
+  sets it.
+- **V05 reports the run, not the threshold.** The finding fired the moment the
+  configured threshold was crossed and put *that* number in the message, so a
+  meter frozen for three weeks was reported as "4 consecutive zero intervals" —
+  the figure a reader acts on, wrong by two orders of magnitude. Each run is now
+  reported once, when it closes, carrying the length it actually reached.
+- **`ValidationConfig::enabled_rules` admits that `zero_run_threshold: 0`
+  switches V05 off.** It reported the rule as armed, so a clean report claimed a
+  stuck meter had been looked for when nothing had looked.
+  `ValidationRuleId::enabling_field` now names `zero_run_threshold` for V05 and
+  `negative_energy_is_error` for V03, the crate's two opt-*out* rules.
+- **The GGV allocation identity was false, and is now true.** `GgvInterval`
+  documented `consumption == allocated + net_grid_draw` as holding *"exactly:
+  all three are `Decimal`"*. For the proportional key it did not. The share is
+  a quotient — `consumption ÷ Σ consumption × generation` — carrying up to 28
+  significant digits, so the `consumption − allocated` that follows needed more
+  than a `Decimal` has and rounded: the identity came back a few 1e-27 kWh
+  short. `ALLOCATION_DP` now cuts the derived share to six decimal places
+  **toward zero**, which makes the identity exact, makes every share a number
+  that fits in an invoice or an MSCONS field, and — because truncation only
+  lowers a share — keeps `Σ allocated ≤ generation` so the § 42b Abs. 5 ceiling
+  stays a theorem rather than becoming a clamp. A proptest over generated
+  communities is what caught it; a unit test with round numbers never would.
+- **§ 42c EnWG's dates.** The `sharing` module said Energy Sharing had been
+  *"in force since 1 June 2026"*. The section itself entered into force on
+  **22 December 2025** (BGBl. 2025 I Nr. 347); 1 June 2026 is when Abs. 4's duty
+  on the Netzbetreiber begins. The distinction decides whether a delivery point
+  that is `NotCapable` today is in breach of anything.
+- **`AnnualForecast::seasonal_correction_applied` records whether the
+  correction ran**, not whether the factor differs from 1. A prior year whose
+  matching window happens to sit at the overall daily rate yields a factor of
+  exactly `1` — a correct, fully corrected projection that reported itself as
+  uncorrected, which is precisely the flag a caller uses to refuse to bill.
+
+### Changed
+
+- **`uuid` is no longer a dependency.** It existed for a single field —
+  `MeasurementSource::RetroactiveCorrection { correction_id }` — that the crate
+  never constructs, parses or validates, while every other external reference
+  in the same enum is a `String`. It also pulled `getrandom` and its system
+  entropy source into a library whose headline guarantee is that it reads no
+  ambient state, and broke `wasm32` consumers for nothing. The field is now
+  `correction_ref: String`. Four runtime dependencies remain.
+- **`Zaehlzeitdefinition::split_energy` returns `BTreeMap<Option<&str>, _>`.**
+  The keys borrow from the definition, so they are exactly the strings
+  `registers()` lists and a lookup reads `split[&Some(HT)]` instead of
+  `split[&Some(HT.to_owned())]`. A year of quarter-hours used to allocate a
+  `String` per interval to produce three distinct keys.
+- **`GasConversionParams::default_erdgas_h()` is gone**, replaced by
+  `new(hs, z)` and `already_converted(hs)`. A Brennwert is operator data
+  published per supply area and billing period, and it is a direct multiplier on
+  a billed quantity: a 10.55 stand-in against a real 11.20 understates every gas
+  invoice in the portfolio by 6 %, silently. It was the one place the crate
+  invented a device property, against its own stated rule.
+  `already_converted` is the useful half — it pins the Zustandszahl to 1 for a
+  Normvolumen, where applying the real one a second time overstates the energy.
+  The type also gained `Copy`, `PartialEq`, `Eq`, `Hash` and `serde`.
+- **`sharing::combine` is `combine_readiness`** and is re-exported at the crate
+  root, where the two functions producing its arguments already were.
+- **`sharing::Finding` is exhaustive.** It was `#[non_exhaustive]`, the
+  treatment this crate reserves for *errors*; a finding is routed, stored and
+  displayed, and marking it also contradicted the `ALL` / `CODES` contract that
+  promises exhaustive iteration. Exactly three types now carry the attribute,
+  and all three are failure vocabularies.
+- **`SharingReadiness::label()` is gone.** It returned the same string as
+  `as_str()`, variant for variant — a second copy of a fact, in a crate whose
+  design rules forbid one.
+- **`mindestleistung_direktansteuerung` returns `Option<Decimal>`**, and
+  `mindestleistung_ems` returns `None` for a set containing something that is
+  not a steuVE. Ziff. 2.4.1 admits the four Fallgruppen only *"mit einer
+  Netzanschlussleistung von mehr als 4,2 Kilowatt"*, so a smaller device is not
+  counted by `n_steuVE` — and including one raises the floor for every other
+  device in the set, quietly costing the Netzbetreiber reduction headroom it is
+  entitled to. `SteuVe::is_steuerbar()` and `STEUVE_SCHWELLE_KW` say why; the
+  latter is the *other* 4,2 kW, a different provision from
+  `MINDESTLEISTUNG_KW` that happens to carry the same number.
+- **`Modul3Context::at_delivery_point(bool, bool, bool)` is gone**, replaced by
+  `with_modul_1`, `with_registrierende_leistungsmessung`,
+  `with_intelligentes_messsystem` and the shorthand
+  `at_a_conforming_delivery_point()`. Three positional booleans of which exactly
+  one is an inverted condition is a call site nobody can read.
+- **`sharing::Capability` is `Copy`** (and `Hash`), like every other verdict in
+  that module. It is a discriminant plus an `EligibilityBasis`, which is itself
+  `Copy`, and `basis()` already took `self` by value — so a caller who wanted
+  both the basis and the verdict had to clone a two-word enum.
+- **`ConversionError` is re-exported at the crate root**, like every other error
+  type here. `normalize_to_kwh` was reachable as `metering::normalize_to_kwh`
+  while the only error it returns needed `metering::conversion::ConversionError`.
+
+### Added
+
+- **`tests/order_independence.rs`** — proptest over `aggregate`, `resample`,
+  `validate_intervals`, `score_intervals`, `fill_gaps`, `split_energy`,
+  `to_lastgang` and `QualityFlag::worst_of`: a shuffled series gives an
+  identical result. Half the generated series are drawn from a coarse half-kWh
+  value grid, because a tie is what makes a maximum order-dependent and ties do
+  not happen by accident in a fine-grained one — both defects above survive a
+  generator that does not force them.
+- **`code_contract::no_coded_enum_escapes_this_file`** — the contract file's own
+  list said "adding an enum without adding it here is the only way to escape",
+  which was a comment rather than a mechanism. The test now reads the crate
+  source, collects every type `string_codes!` is applied to, and fails if one is
+  missing from the list.
+- **`IntervalResolution::from_observed_seconds`** — the tolerance table that
+  maps a *measured* spacing onto a resolution, including the 23–25 hour band
+  that makes a daily series a calendar `Day` rather than a fixed 86 400 s
+  window. `classification::detect_interval_length` and
+  `reading::detect_reading_cadence` held byte-identical copies of it, in a crate
+  whose design rules forbid a second copy of a fact; both now call it.
+- **`ValidationConfig::on(DayBoundary)`** and `ValidationConfig::day_boundary`.
+- **A `para14a` module** — the two powers a § 14a netzorientierte Steuerung
+  turns on, both in kW and both derived from nameplate figures, so quantities
+  rather than money:
+  - `mindestleistung_direktansteuerung` and `mindestleistung_ems` reproduce
+    BK6-22-300 Anlage 1 Ziff. 4.5.1 / 4.5.2 verbatim, with the published
+    Gleichzeitigkeitsfaktor table. Two traps in that formula are worth naming:
+    its first term is `Max(0,4 × ΣP_WP; 0,4 × ΣP_Klima)`, a **maximum of two
+    group sums** rather than `0,4 ×` everything — adding them overstates the
+    floor on any installation carrying both a heat pump and room cooling, and a
+    floor that is too high denies the Netzbetreiber headroom it is entitled to —
+    and `n_steuVE` counts *all* controlled devices, Ladepunkte and Speicher
+    included, not only the scaled ones.
+  - `netzwirksamer_leistungsbezug` computes the share of Ziff. 2.3. That Ziffer
+    *defines* the quantity and does not say how to split a grid draw local
+    generation partly covered; VDE FNN's *Bewertung der Mindestleistung* (V1.0,
+    April 2025) says the calculation is not its subject and points on to a text
+    that is not freely citable. So the apportionment is a `Verursachungsregel`
+    the caller picks, defaulting to the conservative one, with each convention's
+    assumption written out — the treatment G 685's final rounding already gets.
+- **`zaehlzeit::assess_modul_3`** — a conformance check against the BDEW
+  *Anwendungshilfe für die Umsetzung von Modul 3* v1.1 (07.02.2025) §2, for
+  refusing a bad DSO calendar before it reaches an optimiser. It checks the
+  three tariffs, full coverage of the day, HT ≥ 2 h **per day class**, windows
+  *ganzjährig identisch*, ≥ 2 billed quarters (not necessarily adjacent), a
+  calendar-year validity, and the Modul 1 / iMSys / no-RLM preconditions.
+  It deliberately does **not** check the HT and NT price corridors — this crate
+  computes quantities, and it has no Arbeitspreis to compare against — nor the
+  15.10. publication date, which is a Fristen question and which the AWH states
+  for the first year rather than as a standing rule.
+- **`Zaehlzeitdefinition::netzbetreiber`** and `published_by`. `id` is
+  NB-assigned, so `HT/NT-1` from two operators are two calendars under one name.
+  Deliberately **no** `year` field — that is `valid_from`/`valid_to` — and no
+  `source` URL or hash, which is a property of the fetch, not of the calendar.
+- **`ids::BdewCode`** and `CodeVergabestelle` — the 13-digit Marktpartner-ID,
+  with the Bildungsvorschrift of BDEW *Identifikatoren in der
+  Marktkommunikation* v1.2 §2.2 enforced. `MeasurementPoint::accountable_mp_id`
+  and `MeasurementSource::Mscons`'s `sender_mp_id` are now typed rather than
+  free text.
+
+  The check digit is **reported, not enforced**: §2.3 names the same Lok- und
+  Waggon-Verfahren as the MaLo-ID and then exempts GS1-issued GLNs, so a valid
+  Marktpartner-ID may legitimately fail it. `has_bdew_check_digit()` says so
+  without a library refusing data the market issued. The `MaloId` procedure,
+  which has no such carve-out, stays enforced at the parse. That procedure now
+  has one implementation serving both.
+- **`compute_community_allocation`**, `AllocationKey`, `CommunityInterval` and
+  `ParticipantAllocation` — the § 42b allocation for the whole community rather
+  than one tenant at a time. The proportional denominator and the source index
+  are formed once instead of once per tenant, so a year of quarter-hours across
+  a twenty-flat building stops being quadratic in the tenant count; the surplus
+  that fed the grid becomes a number rather than something to reconstruct; and
+  the **§ 42b Abs. 5 pool ceiling becomes computable at all**, because it is
+  defined over the whole participant set.
+
+  It is reported (`CommunityInterval::pool_cap`) rather than applied: with
+  fractions summing to at most 1 the per-participant `Pos()` cap already implies
+  it, so clamping a second time would be a rule the statute does not contain.
+  § 42c Energy Sharing uses the same arithmetic with a contractual
+  Aufteilungsschlüssel — § 42c Abs. 3 Nr. 2 leaves the key to the contract and
+  has no counterpart to Abs. 5, so `pool_cap` is an observation there rather
+  than a ceiling.
+- **`power_quality::PhaseApparentPower`**, `Phase` and `UNSYMMETRIE_LIMIT_KVA` —
+  the VDE-AR-N 4100 Abschnitt 5.5.2 Unsymmetrieleistung, in **kVA**. The module
+  refuses EN 50160's *voltage* unbalance for want of phase angles; load unbalance
+  needs only three magnitudes and is a different question.
+- **`tests/allocation_invariants.rs`** — proptest over generated communities:
+  the three exact-arithmetic identities and the § 42b Abs. 5 ceiling.
+- **Proptest coverage for the identifiers.** `BdewCode` joins the
+  canonicalisation suite — round trip, injectivity, padding, the Vergabestelle
+  read off the leading pair, and the advisory check digit — and `serde` is now
+  asserted to write the same string as `Display` for `MaloId`, `MeloId` and
+  `BdewCode`, which was pinned for `ObisCode` and `IntervalResolution` only.
+- **`tags_added_in_0_20_are_pinned`** and four shape tests, so every type this
+  release put on the wire is covered by the same semver commitment as the rest.
+- **`tests/quantity_invariants.rs`** — the conservation laws and bounds of every
+  arithmetic module, under generated input: differencing sums to the register
+  difference, resampling preserves energy, a filled series is exactly its grid
+  and every invented value is in the audit trail, the register split
+  reconstructs the Arbeitsmenge, the Jahresprognose is its own formula, unit and
+  gas conversion are exact where the quotient terminates and round once where it
+  does not, the Allokationstemperatur is a bounded mean, Mehr and Minder are two
+  halves of one signed delta, `P_min,14a` is monotone, the netzwirksamer
+  Leistungsbezug is bounded by both sides, the Unsymmetrieleistung is a
+  permutation-invariant spread, an EN 50160 outcome partitions its samples, and
+  the § 42c decision table is total.
+
+  This closes the last of the modules that were example-tested only. Every one
+  of the three overstatements above, and the EN 50160 containment direction that
+  turned out to be backwards in the *test*, came out of writing it.
+
+### Removed
+
+- **The enum count in the README.** It said *"all thirty-four enums"*, which
+  became forty-three this release. A hand-maintained tally of something the code
+  already knows is exactly the second copy of a fact this crate's own design
+  rules forbid; `code_contract::no_coded_enum_escapes_this_file` is the
+  mechanism that keeps the list honest, and the prose now points at it.
+
+### Not added, and why
+
+Three requests were declined rather than half-built:
+
+- **MiSpeL flow bookkeeping** (Abgrenzungs- and Pauschaloption). The arithmetic
+  is quantity-shaped, but the quantities exist to size Umlageprivilegien (§ 21
+  EnFG) and Marktprämien (§ 19 EEG) — the money boundary this crate draws — and
+  the Arbeitsstand of 05.08.2026 still writes its own Bekanntgabe as
+  `[01.10.2026]`, in square brackets, with part of it conditional on EU
+  state-aid approval. A semver-stable library does not carry two regimes for a
+  rule that is not yet a rule.
+- **A `year` field on `Zaehlzeitdefinition`.** It is `valid_from` and
+  `valid_to`. The crate's own design rule forbids a second copy of a fact.
+- **Per-phase `MeterInterval`.** Asked for as L1/L2/L3 *active power* for the
+  VDE-AR-N 4100 guard, and that guard is stated in **apparent** power: an
+  inverter at cos φ < 1 — which VDE-AR-N 4105 requires it to be able to do —
+  moves more kVA than kW, so a kW guard passes installations that breach the
+  rule, and the error grows exactly when the grid asked for reactive support.
+  The rule also covers only Erzeugungsanlagen, Speicher and Ladeeinrichtungen,
+  so what the grid meter sees cannot answer it however many phases it carried.
+  Tripling the crate's hottest type would not have delivered the check. The
+  quantity lives in `power_quality` instead, where per-phase measurements
+  already do.
+
 ## [0.19.0] — 2026-08-25
 
 An audit of the invariants the crate states about itself, and of the two places

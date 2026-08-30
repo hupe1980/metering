@@ -1,7 +1,7 @@
 +++
 title = "Design constraints"
 description = "Determinism, exact decimals, one canonical string per value, serde stability and exhaustive domain enums — the invariants the library holds to."
-weight = 12
+weight = 13
 +++
 
 ## Determinism
@@ -27,6 +27,59 @@ non-test code.
 The two meet in exactly one place: the V04 outlier rule converts values to `f64`
 to run the Hampel filter. That comparison decides whether to *flag* an interval;
 it never alters one. Nothing a float touches is written back into a quantity.
+
+## What "exact" means here
+
+**No float, and one rounding at most.**
+
+The first half is absolute: a metered quantity is a `Decimal` from the wire to
+the invoice and never passes through `f64`. The second half is the part worth
+stating, because "exact decimal" is routinely read as "never rounds", and that
+is not true of any decimal type. `Decimal` carries 28–29 significant digits, and
+a division whose quotient does not terminate is rounded to that width. `2 ÷ 3`
+is `0.666…7` here as anywhere.
+
+Addition, subtraction and multiplication of quantities at realistic scales do
+not round at all, which is why the **conservation laws hold exactly**:
+
+| Law | Where |
+|---|---|
+| a register split reconstructs its Arbeitsmenge | `split_energy` |
+| a filled series covers its grid, slot for slot | `fill_gaps` |
+| a consumption splits into a credited and a drawn part | `compute_community_allocation` |
+| a resampling preserves the energy it buckets | `resample` |
+| a Lastgang sums to the difference of its outer Zählerstände | `to_lastgang` |
+
+`tests/quantity_invariants.rs` asserts each of them over generated input.
+
+### Division is where a choice has to be made
+
+Two ways, and which one applies is a rule rather than a case-by-case decision:
+
+- **Cut to a documented number of places** when the quotient is a value someone
+  stores, prints or settles on — or when an identity depends on it.
+  `ALLOCATION_DP` (6), `FORECAST_DP` (3), `SigLinDe::H_VALUE_DP` (6),
+  `KUNDENWERT_DP` (4). A share carrying twenty-seven decimal places is not a
+  quantity, and it breaks the subtraction that follows it.
+- **Leave it at full width** when it is an intermediate nothing downstream can
+  distinguish. `allocation_temperature` feeds only `h_value`, which crosses into
+  `f64` at once; cutting it would be a rule the Leitfaden does not state, bought
+  for no benefit.
+
+Where the rounding rule is the *market's* rather than this crate's it is a
+parameter with a documented default instead — `G685Rounding` is the case where
+published Netzbetreiber practice demonstrably disagrees with itself.
+
+### The consequence that surprises people
+
+A quantity that has been cut is homogeneous only to its last reported place.
+Doubling every reading doubles a Jahresprognose to within `2 × 10⁻³` kWh, not
+exactly, because `round(2x)` and `2·round(x)` differ at a rounding boundary.
+
+The distinction is easy to overstate in either direction. The
+Allokationstemperatur has exact *weights* — eighths — and an inexact division
+by 15. `UnitScale` keeps the *defining identities* exact — 3.6 GJ is 1 000 kWh
+to the digit — and rounds everything else once.
 
 ## One value, one string
 
@@ -80,7 +133,31 @@ and covered by semver**. A test pins every tag literally, so the commitment is
 mechanical rather than a promise.
 
 `ObisCode` serialises as its IEC 62056 string and `IntervalResolution` as its
-ISO 8601 duration — external standards no refactor here can rename.
+ISO 8601 duration — external standards no refactor here can rename. The
+identifiers travel as their digits.
+
+**Instants are RFC 3339 and dates ISO 8601**, in a human-readable format:
+`"2026-06-01T12:00:00Z"`, `"2026-06-01"`. That is the spelling a `TIMESTAMPTZ`
+cast, a JSON Schema `format: date-time` and a log viewer all understand.
+
+In a **binary** format they keep `time`'s own nine-integer tuple, which packs
+tightly and which no schema language would recognise anyway. `MeterInterval`
+carries two instants and is the hottest type in the crate, so a twenty-byte
+string per boundary is a poor trade there. `serde` is asked which kind of format
+it is and the answer decides.
+
+### The hot types survive a non-self-describing format
+
+`MeterInterval`, `ObisCode`, `MeterReading` and the identifiers round-trip
+through bincode and postcard; the internally tagged `AggregationRule` and
+`AllocationKey` deliberately do not.
+
+`rust_decimal/serde-str` is what makes the first half hold. The default
+`Deserialize` calls `deserialize_any`, which is the one question a format
+without a self-describing wire cannot answer, and `MeterInterval` carries a
+`Decimal`. The JSON is identical either way — a `Decimal` travels as its exact
+string regardless — so the feature costs nothing and buys the binary path. A
+test holds both halves of the trade-off.
 
 ## Enum exhaustiveness
 
@@ -135,10 +212,13 @@ default.
 - `DynamicSlpProfile::value_at` returns `None` when a profile needs dynamizing
   and no Dynamisierungsfunktion was supplied, rather than handing back an
   entdynamisiert value as though it were a real one.
-- A validation report says **which rules ran**. Four are opt-in, so a clean
-  result means "the rules that ran found nothing" — and
-  `ValidationConfig::disabled_rules()` and `ValidationResult::evaluated` make
-  the difference between that and "nothing is wrong" a fact rather than an
-  assumption.
+- A validation report says **which rules ran**. Four are opt-in and two more
+  can be switched off, so a clean result means "the rules that ran found
+  nothing" — and `ValidationConfig::disabled_rules()` and
+  `ValidationResult::evaluated` make the difference between that and "nothing
+  is wrong" a fact rather than an assumption.
+- `GasConversionParams` has no `Default`. A Brennwert and a Zustandszahl are
+  operator data, and a typical value for either is a silent percentage error on
+  a billed quantity.
 - `ObisCode::as_lastgang()` returns `None` for a tariff register rather than
   inventing `1-0:1.29.1`, a code the market does not define.

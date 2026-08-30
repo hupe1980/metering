@@ -1,7 +1,7 @@
 +++
 title = "Design constraints"
 description = "Determinism, exact decimals, one canonical string per value, serde stability and exhaustive domain enums — the invariants the library holds to."
-weight = 13
+weight = 14
 +++
 
 ## Determinism
@@ -49,6 +49,8 @@ not round at all, which is why the **conservation laws hold exactly**:
 | a consumption splits into a credited and a drawn part | `compute_community_allocation` |
 | a resampling preserves the energy it buckets | `resample` |
 | a Lastgang sums to the difference of its outer Zählerstände | `to_lastgang` |
+| a session's total survives being spread across slots | `split_session` |
+| `Σ allocated + residual = total`, for every key | `allocate` |
 
 `tests/quantity_invariants.rs` asserts each of them over generated input.
 
@@ -195,6 +197,21 @@ it, and nothing downstream can tell which one is right.
   stored flag that could contradict the two numbers beside it — and
   `compute_virtual_meter` projects from the allocation rather than recomputing
   the § 42b Abs. 5 cap, so the two entry points cannot drift.
+- A `MeterInterval`'s flow direction comes from value group C of its OBIS code
+  (`direction()`), never from a field beside it. `resample` and
+  `split_session` bucket through one `DayBoundary::bucket_bounds`, so two
+  callers cannot disagree about which slot a kWh belongs to; `allocate` is the
+  one implementation of the `Pos()` cap and the residual.
+
+### …and where it cannot be removed, make it reportable
+
+`MeasurementPoint` states direction twice on purpose: `EnergyFlow` is master
+data about the point's *purpose* and also distinguishes storage from load and
+marks a four-quadrant meter `Bidirectional`, none of which an OBIS code says.
+The duplication is therefore load-bearing, and silently preferring one of the
+two would be the same failure in a different place. `direction()` believes the
+metered code, and `direction_conflict()` returns `Some((measured, declared))`
+so the contradiction is something you can log or assert on.
 
 ## Unknown is not good
 

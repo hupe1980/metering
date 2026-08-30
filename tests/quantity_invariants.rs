@@ -12,12 +12,13 @@
 //! a split reconstructs its total, a mean lies between its extremes — or a
 //! bound the API's own documentation promises.
 
+use metering::session::{MeterSample, SessionSplitConfig, merge_sessions, split_session};
 use metering::{
-    AggregationConfig, FillGapsConfig, G685FinalRounding, G685Rounding, GasConversionParams,
-    IntervalResolution, MeasurementUnit, MeterInterval, QualityFlag, ResampleConfig,
-    SubstituteMethod, Zaehlzeitdefinition, aggregate, compute_imbalance, fill_gaps,
-    gas_m3_to_kwh_hs, gas_m3_to_kwh_hs_rounded, network_losses, normalize_to_kwh,
-    project_annual_consumption, resample,
+    AggregationConfig, AllocationBasis, AllocationPart, FillGapsConfig, G685FinalRounding,
+    G685Rounding, GasConversionParams, IntervalResolution, MeasurementUnit, MeterInterval,
+    QualityFlag, ResampleConfig, SubstituteMethod, Zaehlzeitdefinition, aggregate, allocate,
+    compute_imbalance, fill_gaps, gas_m3_to_kwh_hs, gas_m3_to_kwh_hs_rounded, network_losses,
+    normalize_to_kwh, project_annual_consumption, resample, sum_by_direction,
 };
 use proptest::prelude::*;
 use rust_decimal::Decimal;
@@ -890,6 +891,253 @@ proptest! {
                     && delivery == metering::Delivery::Delivering,
             );
             prop_assert!(!verdict.required_action().is_empty());
+        }
+    }
+}
+
+// ── allocation ───────────────────────────────────────────────────────────────
+
+/// A pool and a set of weighted, optionally ceilinged claims on it.
+fn arb_pool() -> impl Strategy<Value = (Decimal, Vec<AllocationPart>, AllocationBasis)> {
+    (
+        arb_kwh(),
+        prop::collection::vec((arb_kwh(), prop::option::of(arb_kwh())), 0..6),
+        any::<bool>(),
+    )
+        .prop_map(|(total, rows, proportional)| {
+            let basis = if proportional {
+                AllocationBasis::Proportional
+            } else {
+                AllocationBasis::Fraction
+            };
+            let n = rows.len().max(1) as i64;
+            let parts = rows
+                .into_iter()
+                .enumerate()
+                .map(|(i, (weight, capacity))| {
+                    // A `Fraction` key is only valid if the weights are
+                    // positive and sum to at most 1, so build one that is —
+                    // the property under test is the identity, not the guard.
+                    let weight = match basis {
+                        AllocationBasis::Fraction => Decimal::ONE / Decimal::from(n * 2),
+                        AllocationBasis::Proportional => weight,
+                    };
+                    let mut part = AllocationPart::new(format!("P{i}"), weight);
+                    if let Some(cap) = capacity {
+                        part = part.capped_at(cap);
+                    }
+                    part
+                })
+                .collect();
+            (total, parts, basis)
+        })
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
+
+    /// The identity the whole module exists for: nothing is created, and
+    /// nothing is lost between the pool and the parts.
+    #[test]
+    fn an_allocation_conserves_its_total((total, parts, basis) in arb_pool()) {
+        let row = allocate(total, parts, basis).expect("the generated key is valid");
+        prop_assert_eq!(row.allocated() + row.residual, row.total);
+        prop_assert_eq!(row.total, total);
+
+        for part in &row.parts {
+            prop_assert!(part.allocated >= Decimal::ZERO, "a part received a negative amount");
+            prop_assert!(part.allocated <= part.share, "a part received more than its share");
+            prop_assert!(part.forgone() >= Decimal::ZERO);
+            prop_assert!(part.share.scale() <= metering::ALLOCATION_DP);
+        }
+
+        // With a non-negative pool, the parts can never take more than it holds.
+        prop_assert!(row.allocated() <= total, "over-allocated");
+        prop_assert!(row.residual >= Decimal::ZERO);
+    }
+}
+
+// ── session ──────────────────────────────────────────────────────────────────
+
+/// A session span, its total, and register readings inside it.
+///
+/// The readings are built from a monotone walk so they are always consistent
+/// with the total: the last uncovered end absorbs whatever they do not
+/// account for, which is exactly the contract `split_session` documents.
+fn arb_session()
+-> impl Strategy<Value = (OffsetDateTime, OffsetDateTime, Decimal, Vec<MeterSample>)> {
+    (
+        60i64..40_000,                                           // span, seconds
+        0i64..900,                                               // offset off the grid
+        arb_kwh(),                                               // session total
+        prop::collection::vec((1i64..2_000, 0i64..1000), 0..24), // samples
+    )
+        .prop_map(|(span, offset, energy, rows)| {
+            let from = BASE + Duration::seconds(offset);
+            let to = from + Duration::seconds(span);
+
+            // Sample instants strictly inside the span, and a register that
+            // only ever climbs — never past the session total.
+            let mut at = from;
+            let mut reading = Decimal::new(1_000_000, 3);
+            let mut samples = Vec::new();
+            let mut placed = Decimal::ZERO;
+            for (step, delta) in rows {
+                at += Duration::seconds(step);
+                if at >= to {
+                    break;
+                }
+                let delta = Decimal::new(delta, 3).min(energy - placed);
+                placed += delta;
+                reading += delta;
+                samples.push(MeterSample::new(at, reading));
+            }
+            (from, to, energy, samples)
+        })
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
+
+    /// A session's energy arrives on the grid whole: the slots sum to the
+    /// total, none of them is negative, and they tile the span contiguously.
+    #[test]
+    fn a_session_split_conserves_its_total(
+        (from, to, energy, samples) in arb_session(),
+    ) {
+        let slots = split_session(from, to, energy, &samples, &SessionSplitConfig::quarter_hourly())
+            .expect("the generated session is consistent");
+
+        prop_assert_eq!(slots.iter().map(|s| s.value).sum::<Decimal>(), energy);
+        prop_assert!(slots.iter().all(|s| s.value >= Decimal::ZERO));
+        prop_assert!(!slots.is_empty());
+
+        // Contiguous, ascending, and covering the whole span.
+        for pair in slots.windows(2) {
+            prop_assert_eq!(pair[0].to, pair[1].from);
+        }
+        prop_assert!(slots[0].from <= from);
+        prop_assert!(slots[slots.len() - 1].to >= to);
+
+        // Every slot value is a quantity someone can write down.
+        prop_assert!(slots.iter().all(|s| s.value.scale() <= metering::ALLOCATION_DP));
+    }
+
+    /// A coarser grid is a partition of the same energy: splitting onto hours
+    /// and splitting onto quarter-hours give the same total.
+    #[test]
+    fn the_grid_does_not_change_the_energy(
+        (from, to, energy, samples) in arb_session(),
+    ) {
+        let cfg = SessionSplitConfig::quarter_hourly();
+        let quarters = split_session(from, to, energy, &samples, &cfg).unwrap();
+        let hours = split_session(
+            from, to, energy, &samples,
+            &cfg.at(IntervalResolution::Hour),
+        ).unwrap();
+        prop_assert_eq!(
+            quarters.iter().map(|s| s.value).sum::<Decimal>(),
+            hours.iter().map(|s| s.value).sum::<Decimal>(),
+        );
+    }
+}
+
+// ── directional balance ──────────────────────────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
+
+    /// The three buckets partition the input: nothing is counted twice and
+    /// nothing falls out.
+    #[test]
+    fn a_directional_split_partitions_the_series(series in arb_series(0..96)) {
+        let codes = ["1-0:1.8.0", "1-0:2.8.0", "1-0:3.8.0"];
+        let tagged: Vec<MeterInterval> = series
+            .iter()
+            .enumerate()
+            .map(|(i, iv)| MeterInterval {
+                obis_code: Some(codes[i % 3].parse().unwrap()),
+                ..iv.clone()
+            })
+            .collect();
+
+        let split = sum_by_direction(&tagged);
+        prop_assert_eq!(split.total(), tagged.iter().map(|iv| iv.value).sum::<Decimal>());
+        prop_assert_eq!(split.net(), split.import - split.export);
+
+        // Untagged intervals are undirected, never silently dropped.
+        let untagged = sum_by_direction(&series);
+        prop_assert_eq!(untagged.import, Decimal::ZERO);
+        prop_assert_eq!(untagged.export, Decimal::ZERO);
+        prop_assert_eq!(untagged.undirected, series.iter().map(|iv| iv.value).sum::<Decimal>());
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
+
+    /// The exactness claim, tested directly rather than trusted: a slot that
+    /// comes back `Measured` carries exactly the energy the register readings
+    /// on its own boundaries say it does.
+    #[test]
+    fn a_measured_slot_is_the_register_difference(
+        (from, to, energy, samples) in arb_session(),
+    ) {
+        let slots = split_session(from, to, energy, &samples, &SessionSplitConfig::quarter_hourly())
+            .expect("the generated session is consistent");
+
+        // A cumulative the samples state directly, with no interpolation.
+        let reading_at = |t| samples.iter().find(|s| s.at == t).map(|s| s.reading);
+
+        for slot in &slots {
+            if slot.quality != QualityFlag::Measured {
+                continue;
+            }
+            // A `Measured` slot is bounded by readings, unless the whole
+            // session lies inside it — in which case its value is the total.
+            if let (Some(open), Some(close)) = (reading_at(slot.from), reading_at(slot.to)) {
+                prop_assert_eq!(slot.value, close - open);
+            } else {
+                prop_assert!(slot.from <= from && slot.to >= to);
+                prop_assert_eq!(slot.value, energy);
+            }
+        }
+    }
+
+    /// Merging is a union: every slot any session touched appears exactly
+    /// once, and the sum is the sum of the totals.
+    #[test]
+    fn merging_sessions_conserves_every_total(
+        (from, to, energy, samples) in arb_session(),
+        offset in 0i64..3_600,
+        second in (0i64..40_000).prop_map(|milli| Decimal::new(milli, 3)),
+    ) {
+        let cfg = SessionSplitConfig::quarter_hourly();
+        let a = split_session(from, to, energy, &samples, &cfg).unwrap();
+        let b = split_session(
+            from + Duration::seconds(offset),
+            to + Duration::seconds(offset),
+            second,
+            &[],
+            &cfg,
+        )
+        .unwrap();
+
+        let merged = merge_sessions(&[a.clone(), b.clone()]);
+        prop_assert_eq!(
+            merged.iter().map(|s| s.value).sum::<Decimal>(),
+            energy + second,
+        );
+
+        // One row per distinct slot, ascending. Not necessarily contiguous:
+        // two sessions with a gap between them touch no slot in the gap, and
+        // inventing zeros there is `fill_gaps`, not this.
+        let mut slots: Vec<_> = a.iter().chain(b.iter()).map(|iv| (iv.from, iv.to)).collect();
+        slots.sort_unstable();
+        slots.dedup();
+        prop_assert_eq!(merged.len(), slots.len());
+        for pair in merged.windows(2) {
+            prop_assert!(pair[0].from < pair[1].from);
         }
     }
 }

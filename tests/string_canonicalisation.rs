@@ -269,6 +269,102 @@ mod market_ids {
     }
 }
 
+// ── Eic ──────────────────────────────────────────────────────────────────────
+
+mod eic {
+    use metering::ids::{Eic, EicType};
+    use proptest::prelude::*;
+
+    /// Every character an EIC may carry, in value order.
+    const ALPHABET: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ-";
+
+    /// A structurally valid EIC: two digits of issuing office, a real object
+    /// type letter, twelve permitted characters, and the check character the
+    /// scheme derives from them.
+    ///
+    /// One body in thirty-seven computes to the minus sign, which §5.2 forbids
+    /// as a check character; for those the last body character is walked
+    /// through the alphabet until one does have a code. That always
+    /// terminates: it carries weight 2, and 2 is invertible modulo the
+    /// scheme's prime 37, so the thirty-seven candidates cover every residue.
+    pub fn arb_eic() -> impl Strategy<Value = Eic> {
+        ("[0-9]{2}", 0usize..EicType::ALL.len(), "[0-9A-Z-]{12}").prop_map(
+            |(office, type_index, body)| {
+                let letter = EicType::ALL[type_index].as_str();
+                let head = format!("{office}{letter}{body}");
+                ALPHABET
+                    .iter()
+                    .find_map(|c| {
+                        let mut bytes = head.clone().into_bytes();
+                        bytes[14] = *c;
+                        let candidate = String::from_utf8(bytes).expect("ascii");
+                        let check = Eic::compute_check_character(&candidate)?;
+                        format!("{candidate}{check}").parse::<Eic>().ok()
+                    })
+                    .expect("every residue is reachable from the last body character")
+            },
+        )
+    }
+
+    proptest! {
+        /// Stability + totality: sixteen characters out, the same value back.
+        #[test]
+        fn eic_round_trips(id in arb_eic()) {
+            let s = id.to_string();
+            prop_assert_eq!(s.len(), Eic::LEN);
+            prop_assert_eq!(s.parse::<Eic>(), Ok(id));
+        }
+
+        /// Injectivity: two different codes cannot share a spelling.
+        #[test]
+        fn eics_are_injective(x in arb_eic(), y in arb_eic()) {
+            prop_assert_eq!(x == y, x.to_string() == y.to_string());
+        }
+
+        /// Idempotence: lowercase and surrounding whitespace converge on the
+        /// one canonical spelling.
+        #[test]
+        fn eic_normalises_case_and_padding(id in arb_eic()) {
+            let messy = format!("  {}\t", id.to_string().to_lowercase());
+            prop_assert_eq!(messy.parse::<Eic>(), Ok(id));
+        }
+
+        /// The check character is the point of the type: a single wrong
+        /// character in the body is always caught, because changing one
+        /// character changes the weighted sum by `w × δ` with `w` in 2..=16
+        /// and `|δ| < 37`, which is never a multiple of 37.
+        #[test]
+        fn eic_single_character_corruption_is_caught(
+            id in arb_eic(),
+            pos in 0usize..15,
+            bump in 1u32..37,
+        ) {
+            let mut bytes = id.to_string().into_bytes();
+            let current = ALPHABET.iter().position(|c| *c == bytes[pos]).expect("in alphabet");
+            let replacement = ALPHABET[(current + bump as usize) % ALPHABET.len()];
+            if replacement == bytes[pos] {
+                return Ok(());
+            }
+            bytes[pos] = replacement;
+            let corrupted = String::from_utf8(bytes).expect("ascii");
+            prop_assert!(
+                corrupted.parse::<Eic>().is_err(),
+                "{corrupted} was accepted",
+            );
+        }
+
+        /// The object type is read off position 3 and nothing else.
+        #[test]
+        fn the_object_type_is_the_third_character(id in arb_eic()) {
+            let letter = &id.to_string()[2..3];
+            prop_assert_eq!(
+                id.object_type().map(|t| t.as_str().to_owned()),
+                Some(letter.to_owned()),
+            );
+        }
+    }
+}
+
 // ── BdewCode ─────────────────────────────────────────────────────────────────
 
 mod marktpartner_id {

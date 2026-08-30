@@ -472,6 +472,84 @@ crate::codes::string_codes! {
     QualityFlag;
 }
 
+// ── Direction ─────────────────────────────────────────────────────────────────
+
+/// Which way energy crossed the measurement point.
+///
+/// ## Why this is derived and not a field
+///
+/// A bidirectional Zählpunkt — a charge point that also discharges, a battery,
+/// a PV roof behind the same meter — delivers import *and* export for the same
+/// quarter-hour, and a settlement has to keep the two apart to the kWh. The
+/// market already keeps them apart, in value group C of the OBIS code:
+/// `1-0:1.8.x` counts Bezug and `1-0:2.8.x` counts Lieferung, on two registers,
+/// and MSCONS carries one time series per register.
+///
+/// So a `direction` field on [`MeterInterval`] would be a second, separately
+/// mutable copy of something [`obis_code`](MeterInterval::obis_code) already
+/// states — the same objection that keeps the *unit* off that type. Two copies
+/// of one fact disagree eventually, and nothing reports it. The direction is
+/// therefore read off the code, by [`ObisCode::direction`] and
+/// [`MeterInterval::direction`], and a **signed** interval is not offered at
+/// all: a negative kWh in this crate means a Korrekturenergiemenge
+/// (EDI@Energy *Codeliste* v2.5c §2.1), not a reversed flow, and overloading
+/// the sign would make those two indistinguishable.
+///
+/// What a caller actually needs from a bidirectional point is the balance, and
+/// that is [`sum_by_direction`](crate::aggregation::sum_by_direction).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "SCREAMING_SNAKE_CASE"))]
+pub enum Direction {
+    /// Bezug — energy drawn *from* the grid. OBIS value group C = 1.
+    Import,
+    /// Einspeisung / Rücklieferung — energy fed *into* the grid. C = 2.
+    Export,
+}
+
+impl Direction {
+    /// Every variant, in declaration order.
+    pub const ALL: [Self; 2] = [Self::Import, Self::Export];
+
+    /// Stable DB/wire label. Matches the `serde` tag and [`FromStr`] input.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Import => "IMPORT",
+            Self::Export => "EXPORT",
+        }
+    }
+
+    /// The German market term: *Bezug* and *Einspeisung*.
+    ///
+    /// A description, not a code — [`as_str`](Self::as_str) is what gets
+    /// stored, this is what gets printed on a German-language report.
+    #[must_use]
+    pub const fn bezeichnung(self) -> &'static str {
+        match self {
+            Self::Import => "Bezug",
+            Self::Export => "Einspeisung",
+        }
+    }
+
+    /// The other direction.
+    #[must_use]
+    pub const fn reversed(self) -> Self {
+        match self {
+            Self::Import => Self::Export,
+            Self::Export => Self::Import,
+        }
+    }
+}
+
+crate::codes::string_codes! {
+    // `BEZUG` / `EINSPEISUNG` are the market's own words and are read on the
+    // way in; `IMPORT` / `EXPORT` are what this crate writes, so that a stored
+    // direction needs no umlaut-free transliteration and matches the OBIS
+    // helpers `is_import` / `is_export` that answer the same question.
+    Direction, aliases = [("BEZUG", Self::Import), ("EINSPEISUNG", Self::Export)];
+}
+
 /// A single metered interval — the energy or volume *in* a period.
 ///
 /// This is the Lastgang. For the cumulative Zählerstand it is derived from, and
@@ -556,14 +634,18 @@ impl MeterInterval {
         }
     }
 
-    /// `true` when this interval carries forward / import energy (C = 1, D = 8).
+    /// Which way the energy flowed, read off the OBIS code.
     ///
-    /// Returns `None` when no OBIS code is set.
+    /// `None` when the interval carries no OBIS code, and when the code it
+    /// carries has no direction — a reactive register, a gas volume, a
+    /// Zustandszahl. Three answers, not two: "not stated" and "neither" are
+    /// both real, and a pair of booleans that are both `false` cannot say
+    /// which.
     ///
     /// ## Example
     ///
     /// ```rust
-    /// use metering::{MeterInterval, QualityFlag};
+    /// use metering::{Direction, MeterInterval, QualityFlag};
     /// use metering::obis::ObisCode;
     /// use rust_decimal::dec;
     /// use time::macros::datetime;
@@ -576,17 +658,11 @@ impl MeterInterval {
     ///     obis_code: Some("1-0:1.8.0".parse().unwrap()),
     /// };
     /// assert_eq!(iv.obis_code, Some(ObisCode::STROM_BEZUG_TOTAL));
-    /// assert_eq!(iv.is_import_energy(), Some(true));
+    /// assert_eq!(iv.direction(), Some(Direction::Import));
     /// ```
     #[must_use]
-    pub fn is_import_energy(&self) -> Option<bool> {
-        self.obis_code.map(|c| c.is_import())
-    }
-
-    /// `true` when this interval carries reverse / export (Einspeisung) energy (C = 2, D = 8).
-    #[must_use]
-    pub fn is_export_energy(&self) -> Option<bool> {
-        self.obis_code.map(|c| c.is_export())
+    pub fn direction(&self) -> Option<Direction> {
+        self.obis_code.and_then(ObisCode::direction)
     }
 
     /// Tariff register number from the OBIS code (`None` = total, `Some(1)` = HT, `Some(2)` = NT).
@@ -949,8 +1025,7 @@ mod code_round_trip_tests {
             obis_code: Some(ObisCode::STROM_BEZUG_HT),
         };
         assert_eq!(iv.tariff_register(), Some(1));
-        assert_eq!(iv.is_import_energy(), Some(true));
-        assert_eq!(iv.is_export_energy(), Some(false));
+        assert_eq!(iv.direction(), Some(Direction::Import));
 
         // An unparseable code fails at the boundary, not later.
         assert!("not an obis code".parse::<ObisCode>().is_err());

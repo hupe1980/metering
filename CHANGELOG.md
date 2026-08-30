@@ -4,6 +4,226 @@ All notable changes to `metering` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the crate follows
 semver, with the `serde` representation explicitly in scope (see the crate docs).
 
+## [0.21.0] — 2026-08-30
+
+A round of consumer feedback from a workspace that allocates the
+Netzgangzeitreihe of a charging Übergabestelle to sessions and fixed devices,
+and then builds MaBiS BK-Summenzeitreihen from the result. Six requests; five
+implemented, one already in the crate under another name.
+
+The theme is **conservation**. Two operations sit either side of the settlement
+grid — a total spread across slots, and a slot split across claims — and both
+had to be arranged so that `Σ = the thing that was divided` is a theorem rather
+than a check. Doing that properly meant giving the crate a single allocation
+primitive and a single grid, instead of one per caller.
+
+Every removal is a hard cut; no deprecated shims.
+
+### Added
+
+- **`session` — a charging session or device log placed on the metering grid.**
+  `split_session(from, to, energy, &samples, &config)` returns one
+  `MeterInterval` per grid slot, contiguous and ascending, summing to the
+  session total **exactly**.
+
+  Clock-aligned register readings (OCPP `MeterValues` on the
+  `ClockAlignedDataInterval`) are used where they land on slot boundaries and
+  the resulting slots come back `Measured`; spans that straddle a boundary are
+  divided by wall-clock time and come back `Estimated`. That distinction is the
+  point of the function: a supplier settling the energy needs to know which
+  quarter-hours were measured and which were inferred from a constant-power
+  assumption the session did not obey.
+
+  The total cannot drift because the slots are **differences of a cumulative**,
+  not a sum with a correction on the last one — so the series telescopes to
+  `cum(end) − cum(start)`, whatever rounding the cumulative itself needed.
+  Truncation toward zero preserves the order of a non-decreasing function, so no
+  slot can come back negative. A register running backwards, a sample outside
+  the span and a total the samples contradict are errors, not something absorbed
+  into the nearest slot.
+
+- **`allocation` — one pool across many claims, with the residual reported.**
+  `allocate(total, parts, basis)` guarantees `Σ allocated + residual = total`,
+  exactly, for every key. `AllocationBasis::Fraction` reads a weight as an
+  absolute share (the § 42b constant key); `Proportional` normalises it (the
+  § 42b proportional key, and anything else with a ratio). An
+  `AllocationPart::capacity` is the `Pos()` ceiling of the BDEW Anwendungshilfe.
+
+  Nothing redistributes the residual — no largest-remainder pass. Under § 42b it
+  is the generation that fed the public grid, and turning it into a rounding
+  correction on somebody's invoice would credit them energy they did not
+  receive.
+
+  `validate_key` runs the same checks without dividing anything, so a persisted
+  allocation rule can be rejected when it is *stored* rather than a month later
+  in a settlement run.
+
+- **`ids::Eic` and `ids::EicType`** — the sixteen-character ENTSO-E Energy
+  Identification Code, with its **check character enforced at the parse**.
+  Unlike the BDEW-Codenummer, whose Bildungsvorschrift exempts GS1-issued GLNs,
+  the EIC scheme has no carve-out, so a mistyped code is rejected where the
+  message that carried it is still available to report.
+
+  Verified against the two worked examples in the ENTSO-E *EIC Reference
+  Manual* §5.1 (`10X168Y4E6H0041Z`, `10X---ENTSOE---L`), the four German
+  Regelzonen and the German bidding zone. `issuing_office()` is a `&str` and
+  `object_type()` an `Option<EicType>`: the LIO list and the type list are
+  ENTSO-E's to extend, and a library that hard-fails on an entry added after its
+  release rejects data the market has already issued.
+
+- **`Direction`, `MeterInterval::direction()` and `ObisCode::direction()`** —
+  the flow direction as one value instead of two booleans that can both be
+  `false`. `None` covers both "no OBIS code" and "this register has no
+  direction" (Blindarbeit, a gas volume, a Zustandszahl).
+
+- **`aggregation::sum_by_direction` → `DirectionalEnergy`** — the conservation
+  check for a bidirectional Zählpunkt: `NGZ_import − Σ alloc_import` is a
+  subtraction. Three buckets, so an undirected interval is counted rather than
+  dropped, and `net()` is `import − export`. It counts **every** interval,
+  billable or not, because it answers a physical question where `aggregate`
+  answers *"can this period be invoiced"*.
+
+- **`MeasurementSource::ChargeDetailRecord` / `ClockAlignedMeterValue` /
+  `DeviceLog`** — provenance for session-derived energy, so a series built from
+  a CDR is never mistaken for one that came from the MSB.
+
+- **`DayBoundary::bilanzierungsmonat(year, month)`** — the settlement month
+  addressed the way the market addresses it (*"Juni 2021"*), as a half-open UTC
+  range, on either boundary. EDI@Energy *Allgemeine Festlegungen* v6.1c Kap. 3.1
+  is quoted on the type and defines both. With it, `day_range_utc`,
+  `month_range_utc` and `year_range_utc` for a period identified by a date.
+
+- **`DayBoundary::bucket_bounds(instant, resolution)`** — *"which slot of this
+  resolution contains this instant"*, now public and now the **only**
+  implementation of that question. `resample` and `split_session` share it; a
+  second copy would drift and the two would then disagree about which slot a kWh
+  belongs to.
+
+- **`session::merge_sessions`** — add several series that share a grid, slot by
+  slot, with **union** semantics. `compute_virtual_meter`'s `Sum` intersects,
+  because a missing source there means the total would be wrong; a charge point
+  that was idle contributes no intervals and that absence *is* zero. It is a
+  separate function rather than a flag because choosing the wrong one silently
+  produces a plausible number. Grouped by `(from, to, obis_code)`, so a
+  bidirectional point's two registers do not collapse into one total; only
+  touched slots appear, because inventing zeros is `fill_gaps`, which records
+  what it invented.
+
+- **`ids::Regelzone`** — the four German Regelzonen, with the letter each
+  occupies position 4 of a Bilanzierungsgebiet EIC with, and the ENTSO-E
+  control-area code for each. **`Eic::regelzone()`** reads it back off a code.
+
+  BDEW *Anwendungshilfe Energy Identification Codes* v1.0 (18.12.2017) §2.2.2
+  gives Bilanzierungsgebiete their own Bildungsvorschrift — a `Y` code in the
+  EIC function *Metering Grid Area* whose position 4 identifies the Regelzone
+  (`N` TenneT, `R` Amprion, `V` 50Hertz, `W` TransnetBW). An EIC function is
+  registry metadata and is not encoded in the code, so a `Y` code cannot in
+  general be told apart from a Bilanzkreis's — but this one can, because the
+  same section's Praxishinweis says the Energie Codes und Services GmbH
+  *excludes* those four letters at position 4 for every other `Y` function.
+  §2.2.1 also pins `11` as the German LIO, which is now `Eic::GERMAN_LIO` and
+  `Eic::is_german()`.
+
+- **`MeasurementPoint::bilanzkreis` and `::bilanzierungsgebiet`**, both
+  `Option<Eic>`, so a MaBiS Summenzeitreihe groups on a check-character-
+  validated value instead of free text. `EicType` is deliberately not
+  constrained on either: a Bilanzkreisverantwortlicher gets a `Y` code in the
+  EIC function *Balance Group*, older Bilanzkreise carry an `X` code, and the
+  ENTSO-E manual explicitly keeps that national usage valid for Germany.
+
+- **`EnergyFlow::direction()`**, **`MeasurementPoint::direction()`** and
+  **`MeasurementPoint::direction_conflict()`**.
+
+### Changed — breaking
+
+- **`ALLOCATION_DP` and `allocation_share` moved to the new `allocation`
+  module** and are re-exported at the crate root as before.
+  `compute_community_allocation` is now `allocate` applied once per
+  quarter-hour, and `compute_ggv_allocation` shares the same cut and cap, so the
+  `Pos()` operator and the residual are defined in exactly one place.
+- **`VirtualMeterError::InvalidFractions` → `VirtualMeterError::Allocation`**,
+  wrapping `AllocationError`. What counts as a valid key is now defined once, by
+  the module that applies it.
+- **`CommunityInterval::surplus_to_grid` is `total − Σ allocated`, unclamped.**
+  It was clamped at zero, which could only ever hide a contradiction: with a
+  non-negative generation the clamp never fired, and with a negative one it
+  broke the identity the field exists to satisfy.
+- **A negative `Proportional` weight is refused.** It does not merely take
+  nothing — it shrinks the denominator and so **inflates** every other part's
+  share. A silent over-allocation is precisely what this arithmetic exists to
+  make impossible.
+- **`MeterInterval::is_import_energy` / `is_export_energy` removed** in favour
+  of `direction()`. Two booleans that can both be `false` cannot distinguish
+  "this register has no direction" from "it counts the other way", and callers
+  read the first as the second.
+- **`MeasurementPoint::is_bezug` / `is_einspeisung` removed**, likewise, in
+  favour of `direction()`. A gas volume at a `Bidirectional` point made both
+  `false`, which said nothing.
+- **`ObisCode::is_einspeisung` removed** — a second name for `is_export`, which
+  is the duplication this crate deleted `SharingReadiness::label()` for.
+  `ObisCode::direction()` is now the primitive and `is_import` / `is_export`
+  are derived from it, so there is one implementation of value group C rather
+  than three.
+
+### Fixed
+
+- **`split_session` scanned the whole segment list for every slot.** The
+  cumulative lookup and the per-slot quality check were both `O(slots ×
+  segments)`, so a day-long device log sampled every minute did ~138 000
+  comparisons for an answer that needs ~1 500. Segments and slots both run
+  forward, so one cursor now walks the segment list once across the whole
+  session. Found by writing the case down, not by a benchmark; the dense-log
+  test pins the result.
+- **`MeasurementPoint` resolved a direction contradiction in silence.** The
+  point states direction twice — as a directed OBIS code and as declared
+  `EnergyFlow` — and the old predicates simply preferred the code. That
+  redundancy cannot be removed, because `EnergyFlow` also distinguishes storage
+  from load and marks a four-quadrant meter as `Bidirectional`, neither of which
+  any OBIS code says. So the disagreement is now **reportable**:
+  `direction_conflict()` returns `Some((measured, declared))`.
+- **`SessionError::SampleTotalMismatch`'s message** described only one of the
+  two situations it covers. It now states both numbers and says the two
+  disagree, which is true whichever way round they are.
+
+### Not added, and why
+
+- **A `Zaehlpunktbezeichnung` type.** It exists: `MeloId` **is** the
+  33-character Zählpunktbezeichnung of VDE-AR-N 4400 / DVGW G 2000. A
+  Messlokation is identified by its Zählpunkt; the two names describe the same
+  characters, and giving them two types would produce two columns holding one
+  identifier. The module docs now say so in as many words.
+- **A `direction` field on `MeterInterval`, or a `BidirectionalInterval`.** The
+  direction is already in value group C of the OBIS code, and MSCONS carries one
+  time series per register. A field would be a second, separately-mutable copy
+  of a fact the type already holds — the same objection that keeps the *unit*
+  off it — and it would grow the hottest type in the crate. `direction()` reads
+  it; `sum_by_direction` balances it.
+- **Signed intervals.** A negative kWh here means a Korrekturenergiemenge
+  (EDI@Energy *Codeliste* v2.5c §2.1). Overloading the sign to mean "reversed
+  flow" would make those two indistinguishable, and no amount of documentation
+  fixes an ambiguity in the data itself.
+
+### Tests
+
+- `tests/quantity_invariants.rs` gains the two conservation laws (a session
+  split conserves its total and tiles its span; an allocation conserves its
+  pool), the directional partition, and the **exactness claim tested directly**:
+  a slot that comes back `Measured` carries exactly the difference of the
+  register readings on its own boundaries.
+- `tests/order_independence.rs` gains `allocate`, `split_session`,
+  `merge_sessions` and `sum_by_direction` — the four new entry points that
+  promise it.
+- The merge proptest found a documentation gap rather than a defect: two
+  sessions with an idle hour between them leave that hour out, and the docs now
+  say so and point at `fill_gaps`.
+- `tests/string_canonicalisation.rs` gains the EIC: round-trip, injectivity,
+  case normalisation, and that **every** single-character corruption of the body
+  is caught (the weight is in 2..=16 and 37 is prime, so the shift is never a
+  multiple of the modulus).
+- `tests/code_contract.rs` gains `Direction`, `AllocationBasis` and `EicType`;
+  `tests/serde_representation.rs` pins their tags and the new
+  `MeasurementSource` shapes.
+
 ## [0.20.0] — 2026-08-30
 
 Order independence, which the crate documents in five places, turned out to be

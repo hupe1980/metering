@@ -332,8 +332,9 @@ mod tests {
         );
     }
 
-    /// The bug the old `.max(ZERO)` hid: a register that wrapped during the
-    /// period billed **zero** for the whole pre-exchange span.
+    /// A register that wraps during the period is reconstructed, not clamped:
+    /// flooring the difference at zero would bill nothing at all for the whole
+    /// pre-exchange span.
     #[test]
     fn a_wrapped_old_register_is_reconstructed_not_zeroed() {
         use crate::reading::AnomalyKind;

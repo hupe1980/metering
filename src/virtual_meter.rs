@@ -42,10 +42,13 @@
 use std::collections::{HashMap, HashSet};
 use std::hash::BuildHasher;
 
-use rust_decimal::{Decimal, RoundingStrategy};
+use rust_decimal::Decimal;
 use time::OffsetDateTime;
 
 use crate::aggregation_rule::{AggregationRule, VirtualMeterKind};
+use crate::allocation::{
+    AllocationBasis, AllocationError, AllocationPart, allocate, allocation_share, validate_key,
+};
 use crate::interval::{MeterInterval, QualityFlag};
 
 /// Source series keyed by MaLo / MeLo ID.
@@ -72,18 +75,15 @@ pub enum VirtualMeterError {
     #[error("missing source MaLo: {0}")]
     MissingSource(String),
 
-    /// An allocation fraction is out of range — each must be positive and
-    /// they must sum to at most 1.
+    /// The allocation key itself is unusable — see [`AllocationError`].
     ///
-    /// [`compute_ggv_allocation`] knows only the one tenant's fraction, so
-    /// `sum` there is that single value; only
-    /// [`compute_community_allocation`], which sees the whole participant set,
-    /// can report a genuine sum.
-    #[error("allocation fractions total {sum} — each must be positive and the total at most 1")]
-    InvalidFractions {
-        /// The offending fraction, or the sum across the community.
-        sum: Decimal,
-    },
+    /// Carried rather than restated, so what counts as a valid key is defined
+    /// in exactly one place. [`compute_ggv_allocation`] knows only the one
+    /// tenant's fraction, so an `InvalidFractions` sum there is that single
+    /// value; only [`compute_community_allocation`], which sees the whole
+    /// participant set, can report a genuine sum.
+    #[error(transparent)]
+    Allocation(#[from] AllocationError),
 
     /// [`compute_ggv_allocation`] was given a rule that allocates nothing.
     #[error("{kind} is not a GGV allocation rule — it has no allocated amount")]
@@ -107,7 +107,7 @@ pub enum VirtualMeterError {
 /// # Errors
 ///
 /// - [`VirtualMeterError::MissingSource`] when a required MaLo is absent.
-/// - [`VirtualMeterError::InvalidFractions`] for invalid GGV fractions.
+/// - [`VirtualMeterError::Allocation`] for an unusable allocation key.
 pub fn compute_virtual_meter<S: BuildHasher>(
     rule: &AggregationRule,
     sources: &SourceMap<S>,
@@ -271,7 +271,7 @@ fn compute_net_grid<S: BuildHasher>(
 /// subtracting the net from a re-projected consumption series.
 ///
 /// `consumption == allocated + net_grid_draw` holds in every interval,
-/// exactly — because [`share`](Self::share) is cut to [`ALLOCATION_DP`] first.
+/// exactly — because [`share`](Self::share) is cut to [`ALLOCATION_DP`](crate::ALLOCATION_DP) first.
 /// An uncut proportional share is a quotient with more significant digits than
 /// the subtraction that follows can hold, and the identity would miss by a few
 /// 1e-27 kWh.
@@ -293,7 +293,7 @@ pub struct GgvInterval {
 
     /// The tenant's share of that generation **before** the `Pos()` cap:
     /// `fraction × generation`, or `ratio × generation`, cut to
-    /// [`ALLOCATION_DP`] places toward zero.
+    /// [`ALLOCATION_DP`](crate::ALLOCATION_DP) places toward zero.
     pub share: Decimal,
     /// The share actually credited: `min(consumption, share)`.
     pub allocated: Decimal,
@@ -353,8 +353,8 @@ impl GgvInterval {
 ///
 /// [`NotAGgvRule`](VirtualMeterError::NotAGgvRule) for a rule that allocates
 /// nothing, [`MissingSource`](VirtualMeterError::MissingSource) for an absent
-/// series, [`InvalidFractions`](VirtualMeterError::InvalidFractions) for a
-/// constant fraction outside `(0, 1]`.
+/// series, [`Allocation`](VirtualMeterError::Allocation) for a constant
+/// fraction outside `(0, 1]`.
 ///
 /// # Example
 ///
@@ -412,50 +412,24 @@ pub fn compute_ggv_allocation<S: BuildHasher>(
     }
 }
 
-/// Decimal places an allocated **share** is cut to before the `Pos()` cap.
-///
-/// The proportional key divides — `consumption ÷ Σ consumption × generation` —
-/// and a `Decimal` quotient carries up to 28 significant digits. Two things go
-/// wrong if that reaches the output. It is not a *quantity*: no invoice, no
-/// MSCONS field and no settlement system has a place for 0.333…3 kWh to
-/// twenty-seven places. And it breaks the identity this module documents,
-/// because `consumption − allocated` then needs more significant digits than a
-/// `Decimal` has and rounds.
-///
-/// Six places is a millionth of a kWh: four orders of magnitude finer than
-/// anything the market settles, and coarse enough that every derived value is
-/// a number someone can write down.
-///
-/// The cut is **toward zero**, which is not a stylistic choice. Truncating can
-/// only lower a share, so `Σ allocated ≤ Σ share ≤ generation` survives it and
-/// the § 42b Abs. 5 ceiling stays a theorem rather than becoming a clamp.
-pub const ALLOCATION_DP: u32 = 6;
-
-/// A raw share, cut to [`ALLOCATION_DP`] places toward zero.
-///
-/// Applied where the share is *formed*, not where it is capped, so the value
-/// reported as [`GgvInterval::share`] is the one the cap was taken against —
-/// which is what `capped()`, comparing the two, depends on.
-fn allocation_share(raw: Decimal) -> Decimal {
-    raw.round_dp_with_strategy(ALLOCATION_DP, RoundingStrategy::ToZero)
-}
+// ── GGV constant allocation (§42b EnWG Beispiel 1, CCI+ZG6) ──────────────────
 
 /// `allocated = min(consumption, share)`, and the net that follows.
 ///
-/// One place, so the `Pos()` cap of § 42b Abs. 5 / UTILTS Z83 is applied once
-/// and both entry points read the same arithmetic. `share` is expected to have
-/// been through [`allocation_share`] already.
+/// The `Pos()` cap of § 42b Abs. 5 / UTILTS Z83 is
+/// [`allocation::cap`](crate::allocation), shared with
+/// [`allocate`], so the single-tenant path here and the whole-community path
+/// below cannot drift apart. `share` is expected to have been through
+/// [`allocation_share`] already.
 ///
 /// The consumption is the caller's measurement and passes through untouched,
 /// so a participant whose whole draw is covered is credited exactly what they
 /// drew and nets exactly zero, however many decimal places their meter
 /// delivered.
 fn ggv_split(consumption: Decimal, share: Decimal) -> (Decimal, Decimal) {
-    let allocated = consumption.min(share).max(Decimal::ZERO);
+    let allocated = crate::allocation::cap(share, Some(consumption));
     (allocated, consumption - allocated)
 }
-
-// ── GGV constant allocation (§42b EnWG Beispiel 1, CCI+ZG6) ──────────────────
 
 /// Constant-fraction GGV allocation — BDEW Anwendungshilfe Beispiel 1,
 /// UTILTS `CCI+ZG6` with `CAV+Z28`.
@@ -472,9 +446,13 @@ fn ggv_constant<S: BuildHasher>(
     sources: &SourceMap<S>,
 ) -> Result<Vec<GgvInterval>, VirtualMeterError> {
     require(sources, [plant_id, tenant_id])?;
-    if fraction <= Decimal::ZERO || fraction > Decimal::ONE {
-        return Err(VirtualMeterError::InvalidFractions { sum: fraction });
-    }
+    // One tenant is still a key, and it is checked by the same function an
+    // over-subscribed community is — up front, before any interval is touched,
+    // so a bad fraction is an error rather than an empty result.
+    validate_key(
+        &[AllocationPart::new(tenant_id, fraction)],
+        AllocationBasis::Fraction,
+    )?;
 
     let index = SourceIndex::build(sources);
     let aligned = aligned_timestamps([plant_id, tenant_id].iter().copied(), sources);
@@ -641,7 +619,7 @@ pub struct ParticipantAllocation {
     /// What they consumed.
     pub consumption: Decimal,
     /// Their nominal share of the generation, before the `Pos()` cap, cut to
-    /// [`ALLOCATION_DP`] places toward zero.
+    /// [`ALLOCATION_DP`](crate::ALLOCATION_DP) places toward zero.
     pub share: Decimal,
     /// What was actually credited: `min(consumption, share)`.
     pub allocated: Decimal,
@@ -741,8 +719,8 @@ impl CommunityInterval {
 /// # Errors
 ///
 /// - [`MissingSource`](VirtualMeterError::MissingSource) for an absent series.
-/// - [`InvalidFractions`](VirtualMeterError::InvalidFractions) when the
-///   constant fractions are not all positive, or sum above 1.
+/// - [`Allocation`](VirtualMeterError::Allocation) when the constant
+///   fractions are not all positive, or sum above 1.
 ///
 /// ```rust
 /// use metering::{AllocationKey, MeterInterval, QualityFlag, compute_community_allocation};
@@ -788,11 +766,15 @@ pub fn compute_community_allocation<S: BuildHasher>(
     require(sources, std::iter::once(plant_id))?;
     require(sources, ids.iter().copied())?;
 
+    // A constant key is fully known before any interval is read, so it is
+    // checked once, here, rather than on whichever quarter-hour happens to be
+    // first — and by the same function that checks it inside `allocate`.
     if let AllocationKey::Constant { fractions } = key {
-        let sum: Decimal = fractions.values().copied().sum();
-        if fractions.values().any(|f| *f <= Decimal::ZERO) || sum > Decimal::ONE {
-            return Err(VirtualMeterError::InvalidFractions { sum });
-        }
+        let parts: Vec<AllocationPart> = fractions
+            .iter()
+            .map(|(id, fraction)| AllocationPart::new(id.clone(), *fraction))
+            .collect();
+        validate_key(&parts, AllocationBasis::Fraction)?;
     }
 
     let index = SourceIndex::build(sources);
@@ -819,33 +801,46 @@ pub fn compute_community_allocation<S: BuildHasher>(
         let total_consumption: Decimal = consumption.iter().map(|(_, iv)| iv.value).sum();
         let generation = plant_iv.value;
 
-        let participants: Vec<ParticipantAllocation> = consumption
-            .iter()
-            .map(|(id, iv)| {
-                let share = allocation_share(match key {
-                    AllocationKey::Constant { fractions } => {
-                        fractions.get(*id).copied().unwrap_or(Decimal::ZERO) * generation
-                    }
-                    AllocationKey::Proportional { .. } => {
-                        if total_consumption > Decimal::ZERO {
-                            iv.value / total_consumption * generation
-                        } else {
-                            Decimal::ZERO
-                        }
-                    }
-                });
-                let (allocated, net_grid_draw) = ggv_split(iv.value, share);
-                ParticipantAllocation {
-                    id: (*id).to_owned(),
-                    consumption: iv.value,
-                    share,
-                    allocated,
-                    net_grid_draw,
-                }
+        // The whole quarter-hour is one `allocate` call: the generation is the
+        // pool, each participant's own draw is the ceiling the `Pos()` cap
+        // reads, and the key decides only how a weight becomes a share.
+        let (basis, parts) = match key {
+            AllocationKey::Constant { fractions } => (
+                AllocationBasis::Fraction,
+                consumption
+                    .iter()
+                    .map(|(id, iv)| {
+                        AllocationPart::new(
+                            *id,
+                            fractions.get(*id).copied().unwrap_or(Decimal::ZERO),
+                        )
+                        .capped_at(iv.value)
+                    })
+                    .collect(),
+            ),
+            AllocationKey::Proportional { .. } => (
+                AllocationBasis::Proportional,
+                consumption
+                    .iter()
+                    .map(|(id, iv)| AllocationPart::new(*id, iv.value).capped_at(iv.value))
+                    .collect(),
+            ),
+        };
+        let row = allocate(generation, parts, basis)?;
+
+        let participants: Vec<ParticipantAllocation> = row
+            .parts
+            .into_iter()
+            .zip(consumption.iter())
+            .map(|(part, (_, iv))| ParticipantAllocation {
+                id: part.key,
+                consumption: iv.value,
+                share: part.share,
+                allocated: part.allocated,
+                net_grid_draw: iv.value - part.allocated,
             })
             .collect();
 
-        let allocated: Decimal = participants.iter().map(|p| p.allocated).sum();
         let quality = consumption
             .iter()
             .fold(plant_iv.quality, |q, (_, iv)| q.worse_of(iv.quality));
@@ -857,7 +852,7 @@ pub fn compute_community_allocation<S: BuildHasher>(
             total_consumption,
             pool_cap: generation.min(total_consumption),
             participants,
-            surplus_to_grid: (generation - allocated).max(Decimal::ZERO),
+            surplus_to_grid: row.residual,
             quality,
         });
     }
@@ -1173,7 +1168,9 @@ mod tests {
         };
         assert!(matches!(
             compute_virtual_meter(&rule, &map),
-            Err(VirtualMeterError::InvalidFractions { .. })
+            Err(VirtualMeterError::Allocation(
+                AllocationError::InvalidFractions { .. }
+            ))
         ));
     }
 
@@ -1583,7 +1580,9 @@ mod ggv_allocation_tests {
         for bad in [dec!(0), dec!(-0.1), dec!(1.5)] {
             assert!(matches!(
                 compute_ggv_allocation(&constant(bad), &src),
-                Err(VirtualMeterError::InvalidFractions { .. })
+                Err(VirtualMeterError::Allocation(
+                    AllocationError::InvalidFractions { .. }
+                ))
             ));
         }
         assert!(compute_ggv_allocation(&constant(dec!(1)), &src).is_ok());
@@ -1721,7 +1720,9 @@ mod community_tests {
         let over = compute_community_allocation("PLANT", &constant(dec!(0.7), dec!(0.5)), &sources);
         assert_eq!(
             over,
-            Err(VirtualMeterError::InvalidFractions { sum: dec!(1.2) }),
+            Err(VirtualMeterError::Allocation(
+                AllocationError::InvalidFractions { sum: dec!(1.2) }
+            )),
         );
 
         // Zero and negative shares are not shares.
@@ -1847,7 +1848,11 @@ mod allocation_precision_tests {
                 p.net_grid_draw,
             );
             // The share is a quantity somebody could write on an invoice.
-            assert!(p.share.scale() <= ALLOCATION_DP, "share {} is not", p.share);
+            assert!(
+                p.share.scale() <= crate::allocation::ALLOCATION_DP,
+                "share {} is not",
+                p.share
+            );
             assert_eq!(p.share, dec!(3.333333), "10 ÷ 3, cut toward zero");
         }
         assert_eq!(iv.total_consumption, dec!(120));

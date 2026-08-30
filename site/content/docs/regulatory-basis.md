@@ -1,7 +1,7 @@
 +++
 title = "Regulatory basis"
 description = "Every provision this library implements, quoted from the published text and dated — including the ones it deliberately does not claim."
-weight = 12
+weight = 13
 +++
 
 Every citation below is checked against the current published text — most

@@ -126,6 +126,33 @@ fn measurement_source_shape_is_stable() {
         json(&redispatch),
         r#"{"REDISPATCH_IMPORT":{"pid":13022,"activation_ref":null}}"#
     );
+
+    let cdr = MeasurementSource::ChargeDetailRecord {
+        cdr_id: "CDR-42".to_owned(),
+        evse_id: Some("DE*ABC*E1234*1".to_owned()),
+    };
+    assert_eq!(
+        json(&cdr),
+        r#"{"CHARGE_DETAIL_RECORD":{"cdr_id":"CDR-42","evse_id":"DE*ABC*E1234*1"}}"#
+    );
+
+    let clock = MeasurementSource::ClockAlignedMeterValue {
+        transaction_id: "tx-7".to_owned(),
+        evse_id: None,
+    };
+    assert_eq!(
+        json(&clock),
+        r#"{"CLOCK_ALIGNED_METER_VALUE":{"transaction_id":"tx-7","evse_id":null}}"#
+    );
+
+    let log = MeasurementSource::DeviceLog {
+        device_id: "wp-1".to_owned(),
+        register: Some("1.8.0".to_owned()),
+    };
+    assert_eq!(
+        json(&log),
+        r#"{"DEVICE_LOG":{"device_id":"wp-1","register":"1.8.0"}}"#
+    );
 }
 
 /// An OBIS code travels as its canonical string, not as six separate numbers —
@@ -605,6 +632,123 @@ fn tags_added_in_0_20_are_pinned() {
     assert_eq!(json(&Quarter::Q1), r#""Q1""#);
     assert_eq!(json(&Phase::L1), r#""L1""#);
     assert_eq!(json(&CodeVergabestelle::Gs1OrOther), r#""GS1_OR_OTHER""#);
+}
+
+/// The tags and shapes introduced in 0.21: the flow direction, the allocation
+/// basis, the EIC object type, and the register sample a session is split on.
+///
+/// Each of these is a value a consumer stores — a directional balance, a
+/// persisted allocation key, a typed Bilanzkreis code, a charge-point reading
+/// kept for audit — so their tags are covered by semver from here.
+#[test]
+fn tags_added_in_0_21_are_pinned() {
+    use metering::allocation::AllocationBasis;
+    use metering::ids::EicType;
+    use metering::{Direction, MeterSample};
+
+    for v in Direction::ALL {
+        assert_eq!(json(&v), format!("\"{}\"", v.as_str()), "{v:?}");
+    }
+    for v in AllocationBasis::ALL {
+        assert_eq!(json(&v), format!("\"{}\"", v.as_str()), "{v:?}");
+    }
+    // The EIC object type's code *is* its letter — the market writes `10Y…`,
+    // never `10AREA…`, so a second spelling would be the one this crate
+    // refuses everywhere else.
+    for v in EicType::ALL {
+        assert_eq!(json(&v), format!("\"{}\"", v.as_str()), "{v:?}");
+    }
+    assert_eq!(json(&EicType::Area), r#""Y""#);
+    assert_eq!(json(&Direction::Import), r#""IMPORT""#);
+    assert_eq!(json(&AllocationBasis::Proportional), r#""PROPORTIONAL""#);
+
+    let sample = MeterSample::new(datetime!(2026-06-01 12:15 UTC), dec!(1006.5));
+    assert_eq!(
+        json(&sample),
+        r#"{"at":"2026-06-01T12:15:00Z","reading":"1006.5"}"#
+    );
+
+    let row = metering::allocate(
+        dec!(10),
+        vec![metering::AllocationPart::new("T1", dec!(1)).capped_at(dec!(2))],
+        AllocationBasis::Proportional,
+    )
+    .unwrap();
+    assert_eq!(
+        json(&row),
+        r#"{"total":"10","parts":[{"key":"T1","weight":"1","share":"10","allocated":"2"}],"residual":"8"}"#
+    );
+}
+
+/// A measurement point, field by field — it is master data a consumer stores,
+/// so the field names are a wire format.
+#[test]
+fn measurement_point_field_names_are_stable() {
+    use metering::{EnergyFlow, MarktRolle, MeasurementPoint, Sparte};
+    use rust_decimal::Decimal;
+    use time::macros::date;
+
+    let mp = MeasurementPoint {
+        malo_id: "51238696781".parse().unwrap(),
+        melo_id: None,
+        meter_serial: None,
+        obis_code: ObisCode::STROM_BEZUG_TOTAL,
+        sparte: Sparte::Strom,
+        energy_flow: EnergyFlow::Consumption,
+        accountable_role: MarktRolle::Lf,
+        accountable_mp_id: "9900987654321".parse().unwrap(),
+        bilanzkreis: Some("11XSAP-AMPRION-B".parse().unwrap()),
+        bilanzierungsgebiet: Some("11YR-AMPRION-BG9".parse().unwrap()),
+        is_virtual: false,
+        wandler_factor: Decimal::ONE,
+        valid_from: date!(2026 - 01 - 01),
+        valid_to: None,
+    };
+
+    let value: serde_json::Value = serde_json::from_str(&json(&mp)).unwrap();
+    assert_eq!(value["malo_id"], "51238696781");
+    assert_eq!(value["obis_code"], "1-0:1.8.0");
+    assert_eq!(value["energy_flow"], "CONSUMPTION");
+    assert_eq!(value["bilanzkreis"], "11XSAP-AMPRION-B");
+    assert_eq!(value["bilanzierungsgebiet"], "11YR-AMPRION-BG9");
+    assert_eq!(value["valid_from"], "2026-01-01");
+
+    let back: MeasurementPoint = serde_json::from_str(&json(&mp)).unwrap();
+    assert_eq!(back, mp);
+}
+
+/// The four Regelzonen, and the control-area codes they carry.
+#[test]
+fn regelzone_tags_are_pinned() {
+    use metering::Regelzone;
+
+    for v in Regelzone::ALL {
+        assert_eq!(json(&v), format!("\"{}\"", v.as_str()), "{v:?}");
+    }
+    // `SCREAMING_SNAKE_CASE` would write TENNE_T; the operator's own spelling
+    // has an inner capital and the code must not inherit it.
+    assert_eq!(json(&Regelzone::TenneT), r#""TENNET""#);
+    assert_eq!(json(&Regelzone::FiftyHertz), r#""FIFTY_HERTZ""#);
+    assert_eq!(
+        json(&Regelzone::TransnetBw.control_area_eic()),
+        r#""10YDE-ENBW-----N""#
+    );
+}
+
+/// An EIC travels as its sixteen characters, like every other identifier here
+/// — and the check character is enforced on the way back in.
+#[test]
+fn an_eic_is_a_string_on_the_wire() {
+    use metering::Eic;
+
+    let eic: Eic = "10YDE-VE-------2".parse().unwrap();
+    assert_eq!(json(&eic), r#""10YDE-VE-------2""#);
+    assert_eq!(json(&eic), format!("\"{eic}\""), "serde is Display");
+
+    let back: Eic = serde_json::from_str(r#""10YDE-VE-------2""#).expect("reads back");
+    assert_eq!(back, eic);
+
+    assert!(serde_json::from_str::<Eic>(r#""10YDE-VE-------3""#).is_err());
 }
 
 /// A Marktpartner-ID travels as its digits, like every other identifier here.

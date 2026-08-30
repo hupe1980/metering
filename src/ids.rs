@@ -1,4 +1,4 @@
-//! Typed market identifiers — [`MaloId`] and [`MeloId`].
+//! Typed market identifiers — [`MaloId`], [`MeloId`], [`BdewCode`] and [`Eic`].
 //!
 //! ## Why these are types and not strings
 //!
@@ -65,6 +65,18 @@
 //! Netzbetreiber. There is **no check digit**, so [`MeloId`] validates the
 //! structure — length, charset and the numeric prefix groups — and nothing
 //! more.
+//!
+//! The MeLo-ID **is** the Zählpunktbezeichnung. There is no separate type for
+//! one: a Messlokation is identified by its Zählpunkt, the two names describe
+//! the same thirty-three characters, and giving them two types would produce
+//! two columns holding one identifier.
+//!
+//! ## EIC (Energy Identification Code)
+//!
+//! [`Eic`] is the sixteen-character ENTSO-E identifier — the one a Bilanzkreis,
+//! a Bilanzierungsgebiet, a Regelzone and a Metering Grid Area are addressed
+//! by. It carries a check character, and unlike the BDEW-Codenummer the scheme
+//! has no exception to it, so [`Eic`] enforces it at the parse.
 //!
 //! ## What deliberately stays a plain string
 //!
@@ -562,11 +574,503 @@ impl From<MeloId> for String {
     }
 }
 
+// ── Eic ───────────────────────────────────────────────────────────────────────
+
+/// What an [`Eic`] identifies, read off its third character.
+///
+/// The closed list of ENTSO-E *EIC Reference Manual* §4.2. The code **is** the
+/// letter, because that is the letter the market writes and reads: an EIC is
+/// quoted as `10YDE-VE-------2`, and calling the `Y` `AREA` in one place and
+/// `Y` in another would be the second spelling this crate refuses everywhere
+/// else. [`name`](Self::name) carries the description.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum EicType {
+    /// `X` — a **party**: a market participant, TSO, supplier, trader,
+    /// Bilanzkreisverantwortlicher. German Bilanzkreise carry a type `X` code,
+    /// which the manual calls out as a national usage that remains valid.
+    #[cfg_attr(feature = "serde", serde(rename = "X"))]
+    Party,
+    /// `Y` — an **area or domain**: a bidding zone, a control area, a
+    /// Bilanzierungsgebiet, a Metering Grid Area.
+    #[cfg_attr(feature = "serde", serde(rename = "Y"))]
+    Area,
+    /// `Z` — a **measurement point**.
+    #[cfg_attr(feature = "serde", serde(rename = "Z"))]
+    MeasurementPoint,
+    /// `W` — a **resource object**: a generation, consumption or storage unit.
+    /// Passive grid elements are type `T`.
+    #[cfg_attr(feature = "serde", serde(rename = "W"))]
+    ResourceObject,
+    /// `T` — a **tie line** or other connecting object: interconnectors,
+    /// lines, busbar couplers, transformers.
+    #[cfg_attr(feature = "serde", serde(rename = "T"))]
+    TieLine,
+    /// `V` — a **location**, physical or logical, or an IT system.
+    #[cfg_attr(feature = "serde", serde(rename = "V"))]
+    Location,
+    /// `A` — a **substation** or topological node.
+    #[cfg_attr(feature = "serde", serde(rename = "A"))]
+    Substation,
+}
+
+impl EicType {
+    /// Every variant, in declaration order.
+    pub const ALL: [Self; 7] = [
+        Self::Party,
+        Self::Area,
+        Self::MeasurementPoint,
+        Self::ResourceObject,
+        Self::TieLine,
+        Self::Location,
+        Self::Substation,
+    ];
+
+    /// The EIC object-type letter. Matches the `serde` tag and
+    /// [`FromStr`] input.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Party => "X",
+            Self::Area => "Y",
+            Self::MeasurementPoint => "Z",
+            Self::ResourceObject => "W",
+            Self::TieLine => "T",
+            Self::Location => "V",
+            Self::Substation => "A",
+        }
+    }
+
+    /// The manual's own description of the type.
+    ///
+    /// A description, not a code — see [`as_str`](Self::as_str).
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Party => "Party",
+            Self::Area => "Area or Domain",
+            Self::MeasurementPoint => "Measurement point",
+            Self::ResourceObject => "Resource object",
+            Self::TieLine => "Tie-line",
+            Self::Location => "Location",
+            Self::Substation => "Substation",
+        }
+    }
+
+    /// The type a letter names, or `None` for a letter the manual does not
+    /// list.
+    #[must_use]
+    pub const fn from_letter(letter: u8) -> Option<Self> {
+        match letter {
+            b'X' => Some(Self::Party),
+            b'Y' => Some(Self::Area),
+            b'Z' => Some(Self::MeasurementPoint),
+            b'W' => Some(Self::ResourceObject),
+            b'T' => Some(Self::TieLine),
+            b'V' => Some(Self::Location),
+            b'A' => Some(Self::Substation),
+            _ => None,
+        }
+    }
+}
+
+crate::codes::string_codes! {
+    EicType;
+}
+
+/// One of the four German **Regelzonen**, read off position 4 of a
+/// Bilanzierungsgebiet's EIC.
+///
+/// BDEW *Anwendungshilfe Energy Identification Codes* v1.0 (18.12.2017) §2.2.2
+/// prints the Bildungsvorschrift for a Bilanzierungsgebiet as its own table:
+/// position 4 identifies the Regelzone the area lies in, with `N` TenneT,
+/// `R` Amprion, `V` 50Hertz and `W` TransnetBW.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "SCREAMING_SNAKE_CASE"))]
+pub enum Regelzone {
+    /// `N` — TenneT TSO GmbH.
+    ///
+    /// Renamed explicitly: `SCREAMING_SNAKE_CASE` would split the operator's
+    /// own inner capital into `TENNE_T`.
+    #[cfg_attr(feature = "serde", serde(rename = "TENNET"))]
+    TenneT,
+    /// `R` — Amprion GmbH.
+    Amprion,
+    /// `V` — 50Hertz Transmission GmbH.
+    FiftyHertz,
+    /// `W` — TransnetBW GmbH.
+    TransnetBw,
+}
+
+impl Regelzone {
+    /// Every variant, in declaration order.
+    pub const ALL: [Self; 4] = [
+        Self::TenneT,
+        Self::Amprion,
+        Self::FiftyHertz,
+        Self::TransnetBw,
+    ];
+
+    /// Stable DB/wire label. Matches the `serde` tag and [`FromStr`] input.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::TenneT => "TENNET",
+            Self::Amprion => "AMPRION",
+            Self::FiftyHertz => "FIFTY_HERTZ",
+            Self::TransnetBw => "TRANSNET_BW",
+        }
+    }
+
+    /// The operator's own spelling.
+    ///
+    /// A description, not a code — `50Hertz` starts with a digit and
+    /// `TransnetBW` mixes case, neither of which belongs in a database column.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::TenneT => "TenneT TSO",
+            Self::Amprion => "Amprion",
+            Self::FiftyHertz => "50Hertz Transmission",
+            Self::TransnetBw => "TransnetBW",
+        }
+    }
+
+    /// The letter this Regelzone occupies position 4 of a Bilanzierungsgebiet
+    /// EIC with.
+    #[must_use]
+    pub const fn eic_letter(self) -> char {
+        match self {
+            Self::TenneT => 'N',
+            Self::Amprion => 'R',
+            Self::FiftyHertz => 'V',
+            Self::TransnetBw => 'W',
+        }
+    }
+
+    /// The Regelzone a position-4 letter names, or `None` for any other letter.
+    #[must_use]
+    pub const fn from_eic_letter(letter: u8) -> Option<Self> {
+        match letter {
+            b'N' => Some(Self::TenneT),
+            b'R' => Some(Self::Amprion),
+            b'V' => Some(Self::FiftyHertz),
+            b'W' => Some(Self::TransnetBw),
+            _ => None,
+        }
+    }
+
+    /// The ENTSO-E **control-area** code for this Regelzone.
+    ///
+    /// A `Y` code issued by the Central Issuing Office (LIO `10`), and a
+    /// different thing from the Bilanzierungsgebiet codes the BDEW issues
+    /// under LIO `11` — this one identifies the whole Regelzone in ENTSO-E
+    /// schedules and publications. The bodies still carry the pre-2010 company
+    /// names (`EON`, `RWENET`, `VE`, `ENBW`), which is why they are worth
+    /// having as constants rather than being guessed from the operator's
+    /// current name.
+    #[must_use]
+    pub const fn control_area_eic(self) -> Eic {
+        Eic {
+            chars: match self {
+                Self::TenneT => *b"10YDE-EON------1",
+                Self::Amprion => *b"10YDE-RWENET---I",
+                Self::FiftyHertz => *b"10YDE-VE-------2",
+                Self::TransnetBw => *b"10YDE-ENBW-----N",
+            },
+        }
+    }
+}
+
+crate::codes::string_codes! {
+    Regelzone;
+}
+
+/// The shape [`Eic`] accepts, as rendered in a [`ParseError`].
+const EIC_FORMAT: &str = "a 16-character EIC: 2 characters of issuing office, an object-type \
+     letter, 12 characters of `0-9`, `A-Z` or `-`, and a check character \
+     (ENTSO-E EIC Reference Manual)";
+
+/// A check-character-validated **Energy Identification Code**.
+///
+/// The identifier every ENTSO-E-connected object is addressed by, and the one
+/// the German market uses for Bilanzkreise, Bilanzierungsgebiete, Regelzonen
+/// and Metering Grid Areas. It is not a BDEW identifier and shares nothing
+/// with one: a [`BdewCode`] is thirteen digits and addresses a *Marktpartner*,
+/// an EIC is sixteen alphanumerics and addresses whatever its type letter
+/// says.
+///
+/// # Bildungsvorschrift
+///
+/// ENTSO-E *The Energy Identification Coding Scheme (EIC) Reference Manual*,
+/// §5.2–5.3:
+///
+/// | Position | Content |
+/// |---|---|
+/// | 1–2 | the Local Issuing Office, assigned by the Central Issuing Office |
+/// | 3 | the object type — see [`EicType`] |
+/// | 4–15 | twelve characters assigned by the LIO |
+/// | 16 | the check character |
+///
+/// Permitted characters are *"numbers (0 to 9), capital letters (A to Z,
+/// English alphabet) and the sign minus (-)"*, and the check character is
+/// restricted further: *"To avoid confusion, the check character shall use
+/// numbers (0 to 9) or the capital letters (A to Z)"* — never the minus. The
+/// BDEW *Anwendungshilfe Energy Identification Codes* v1.0 (18.12.2017) §2.2.1
+/// prints the same two rows for the German market, and adds that positions 1–2
+/// are `11` for the BDEW as the German LIO — see [`GERMAN_LIO`](Self::GERMAN_LIO)
+/// and [`regelzone`](Self::regelzone).
+///
+/// # The check character is enforced
+///
+/// Unlike [`BdewCode`], whose Bildungsvorschrift carves out GS1-issued GLNs
+/// and whose check digit is therefore only reported, the EIC scheme has no
+/// exception: every code the CIO or a LIO issues satisfies the algorithm, and
+/// the manual prints two worked examples that this crate pins as tests. So a
+/// mistyped EIC is rejected at the parse, where the message that carried it is
+/// still available to report — the same treatment [`MaloId`] gets.
+///
+/// ## The algorithm
+///
+/// Each of the first fifteen characters takes a value (`0`–`9` → 0–9, `A`–`Z`
+/// → 10–35, `-` → 36), is multiplied by a weight running 16 down to 2, and the
+/// products are summed. The check character is the character whose value is
+/// `36 − ((Σ − 1) mod 37)`. A result of 36 would be a minus sign, which the
+/// manual forbids as a check character, so such a code is never issued.
+///
+/// ```rust
+/// use metering::ids::{Eic, EicType};
+///
+/// // The 50Hertz control area — a type `Y` code.
+/// let regelzone: Eic = "10YDE-VE-------2".parse()?;
+/// assert_eq!(regelzone.object_type(), Some(EicType::Area));
+/// assert_eq!(regelzone.issuing_office(), "10");
+/// assert_eq!(regelzone.check_character(), '2');
+///
+/// // A transposed pair is a different, plausible-looking code — and is caught.
+/// assert!("10YED-VE-------2".parse::<Eic>().is_err());
+/// # Ok::<(), metering::ParseError>(())
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Eic {
+    /// The sixteen ASCII characters.
+    chars: [u8; 16],
+}
+
+impl Eic {
+    /// The identifier's length: always 16 characters.
+    pub const LEN: usize = 16;
+
+    /// The code as a `&str`, uppercase.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        // Every byte was checked to be an ASCII digit, `A`-`Z` or `-` at
+        // parse, so this is infallible; the fallback keeps the crate free of
+        // `unsafe` and of a panic path, which `#![deny(unsafe_code)]` and the
+        // no-panic norm both want.
+        std::str::from_utf8(&self.chars).unwrap_or("")
+    }
+
+    /// The Local Issuing Office (positions 1–2).
+    ///
+    /// Returned as a `&str` rather than a typed enum: the CIO assigns these,
+    /// publishes the list on the EIC website, and adds to it — pinning a
+    /// closed set here would reject codes from an office registered after this
+    /// crate was released. The manual says only *"the 2-characters identifying
+    /// the LIO"*, so this type does not require them to be digits either,
+    /// though every office assigned so far uses two.
+    #[must_use]
+    pub fn issuing_office(&self) -> &str {
+        self.as_str().get(..2).unwrap_or("")
+    }
+
+    /// What this code identifies, or `None` for a type letter the manual's
+    /// list does not contain.
+    ///
+    /// `Option` rather than a parse failure, for the reason
+    /// [`BdewCode::has_bdew_check_digit`] is advisory: the type list is
+    /// ENTSO-E's to extend, and a library that hard-fails on a letter added
+    /// after its release rejects data the market has already issued. The
+    /// *shape* is still enforced — position 3 must be an uppercase letter.
+    #[must_use]
+    pub const fn object_type(&self) -> Option<EicType> {
+        EicType::from_letter(self.chars[2])
+    }
+
+    /// The check character (position 16).
+    #[must_use]
+    pub const fn check_character(&self) -> char {
+        self.chars[15] as char
+    }
+
+    /// The Local Issuing Office of the German electricity market: `11`, the
+    /// BDEW.
+    ///
+    /// BDEW *Anwendungshilfe Energy Identification Codes* v1.0 §2.2.1: *"die
+    /// Zahl „11" steht für das deutsche LIO im Strommarkt, den BDEW
+    /// Bundesverband der Energie- und Wasserwirtschaft e.V."*
+    pub const GERMAN_LIO: &'static str = "11";
+
+    /// `true` when this code was issued by the German LIO.
+    #[must_use]
+    pub fn is_german(&self) -> bool {
+        self.issuing_office() == Self::GERMAN_LIO
+    }
+
+    /// The **Regelzone** this code names, when it is a German
+    /// Bilanzierungsgebiet.
+    ///
+    /// A Bilanzierungsgebiet is a `Y` code in the EIC function *Metering Grid
+    /// Area*, and the BDEW Bildungsvorschrift (*Anwendungshilfe* v1.0 §2.2.2)
+    /// gives position 4 a meaning no other EIC has: it identifies the
+    /// Regelzone the area lies in.
+    ///
+    /// The EIC *function* is registry metadata and is not encoded in the code
+    /// itself, so a `Y` code cannot in general be told apart from a
+    /// Bilanzkreis's — but this one can, because the same section adds a
+    /// Praxishinweis that the Energie Codes und Services GmbH **excludes**
+    /// `N`, `R`, `V` and `W` at position 4 for every other `Y` function. So a
+    /// German `Y` code carrying one of those four letters there is a
+    /// Bilanzierungsgebiet, and `Some` here is that inference.
+    ///
+    /// `None` for a code from another issuing office, a non-`Y` type, or any
+    /// other position-4 letter.
+    ///
+    /// ```rust
+    /// use metering::ids::{Eic, Regelzone};
+    ///
+    /// // A Bilanzierungsgebiet in the Amprion Regelzone. (The body here is
+    /// // illustrative; the real ones are published per Regelzone.)
+    /// let bg: Eic = "11YR-AMPRION-BG9".parse()?;
+    /// assert_eq!(bg.regelzone(), Some(Regelzone::Amprion));
+    /// assert!(bg.is_german());
+    ///
+    /// // The Regelzone's own ENTSO-E control-area code is a different code.
+    /// assert_eq!(
+    ///     Regelzone::Amprion.control_area_eic().to_string(),
+    ///     "10YDE-RWENET---I",
+    /// );
+    ///
+    /// // A control-area code comes from the ENTSO-E CIO, not the BDEW, so it
+    /// // carries no Bilanzierungsgebiet Regelzone letter.
+    /// assert_eq!(Regelzone::Amprion.control_area_eic().regelzone(), None);
+    /// # Ok::<(), metering::ParseError>(())
+    /// ```
+    #[must_use]
+    pub const fn regelzone(&self) -> Option<Regelzone> {
+        if self.chars[0] != b'1' || self.chars[1] != b'1' || self.chars[2] != b'Y' {
+            return None;
+        }
+        Regelzone::from_eic_letter(self.chars[3])
+    }
+
+    /// The check character for the first fifteen characters of a code.
+    ///
+    /// `None` when `body` is not exactly fifteen permitted characters, and
+    /// when the algorithm yields 36 — the minus sign, which the manual forbids
+    /// as a check character, so no such code is issued.
+    ///
+    /// ```rust
+    /// use metering::ids::Eic;
+    ///
+    /// // The two worked examples printed in the EIC Reference Manual §5.1.
+    /// assert_eq!(Eic::compute_check_character("10X168Y4E6H0041"), Some('Z'));
+    /// assert_eq!(Eic::compute_check_character("10X---ENTSOE---"), Some('L'));
+    /// ```
+    #[must_use]
+    pub fn compute_check_character(body: &str) -> Option<char> {
+        let bytes = body.as_bytes();
+        if bytes.len() != Self::LEN - 1 {
+            return None;
+        }
+        let mut sum: u32 = 0;
+        for (i, byte) in bytes.iter().enumerate() {
+            let value = eic_value(*byte)?;
+            // Weights run 16 down to 2 across the fifteen characters.
+            sum += value * (16 - i as u32);
+        }
+        let check = 36 - ((sum + 36) % 37);
+        eic_char(check)
+    }
+}
+
+/// The numeric value of one EIC character: `0`-`9` → 0–9, `A`-`Z` → 10–35,
+/// `-` → 36. `None` for anything else.
+const fn eic_value(byte: u8) -> Option<u32> {
+    match byte {
+        b'0'..=b'9' => Some((byte - b'0') as u32),
+        b'A'..=b'Z' => Some((byte - b'A') as u32 + 10),
+        b'-' => Some(36),
+        _ => None,
+    }
+}
+
+/// The inverse of [`eic_value`], restricted to what a check character may be.
+///
+/// `None` for 36, whose character is the minus sign — forbidden as a check
+/// character by §5.2, so a body that computes to it is never issued a code.
+const fn eic_char(value: u32) -> Option<char> {
+    match value {
+        0..=9 => Some((b'0' + value as u8) as char),
+        10..=35 => Some((b'A' + (value - 10) as u8) as char),
+        _ => None,
+    }
+}
+
+impl fmt::Display for Eic {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.pad(self.as_str())
+    }
+}
+
+impl FromStr for Eic {
+    type Err = ParseError;
+
+    /// Parses a 16-character EIC, ignoring surrounding whitespace and
+    /// canonicalising to uppercase.
+    ///
+    /// Enforced: the length, the permitted character set, an uppercase letter
+    /// in position 3, and the check character. The issuing office is not
+    /// required to be numeric — see [`Eic::issuing_office`].
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let err = || ParseError::format("Eic", s, EIC_FORMAT);
+        let trimmed = s.trim();
+        if trimmed.len() != Self::LEN {
+            return Err(err());
+        }
+        let upper = trimmed.to_ascii_uppercase();
+        let bytes = upper.as_bytes();
+        if !bytes.iter().all(|b| eic_value(*b).is_some()) || !bytes[2].is_ascii_uppercase() {
+            return Err(err());
+        }
+        if Self::compute_check_character(&upper[..Self::LEN - 1]) != Some(bytes[15] as char) {
+            return Err(err());
+        }
+        let mut chars = [0u8; 16];
+        chars.copy_from_slice(bytes);
+        Ok(Self { chars })
+    }
+}
+
+impl TryFrom<&str> for Eic {
+    type Error = ParseError;
+    fn try_from(s: &str) -> Result<Self, Self::Error> {
+        s.parse()
+    }
+}
+
+impl From<Eic> for String {
+    fn from(id: Eic) -> String {
+        id.as_str().to_owned()
+    }
+}
+
 // ── Serde: one string on the wire ─────────────────────────────────────────────
 
 #[cfg(feature = "serde")]
 mod serde_impl {
-    use super::{BdewCode, MaloId, MeloId};
+    use super::{BdewCode, Eic, MaloId, MeloId};
     use serde::de::{self, Visitor};
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
     use std::fmt;
@@ -649,6 +1153,33 @@ mod serde_impl {
     impl<'de> Deserialize<'de> for MeloId {
         fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
             deserializer.deserialize_str(MeloIdVisitor)
+        }
+    }
+
+    impl Serialize for Eic {
+        /// Writes the canonical uppercase 16-character string.
+        fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            serializer.collect_str(self)
+        }
+    }
+
+    struct EicVisitor;
+
+    impl Visitor<'_> for EicVisitor {
+        type Value = Eic;
+
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("a 16-character EIC such as \"10YDE-VE-------2\"")
+        }
+
+        fn visit_str<E: de::Error>(self, v: &str) -> Result<Eic, E> {
+            v.parse().map_err(de::Error::custom)
+        }
+    }
+
+    impl<'de> Deserialize<'de> for Eic {
+        fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            deserializer.deserialize_str(EicVisitor)
         }
     }
 }
@@ -772,5 +1303,156 @@ mod tests {
         ] {
             assert!(s.parse::<MeloId>().is_err(), "{s:?} must not parse");
         }
+    }
+
+    // ── Eic ───────────────────────────────────────────────────────────────
+
+    /// The two examples the EIC Reference Manual §5.1 prints, and three
+    /// German codes in daily use. A check-digit implementation that is wrong
+    /// is worse than none, so it is pinned against codes nobody here invented.
+    #[test]
+    fn the_published_eic_examples_are_reproduced() {
+        for code in [
+            "10X168Y4E6H0041Z", // manual §5.1, "random non-significant"
+            "10X---ENTSOE---L", // manual §5.1, "non-random significant"
+            "10YDE-VE-------2", // 50Hertz Regelzone
+            "10YDE-ENBW-----N", // TransnetBW Regelzone
+            "10YDE-RWENET---I", // Amprion Regelzone
+            "10YDE-EON------1", // TenneT TSO Regelzone
+            "10Y1001A1001A83F", // the German bidding zone
+        ] {
+            let eic: Eic = code.parse().unwrap_or_else(|e| panic!("{code}: {e}"));
+            assert_eq!(eic.as_str(), code);
+            assert_eq!(
+                Eic::compute_check_character(&code[..15]),
+                Some(code.as_bytes()[15] as char),
+            );
+        }
+    }
+
+    #[test]
+    fn the_object_type_is_the_third_character() {
+        let area: Eic = "10YDE-VE-------2".parse().unwrap();
+        assert_eq!(area.object_type(), Some(EicType::Area));
+        assert_eq!(area.issuing_office(), "10");
+        assert_eq!(area.check_character(), '2');
+
+        let party: Eic = "10X---ENTSOE---L".parse().unwrap();
+        assert_eq!(party.object_type(), Some(EicType::Party));
+    }
+
+    /// A single wrong character, and a transposed pair, both fail — which is
+    /// the whole reason this is a type and not a `String`.
+    #[test]
+    fn a_corrupted_code_is_refused() {
+        assert!(
+            "10YDE-VE-------3".parse::<Eic>().is_err(),
+            "wrong check char"
+        );
+        assert!("10YED-VE-------2".parse::<Eic>().is_err(), "transposition");
+        assert!("10YDE-VE-------".parse::<Eic>().is_err(), "too short");
+        assert!("10YDE-VE-------22".parse::<Eic>().is_err(), "too long");
+        assert!("10YDE_VE-------2".parse::<Eic>().is_err(), "underscore");
+    }
+
+    /// Position 3 names the object, so a digit or a minus there is malformed
+    /// however the check character comes out.
+    #[test]
+    fn the_type_position_must_be_a_letter() {
+        // Build a body whose third character is a digit, then give it its own
+        // correct check character: the shape rule must still reject it.
+        let body = "1010DE---------";
+        let check = Eic::compute_check_character(body).unwrap();
+        assert!(format!("{body}{check}").parse::<Eic>().is_err());
+    }
+
+    /// Lowercase is accepted on the way in and never written back out — two
+    /// casings of one Bilanzkreis must not become two keys.
+    #[test]
+    fn lowercase_is_canonicalised() {
+        let eic: Eic = "  10yde-ve-------2  ".parse().unwrap();
+        assert_eq!(eic.to_string(), "10YDE-VE-------2");
+    }
+
+    /// The minus sign is a permitted body character but §5.2 forbids it as a
+    /// **check** character, so a body whose algorithm yields 36 is one the CIO
+    /// never issues a code for. The function says `None` rather than writing a
+    /// `-` that no reader would accept.
+    #[test]
+    fn a_body_computing_to_the_minus_sign_has_no_check_character() {
+        let body = "10X000000000002"; // weighted sum ≡ 1 (mod 37)
+        assert_eq!(Eic::compute_check_character(body), None);
+        assert!(format!("{body}-").parse::<Eic>().is_err());
+    }
+
+    #[test]
+    fn a_short_or_impure_body_has_no_check_character() {
+        assert_eq!(Eic::compute_check_character("10X"), None);
+        assert_eq!(Eic::compute_check_character("10x---entsoe---"), None);
+    }
+
+    #[test]
+    fn an_unknown_type_letter_is_not_a_parse_failure() {
+        // `Q` is not in the manual's list; the code is still well-formed.
+        let body = "10Q---FUTURE---";
+        let check = Eic::compute_check_character(body).unwrap();
+        let eic: Eic = format!("{body}{check}").parse().unwrap();
+        assert_eq!(eic.object_type(), None);
+    }
+
+    // ── Regelzone ─────────────────────────────────────────────────────────
+
+    /// The four published ENTSO-E control-area codes, parsed back through the
+    /// same check-character algorithm they were written with.
+    #[test]
+    fn every_control_area_code_is_a_valid_eic() {
+        for zone in Regelzone::ALL {
+            let eic = zone.control_area_eic();
+            let text = eic.to_string();
+            assert_eq!(
+                text.parse::<Eic>(),
+                Ok(eic),
+                "{}: {text} does not round-trip",
+                zone.as_str(),
+            );
+            assert_eq!(eic.object_type(), Some(EicType::Area));
+            assert_eq!(eic.issuing_office(), "10", "the CIO, not the BDEW");
+            assert!(!eic.is_german(), "a control area is a CIO code");
+        }
+        assert_eq!(
+            Regelzone::FiftyHertz.control_area_eic().to_string(),
+            "10YDE-VE-------2",
+        );
+    }
+
+    /// Position 4 of a German `Y` code names the Regelzone — and only there.
+    #[test]
+    fn the_regelzone_is_read_off_a_german_y_code() {
+        let bg: Eic = "11YR-AMPRION-BG9".parse().unwrap();
+        assert_eq!(bg.regelzone(), Some(Regelzone::Amprion));
+        assert_eq!(bg.object_type(), Some(EicType::Area));
+        assert!(bg.is_german());
+
+        for (code, zone) in [
+            ("11YN-TENNET--BGQ", Regelzone::TenneT),
+            ("11YV-50HERTZ-BGX", Regelzone::FiftyHertz),
+            ("11YW-TNGBW---BGW", Regelzone::TransnetBw),
+        ] {
+            let eic: Eic = code.parse().unwrap_or_else(|e| panic!("{code}: {e}"));
+            assert_eq!(eic.regelzone(), Some(zone));
+            assert_eq!(zone.eic_letter(), code.as_bytes()[3] as char);
+        }
+    }
+
+    /// A `X` code is a party, not an area, so position 4 means nothing there —
+    /// and a code from another issuing office is not the BDEW's scheme at all.
+    #[test]
+    fn only_a_german_area_code_has_a_regelzone() {
+        let party: Eic = "11XSAP-AMPRION-B".parse().unwrap();
+        assert_eq!(party.object_type(), Some(EicType::Party));
+        assert_eq!(party.regelzone(), None, "an X code carries no Regelzone");
+
+        // A CIO-issued control area: right type, wrong issuing office.
+        assert_eq!(Regelzone::Amprion.control_area_eic().regelzone(), None);
     }
 }

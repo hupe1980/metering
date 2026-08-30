@@ -1134,10 +1134,9 @@ mod channel_and_cadence_tests {
             .collect()
     }
 
-    /// The bug a fixed result code hid: an Einspeisung Zählerstandsgang came
-    /// out labelled `1-0:1.29.0` — **import** — because `strom()` stamped a
-    /// hard-coded Bezug constant on every interval it derived. The values were
-    /// right and the channel was a lie, so nothing downstream could see it.
+    /// A feed-in Zählerstandsgang keeps its own channel. Stamping a fixed
+    /// Bezug code on every derived interval leaves the values right and the
+    /// channel a lie, which nothing downstream can detect.
     #[test]
     fn a_feed_in_series_is_not_relabelled_as_import() {
         let readings = zsg(

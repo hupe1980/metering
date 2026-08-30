@@ -545,39 +545,59 @@ impl ObisCode {
         self.d == 9
     }
 
-    /// `true` when this code represents import (Bezug from the grid).
+    /// The direction this code counts in, if it counts in one.
     ///
     /// Direction lives in value group **C alone**: EDI@Energy §2.1 states
-    /// "+ Bezug des Kunden aus dem Netz (z. B. `1-b:1.x.y`)", with `x` and `y`
+    /// "+ Bezug des Kunden aus dem Netz (z. B. `1-b:1.x.y`)" and "− (Rück-)
+    /// Lieferung des Kunden an das Netz (z. B. `1-b:2.x.y`)", with `x` and `y`
     /// explicitly free. So the Zählerstand `1-0:1.8.0`, the Vorschub
     /// `1-0:1.9.0`, the Lastgang `1-0:1.29.0` and the Maximum `1-0:1.6.0` are
-    /// all import.
+    /// all import; the Messart D is not part of the direction, and `D = 9` is
+    /// *Vorschub*, not a reverse flag.
     ///
-    /// Requiring D = 8 here would report the Lastgang — the commonest code in
-    /// MSCONS interval data — as neither import nor export.
+    /// Requiring D = 8 would report the Lastgang — the commonest code in
+    /// MSCONS interval data — as having no direction at all.
+    ///
+    /// `None` for every code that genuinely has none: reactive power
+    /// (C = 3, 4), apparent power, gas volume, a Zustandszahl. This is the
+    /// **primitive**; [`is_import`](Self::is_import) and
+    /// [`is_export`](Self::is_export) are derived from it, because two
+    /// booleans that are both `false` cannot distinguish "this register has no
+    /// direction" from "this register counts the other way".
+    ///
+    /// ```rust
+    /// use metering::{Direction, ObisCode};
+    ///
+    /// let bezug: ObisCode = "1-0:1.8.0".parse()?;
+    /// let einspeisung: ObisCode = "1-0:2.8.0".parse()?;
+    /// let blind: ObisCode = "1-0:3.8.0".parse()?;
+    ///
+    /// assert_eq!(bezug.direction(), Some(Direction::Import));
+    /// assert_eq!(einspeisung.direction(), Some(Direction::Export));
+    /// assert_eq!(blind.direction(), None, "Blindarbeit has no flow direction");
+    /// # Ok::<(), metering::ParseError>(())
+    /// ```
     #[must_use]
-    pub fn is_import(&self) -> bool {
-        self.a == 1 && self.c == 1
+    pub const fn direction(self) -> Option<crate::interval::Direction> {
+        use crate::interval::Direction;
+        match (self.a, self.c) {
+            (1, 1) => Some(Direction::Import),
+            (1, 2) => Some(Direction::Export),
+            _ => None,
+        }
     }
 
-    /// `true` when this code represents export / Einspeisung (Rücklieferung to
-    /// the grid).
-    ///
-    /// EDI@Energy §2.1: "− (Rück-)Lieferung des Kunden an das Netz (z. B.
-    /// `1-b:2.x.y`)". As with [`is_import`](Self::is_import), the Messart D is
-    /// not part of the direction — `D = 9` is *Vorschub*, not a reverse flag.
+    /// `true` when this code counts Bezug — see [`direction`](Self::direction).
     #[must_use]
-    pub fn is_export(&self) -> bool {
-        self.a == 1 && self.c == 2
+    pub const fn is_import(self) -> bool {
+        matches!(self.direction(), Some(crate::interval::Direction::Import))
     }
 
-    /// `true` when this code represents Einspeisung (feed-in to the grid).
-    ///
-    /// Alias for `is_export()` using the German market terminology.
-    /// Identifies `1-0:2.8.x` codes (reverse active energy).
+    /// `true` when this code counts Einspeisung — see
+    /// [`direction`](Self::direction).
     #[must_use]
-    pub fn is_einspeisung(&self) -> bool {
-        self.is_export()
+    pub const fn is_export(self) -> bool {
+        matches!(self.direction(), Some(crate::interval::Direction::Export))
     }
 
     /// Value group E when the register counts faults rather than energy.
@@ -1204,7 +1224,6 @@ mod tests {
             code.is_export(),
             "1-0:2.8.0 should be Einspeisung/export (C=2, D=8)"
         );
-        assert!(code.is_einspeisung(), "should alias is_export()");
         assert_eq!(code, ObisCode::STROM_EINSPEISUNG_TOTAL);
     }
 
@@ -1267,7 +1286,7 @@ mod mako_semantics_tests {
         ] {
             let c: ObisCode = code.parse().unwrap();
             assert!(c.is_export(), "{code} ({what}) is Lieferung");
-            assert!(c.is_einspeisung(), "{code} ({what}) aliases is_export");
+            assert_eq!(c.direction(), Some(crate::interval::Direction::Export));
             assert!(!c.is_import(), "{code} ({what}) is not Bezug");
         }
     }
@@ -1380,11 +1399,11 @@ mod mako_semantics_tests {
 
 /// One channel, one string.
 ///
-/// The bug these lock: `FromStr` defaulted the storage group to 255 and
-/// `Display` always printed it, so `"1-0:1.8.0"` came back out as
-/// `"1-0:1.8.0*255"`. A consumer keying stored rows on the string saw one
-/// channel as two — and a correction written through the long spelling did not
-/// supersede the reading written through the short one.
+/// A parser that defaults the storage group to 255 and a `Display` that always
+/// prints it give `"1-0:1.8.0"` and `"1-0:1.8.0*255"` for one channel. A
+/// consumer keying stored rows on the string then sees two, and a correction
+/// written through one spelling does not supersede the reading written through
+/// the other.
 #[cfg(test)]
 mod canonical_string_tests {
     use super::*;

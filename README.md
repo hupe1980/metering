@@ -7,10 +7,11 @@
 [![License](https://img.shields.io/crates/l/metering.svg)](#-license)
 
 **German energy metering domain library for Rust.** Europe/Berlin calendar
-arithmetic — Liefertag *and* Gastag — Zählerstandsgang → Lastgang, gas
-m³→kWh_Hs and the SigLinDe gas SLP, Ersatzwertbildung, a robust validation
-engine, EN 50160, §14a Modul 3 tariff registers, virtual meters (§42b EnWG),
-check-digit-validated MaLo-IDs and Jahresprognose.
+arithmetic — Liefertag *and* Gastag — Zählerstandsgang → Lastgang, charging
+sessions and device logs onto the settlement grid, gas m³→kWh_Hs and the
+SigLinDe gas SLP, Ersatzwertbildung, a robust validation engine, EN 50160,
+§14a Modul 3 tariff registers, conservation-checked allocation (§42b EnWG),
+check-digit-validated MaLo-IDs and EICs, and Jahresprognose.
 
 > 🧊 **Zero I/O** · ⏱️ **no async** · 🕰️ **no clock** · 🔢 **exact decimal quantities**
 
@@ -150,7 +151,7 @@ it. It asserts its own invariants, so CI runs it as a test.
 |---|---|---|
 | **Calendar** | Berlin days, months, years **and the 06:00 Gastag**; `DayBoundary` carries the choice into resampling and gap filling; DST-correct interval counts; Bundesland holidays | [→](https://hupe1980.github.io/metering/docs/time-and-calendar/) |
 | **Readings** | Zählerstandsgang → Lastgang, register rollover, meter exchange | [→](https://hupe1980.github.io/metering/docs/readings/) |
-| **Identifiers** | `MaloId` with the BDEW check digit verified at the parse; `MeloId`; `BdewCode` Marktpartner-ID | [→](https://hupe1980.github.io/metering/docs/identifiers/) |
+| **Identifiers** | `MaloId` and `Eic` with their check characters verified at the parse; `MeloId` (= the Zählpunktbezeichnung); `BdewCode` Marktpartner-ID; the Regelzone read off a Bilanzierungsgebiet's EIC | [→](https://hupe1980.github.io/metering/docs/identifiers/) |
 | **Validation** | Order-independent rules V01–V12 (V10 retired), Hampel outlier test, A/B/C/F grading, and a `RuleSet` saying which rules actually ran; DST- and Gastag-aware daily lengths | [→](https://hupe1980.github.io/metering/docs/validation/) |
 | **Ersatzwerte** | Four methods, calendar-aware grid, audit trail of what actually ran | [→](https://hupe1980.github.io/metering/docs/substitute-values/) |
 | **Tariff registers** | HT/NT and §14a Modul 3 in one mechanism, plus a Modul 3 conformance check for curated DSO calendars | [→](https://hupe1980.github.io/metering/docs/tariff-registers/) |
@@ -158,6 +159,7 @@ it. It asserts its own invariants, so CI runs it as a test.
 | **Gas & units** | m³→kWh_Hs, G 685 rounding, the SigLinDe gas SLP, exact-rational unit normalisation | [→](https://hupe1980.github.io/metering/docs/gas-and-units/) |
 | **Power quality** | EN 50160 as the statistical test it actually is; VDE-AR-N 4100 Unsymmetrieleistung | [→](https://hupe1980.github.io/metering/docs/power-quality/) |
 | **Virtual meters** | Sum, Residual, GGV allocation (§42b EnWG) — per tenant and per community, with the §42b Abs. 5 pool ceiling | [→](https://hupe1980.github.io/metering/docs/virtual-meters/) |
+| **Sessions & allocation** | A charging session or device log placed on the grid without losing a kWh, and several of them merged onto it; one pool split across many claims with the residual reported; the import/export balance of a bidirectional Zählpunkt | [→](https://hupe1980.github.io/metering/docs/sessions-and-allocation/) |
 | **End to end** | The full MSB pipeline as a runnable example | [→](https://hupe1980.github.io/metering/docs/pipeline/) |
 
 ---
@@ -217,17 +219,26 @@ waiting on EU state-aid approval.
   `ValidationConfig::disabled_rules()` make the difference between "found
   nothing" and "never looked" a fact you can log or assert on.
 - **Order in, order out.** `aggregate`, `resample`, `validate_intervals`,
-  `fill_gaps`, `split_energy` and `to_lastgang` all give the same answer for a
-  shuffled series, and a proptest suite asserts it rather than the docs
-  promising it. Two defects hid behind that promise until the suite existed,
-  and both needed a *tie* to surface.
+  `fill_gaps`, `split_energy`, `to_lastgang`, `allocate`, `split_session` and
+  `sum_by_direction` all give the same answer for a shuffled input, and a
+  proptest suite asserts it rather than the docs promising it. Two defects hid
+  behind that promise until the suite existed, and both needed a *tie* to
+  surface.
+- **Nothing created, nothing lost.** A session total placed on the grid sums
+  back to itself; a pool split across claims satisfies
+  `Σ allocated + residual = total`. Both identities are theorems rather than
+  checks — the cut lands on the *cumulative*, so the slot differences telescope
+  — and proptests hold them.
 - **No second copy of a fact.** A register's unit comes from its OBIS code, a
   meter exchange's date from its instant, a series' worst quality from its
-  intervals — never from a field that can drift out of step.
+  intervals, an interval's flow direction from its OBIS value group C — never
+  from a field that can drift out of step. Where a fact genuinely *is* stated
+  twice — a measurement point declares a purpose as well as carrying a directed
+  OBIS code — the disagreement is reportable (`direction_conflict`) rather than
+  resolved in silence.
 - **Serde tags are semver-covered**, pinned literally by a test. Instants
   travel as RFC 3339 and dates as ISO 8601 in JSON, and keep `time`'s compact
-  tuple in bincode and postcard — where the hot types round-trip, which the
-  crate claimed before it was true.
+  tuple in bincode and postcard, where the hot types round-trip.
 - **Domain enums are exhaustive**; only error enums are `#[non_exhaustive]`.
 - **Unknown is not good.** Where a quantity cannot be determined the API says
   so — an `Option`, or an error — rather than returning a benign-looking

@@ -1,7 +1,7 @@
 +++
 title = "The whole pipeline"
 description = "One Liefertag from the Zählerstandsgang the gateway delivered through to the §14a register split — a runnable, self-asserting example."
-weight = 14
+weight = 15
 +++
 
 The guides explain each stage on its own. This is all of them, on one day:

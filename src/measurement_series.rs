@@ -68,16 +68,17 @@ use crate::resolution::IntervalResolution;
 /// The origin of a measurement series — how the data entered the system.
 ///
 /// Stored per series (not per interval) since all intervals in one MSCONS
-/// message share the same ingestion source.
+/// message share the same ingestion source. The same holds for a charging
+/// session: one [`split_session`](crate::split_session) call produces one
+/// series, and every slot in it came from the same record.
 ///
 /// ## Provenance is not billability
 ///
 /// Whether a value may be billed is decided by each interval's
 /// [`QualityFlag`] — only `Faulty` and `Unknown` block billing — never by
 /// where the series came from: a manual entry after a dispute and a GGV
-/// virtual-meter result are billed every day. An earlier
-/// `is_billable_source` predicate on this type said otherwise for both, which
-/// was a second, contradictory notion of billability; it is gone.
+/// virtual-meter result are billed every day. A predicate on this type would
+/// be a second, contradictory notion of billability.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[cfg_attr(feature = "serde", serde(rename_all = "SCREAMING_SNAKE_CASE"))]
@@ -129,13 +130,9 @@ pub enum MeasurementSource {
     RetroactiveCorrection {
         /// Reference to the correction record in the caller's own system.
         ///
-        /// A `String`, like every other external reference in this enum. It
-        /// was a `uuid::Uuid`, which is a claim about the *consumer's*
-        /// primary-key scheme that this crate has no business making — and it
-        /// made `uuid` a mandatory dependency for one field the crate never
-        /// constructs, parses or validates, dragging `getrandom`'s system
-        /// entropy source into a library whose first promise is that it reads
-        /// no ambient state.
+        /// A `String`, like every other external reference in this enum: the
+        /// shape of a consumer's primary key is not this crate's to decide,
+        /// and nothing here constructs, parses or validates it.
         correction_ref: String,
         /// Who applied the correction.
         corrected_by: String,
@@ -161,6 +158,54 @@ pub enum MeasurementSource {
         /// Activation ID or process reference.
         activation_ref: Option<String>,
     },
+
+    /// A charging session's **Charge Detail Record** — one total for the whole
+    /// session, placed on the metering grid by
+    /// [`split_session`](crate::split_session).
+    ///
+    /// The energy is measured: a CDR is the difference of the charge point's
+    /// register at the start and the end of the transaction, and under the
+    /// Eichrecht it is signed. What is *not* measured is where inside the
+    /// session it flowed, so every slot the session did not fill exactly comes
+    /// back [`Estimated`](QualityFlag::Estimated). Distinguishing that from
+    /// [`ClockAlignedMeterValue`](Self::ClockAlignedMeterValue) is the point of
+    /// having two variants: a supplier settling this energy needs to know
+    /// which quarter-hours were read and which were divided.
+    ChargeDetailRecord {
+        /// The CDR's identifier in the caller's own system or in OCPI.
+        cdr_id: String,
+        /// The EVSE the session ran on (ISO 15118 / eMI3), when known.
+        evse_id: Option<String>,
+    },
+
+    /// **Clock-aligned meter values** from a charge point — OCPP
+    /// `MeterValues` sampled on the `ClockAlignedDataInterval`.
+    ///
+    /// The readings land on the settlement grid's own boundaries, so the slots
+    /// between two of them are measured rather than inferred. This is the
+    /// source a charge point should be configured to produce wherever the
+    /// energy is going to be settled per quarter-hour.
+    ClockAlignedMeterValue {
+        /// The OCPP transaction the readings belong to.
+        transaction_id: String,
+        /// The EVSE they were taken at (ISO 15118 / eMI3), when known.
+        evse_id: Option<String>,
+    },
+
+    /// A device's **own log** — a heat pump, a battery, a wallbox submeter.
+    ///
+    /// Not the Messstellenbetreiber's meter, and not necessarily an
+    /// eichrechtskonform one: a device register is fit for allocating and for
+    /// diagnostics, and the moment it is used to bill a third party the
+    /// Eichrecht applies to it like any other measuring instrument. The
+    /// variant exists so that a series carrying such values is never mistaken
+    /// for one that came from the MSB.
+    DeviceLog {
+        /// The device the log came from.
+        device_id: String,
+        /// Which of the device's registers, when it has more than one.
+        register: Option<String>,
+    },
 }
 
 impl MeasurementSource {
@@ -175,6 +220,9 @@ impl MeasurementSource {
             Self::RetroactiveCorrection { .. } => "Nachträgliche Korrektur",
             Self::VirtualMeter { .. } => "Virtueller Zähler",
             Self::RedispatchImport { .. } => "Redispatch 2.0",
+            Self::ChargeDetailRecord { .. } => "Ladevorgang (CDR)",
+            Self::ClockAlignedMeterValue { .. } => "Ladepunkt-Zählwert",
+            Self::DeviceLog { .. } => "Gerätelog",
         }
     }
 }

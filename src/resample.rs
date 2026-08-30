@@ -47,14 +47,14 @@
 //!
 //! - **§ 2 MsbG** — RLM, the 15-minute interval metering these buckets start from.
 //! - **GPKE Kap. 8.4** (BNetzA **BK6-24-174**) — Jahresmehr- und
-//!   Jahresmindermengen, which are settled **annually**, not monthly. Earlier
-//!   releases described them as calendar-month totals and cited *§ 13 StromNZV*,
-//!   which was repealed with effect from the end of 31 December 2025.
+//!   Jahresmindermengen, settled **annually**, not monthly. The older citation
+//!   *§ 13 StromNZV* is dead: repealed with effect from the end of
+//!   31 December 2025.
 
 use std::collections::BTreeMap;
 
 use rust_decimal::Decimal;
-use time::{Duration, OffsetDateTime};
+use time::OffsetDateTime;
 
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
@@ -261,8 +261,9 @@ pub fn resample(intervals: &[MeterInterval], config: &ResampleConfig) -> Vec<Res
     let mut buckets: BTreeMap<i64, ResampledBucket> = BTreeMap::new();
 
     for iv in intervals {
-        let (bucket_start, bucket_end) =
-            bucket_bounds_for(iv.from, config.target_resolution, config.day_boundary);
+        let (bucket_start, bucket_end) = config
+            .day_boundary
+            .bucket_bounds(iv.from, config.target_resolution);
 
         let entry = buckets
             .entry(bucket_start.unix_timestamp())
@@ -299,54 +300,13 @@ pub fn resample(intervals: &[MeterInterval], config: &ResampleConfig) -> Vec<Res
     buckets.into_values().collect()
 }
 
-// ── helpers ───────────────────────────────────────────────────────────────────
-
-/// The half-open bucket `[start, end)` containing `ts`.
-///
-/// Day, month and year buckets are Europe/Berlin calendar periods, so their
-/// duration is whatever the calendar says — 23, 24 or 25 hours for a day; 28 to
-/// 31 days ±1 hour for a month. Sub-daily buckets snap in UTC, which coincides
-/// with local snapping because every Berlin offset is a whole hour.
-fn bucket_bounds_for(
-    ts: OffsetDateTime,
-    res: IntervalResolution,
-    boundary: DayBoundary,
-) -> (OffsetDateTime, OffsetDateTime) {
-    match res {
-        IntervalResolution::Day => {
-            let day = boundary.local_day(ts);
-            (boundary.day_start_utc(day), boundary.day_end_utc(day))
-        }
-        IntervalResolution::Month => {
-            let day = boundary.local_day(ts);
-            (boundary.month_start_utc(day), boundary.month_end_utc(day))
-        }
-        IntervalResolution::Year => {
-            let year = boundary.local_year(ts);
-            (boundary.year_start_utc(year), boundary.year_end_utc(year))
-        }
-        // Fixed-length resolutions: snap the Unix timestamp onto the grid.
-        // `fixed_seconds` answers `Some` for every one of them — a
-        // `CustomSeconds` cannot be zero — so the fallback is unreachable and
-        // exists only so this function is total without an `expect`.
-        fixed => {
-            let Some(secs) = fixed.fixed_seconds() else {
-                return (ts, ts + Duration::seconds(1));
-            };
-            let s = i64::from(secs);
-            let snapped = ts.unix_timestamp().div_euclid(s) * s;
-            let start = OffsetDateTime::from_unix_timestamp(snapped).unwrap_or(ts);
-            (start, start + Duration::seconds(s))
-        }
-    }
-}
-
 // ── tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use rust_decimal::dec;
+    use time::Duration;
     use time::macros::{date, datetime};
 
     fn make_iv(from: OffsetDateTime, value: Decimal) -> MeterInterval {
@@ -599,6 +559,7 @@ mod gas_day_tests {
     use crate::calendar;
     use crate::interval::QualityFlag;
     use rust_decimal::dec;
+    use time::Duration;
     use time::macros::{date, datetime};
 
     /// Hourly gas intervals over `n` hours from `start`, 1 kWh each.

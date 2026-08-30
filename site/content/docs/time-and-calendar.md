@@ -208,3 +208,60 @@ Counting Werktage to a GPKE deadline — and the EDI@Energy rule that a holiday 
 one Bundesland counts nationwide — are market-*communication* concerns. They
 belong in a process engine, not in a library that computes kWh. Nothing here
 counts business days.
+
+## Addressing a period the way the market does
+
+A Bilanzierungsmonat is named, not constructed: *"Juni 2021"*. `DayBoundary`
+turns that name into the half-open UTC range it stands for, on either boundary,
+without the caller doing any date arithmetic:
+
+```rust
+use metering::calendar::DayBoundary;
+use time::Month;
+use time::macros::datetime;
+
+// March 2026 contains the spring-forward Sunday, so the electricity
+// Bilanzierungsmonat is one hour short of 31 days.
+let (from, to) = DayBoundary::Midnight.bilanzierungsmonat(2026, Month::March);
+assert_eq!(from, datetime!(2026-02-28 23:00 UTC));
+assert_eq!(to,   datetime!(2026-03-31 22:00 UTC));
+assert_eq!((to - from).whole_hours(), 31 * 24 - 1);
+
+// The gas month is the same span, shifted six hours.
+let (gas_from, gas_to) = DayBoundary::Gastag.bilanzierungsmonat(2026, Month::March);
+assert_eq!(gas_from, datetime!(2026-03-01 5:00 UTC));
+assert_eq!(gas_to,   datetime!(2026-04-01 4:00 UTC));
+```
+
+That is the market's own rule rather than an extrapolation. EDI@Energy
+*Allgemeine Festlegungen* v6.1c Kap. 3.1:
+
+> Die Angabe des Bilanzierungsmonats erfolgt unter Angabe von Jahr und Monat
+> (z. B. Juni 2021), sodass damit der Zeitraum vom 01.06.2021 00:00 Uhr bis
+> 01.07.2021 00:00 Uhr gesetzlicher deutscher Zeit abgedeckt ist, wenn es sich
+> um den Bilanzierungsmonat in der Sparte Strom handelt, in der Sparte Gas ist
+> damit der Zeitraum vom 01.06.2021 06:00 Uhr bis 01.07.2021 06:00 Uhr
+> gesetzlicher deutscher Zeit abgedeckt.
+
+`day_range_utc`, `month_range_utc` and `year_range_utc` return the same pair for
+a period identified by a date, and feed straight into
+`AggregationConfig::over_period`.
+
+## One grid, one implementation
+
+`DayBoundary::bucket_bounds` answers *"which slot of this resolution contains
+this instant"*, and it is the only implementation of that question in the crate:
+`resample` buckets with it and `split_session` places a charging session on it.
+A second implementation would drift from the first, and the two would then
+disagree about which slot a kWh belongs to.
+
+```rust
+use metering::calendar::DayBoundary;
+use metering::IntervalResolution;
+use time::macros::datetime;
+
+let (from, to) = DayBoundary::Midnight
+    .bucket_bounds(datetime!(2026-06-01 12:07 UTC), IntervalResolution::QuarterHour);
+assert_eq!(from, datetime!(2026-06-01 12:00 UTC));
+assert_eq!(to,   datetime!(2026-06-01 12:15 UTC));
+```

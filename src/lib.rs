@@ -15,12 +15,12 @@
 //! | [`interval`] | `MeterInterval` — the Lastgang; `Sparte`, `QualityFlag` |
 //! | [`reading`] | `MeterReading` — the Zählerstand, and the ZSG → Lastgang conversion |
 //! | [`obis`] | Typed `ObisCode`, one canonical string per channel |
-//! | [`ids`] | Typed `MaloId` (check-digit validated), `MeloId` and `BdewCode` |
+//! | [`ids`] | Typed `MaloId` and `Eic` (check-character validated), `MeloId`, `BdewCode`, `Regelzone` |
 //! | [`calendar`] | Europe/Berlin days, months, years **and the 06:00 Gastag** — DST-correct; `DayBoundary` |
 //! | [`holiday`] | Bundesland statutory holidays; SLP day typing |
 //! | [`resolution`] | `IntervalResolution` — fixed vs calendar lengths |
 //! | [`conversion`] | Gas m³ → kWh_Hs, unit normalisation, HeizkostenV warm water |
-//! | [`aggregation`] | Billing period: Arbeitsmenge, Spitzenleistung, coverage |
+//! | [`aggregation`] | Billing period: Arbeitsmenge, Spitzenleistung, coverage; the directional balance |
 //! | [`zaehlzeit`] | Tariff registers — HT/NT and § 14a Modul 3, with a conformance check |
 //! | [`para14a`] | § 14a netzorientierte Steuerung — `P_min,14a` and the netzwirksamer Leistungsbezug |
 //! | [`mod@resample`] | Down-sampling to Berlin calendar buckets |
@@ -33,6 +33,8 @@
 //! | [`classification`] | SLP / RLM / iMSys detection from the observed series |
 //! | [`virtual_meter`] | Sum / Residual / GGV virtual meters (§ 42b EnWG), per tenant and per community |
 //! | [`aggregation_rule`] | The rules `virtual_meter` evaluates |
+//! | [`allocation`] | One pool across many claims — `Σ allocated + residual = total` |
+//! | [`session`] | A charging session or device log onto the settlement grid, and back into one series |
 //! | [`imbalance`] | Jahresmehr-/-mindermengen (GPKE Kap. 8.4) |
 //! | [`losses`] | Netzverlust balance (§ 22 Abs. 1 EnWG) |
 //! | [`power_quality`] | EN 50160 — statistical, over a week of 10-minute means; VDE-AR-N 4100 Unsymmetrie |
@@ -183,7 +185,14 @@
 //! - A **code** and a **description** are different things, and the types with
 //!   both keep them apart: [`Holiday::as_str`] is `BUSS_UND_BETTAG` and
 //!   [`Holiday::name`] is *"Buß- und Bettag"*; [`RegisterUnit::as_str`] is
-//!   `KILO_WATT_HOUR` and [`RegisterUnit::symbol`] is `kWh`.
+//!   `KILO_WATT_HOUR` and [`RegisterUnit::symbol`] is `kWh`;
+//!   [`Regelzone::as_str`] is `FIFTY_HERTZ` and [`Regelzone::name`] is
+//!   *"50Hertz Transmission"*, because a code that has to survive a database
+//!   column does not start with a digit.
+//! - Where the market's own code **is** a single character, that is the code:
+//!   [`EicType::as_str`] is `"Y"`, because an EIC is quoted as
+//!   `10YDE-VE-------2` and spelling the same value `AREA` somewhere else
+//!   would be the second spelling this rule exists to prevent.
 //! - Parsing accepts a few **input aliases** — `WÄRME` for [`Sparte::Waerme`],
 //!   `DE-BY` for [`Bundesland::By`], `ÜNB` for [`MarktRolle::Uenb`] — which are
 //!   never written back. An alias is not a code and is deliberately absent from
@@ -191,6 +200,9 @@
 //!
 //! [`Holiday::as_str`]: holiday::Holiday::as_str
 //! [`Holiday::name`]: holiday::Holiday::name
+//! [`Regelzone::as_str`]: ids::Regelzone::as_str
+//! [`Regelzone::name`]: ids::Regelzone::name
+//! [`EicType::as_str`]: ids::EicType::as_str
 //! [`RegisterUnit::as_str`]: obis::RegisterUnit::as_str
 //! [`RegisterUnit::symbol`]: obis::RegisterUnit::symbol
 //! - [`ObisCode`]: `1-0:1.8.0`. The `*F` group is omitted when F is 255 ("not
@@ -407,6 +419,7 @@ mod wire;
 
 pub mod aggregation;
 pub mod aggregation_rule;
+pub mod allocation;
 pub mod calendar;
 pub mod classification;
 pub mod conversion;
@@ -430,6 +443,7 @@ pub mod reading;
 pub mod resample;
 pub mod resolution;
 pub mod rollout;
+pub mod session;
 pub mod sharing;
 pub mod substitute;
 pub mod validation;
@@ -438,8 +452,14 @@ pub mod zaehlzeit;
 
 // ── Re-exports ────────────────────────────────────────────────────────────────
 
-pub use aggregation::{AggregationConfig, BillingPeriod, aggregate};
+pub use aggregation::{
+    AggregationConfig, BillingPeriod, DirectionalEnergy, aggregate, sum_by_direction,
+};
 pub use aggregation_rule::{AggregationRule, VirtualMeterKind};
+pub use allocation::{
+    ALLOCATION_DP, AllocatedPart, AllocationBasis, AllocationError, AllocationPart, AllocationRow,
+    allocate, allocation_share, validate_key,
+};
 pub use calendar::{
     DayBoundary, DayKind, day_length, day_start_utc, gas_day_start_utc, intervals_in_day,
     local_day, local_gas_day,
@@ -456,9 +476,9 @@ pub use gas_slp::{
     SigLinDe, WeekdayFactors, allocation_temperature, gas_daily_quantity, kundenwert,
 };
 pub use holiday::{Bundesland, Holiday, slp_day_type};
-pub use ids::{BdewCode, CodeVergabestelle, MaloId, MaloIssuer, MeloId};
+pub use ids::{BdewCode, CodeVergabestelle, Eic, EicType, MaloId, MaloIssuer, MeloId, Regelzone};
 pub use imbalance::{ImbalanceSaldo, compute_imbalance};
-pub use interval::{MeasurementUnit, MeterInterval, QualityFlag, Sparte, UnitScale};
+pub use interval::{Direction, MeasurementUnit, MeterInterval, QualityFlag, Sparte, UnitScale};
 pub use lifecycle::{
     MeterExchangeEvent, MeterLifecycleEvent, MeterLifecycleEventType, MeterStatus,
 };
@@ -492,6 +512,7 @@ pub use rollout::{
     QuotaScope, ROLLOUT_MILESTONES, RolloutMilestone, RolloutObligation,
     classify_rollout_obligation, next_milestone,
 };
+pub use session::{MeterSample, SessionError, SessionSplitConfig, merge_sessions, split_session};
 pub use sharing::{
     Bilanzierungsmethode, Capability, Delivery, DeliveryEvidenceInput, EligibilityBasis, Finding,
     MeteringCapabilityInput, SharingReadiness, Zaehlertyp, assess_capability, assess_delivery,
@@ -505,8 +526,8 @@ pub use validation::{
     ValidationSeverity, validate_intervals,
 };
 pub use virtual_meter::{
-    ALLOCATION_DP, AllocationKey, CommunityInterval, GgvInterval, ParticipantAllocation,
-    VirtualMeterError, compute_community_allocation, compute_ggv_allocation, compute_virtual_meter,
+    AllocationKey, CommunityInterval, GgvInterval, ParticipantAllocation, VirtualMeterError,
+    compute_community_allocation, compute_ggv_allocation, compute_virtual_meter,
 };
 pub use zaehlzeit::{
     DayGroup, Modul3Conformance, Modul3Context, Modul3Finding, Quarter, ZaehlzeitFenster,

@@ -1059,8 +1059,8 @@ mod tests {
 
     // ── §14a Modul 3 ─────────────────────────────────────────────────────────
 
-    /// The reason the two-register type is gone: Modul 3 has three levels, and
-    /// every Netzbetreiber has had to offer it since 1 April 2025.
+    /// Modul 3 has three levels, not two, and every Netzbetreiber has had to
+    /// offer it since 1 April 2025.
     #[test]
     fn modul_3_resolves_three_registers() {
         let zzd = Zaehlzeitdefinition::modul_3(

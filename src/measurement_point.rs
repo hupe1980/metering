@@ -5,12 +5,31 @@
 //! the structural context that turns a bare [`crate::MeterInterval`] into a
 //! reading somebody can invoice.
 //!
-//! ## One type, one direction enum
+//! ## Purpose and direction are two questions
 //!
-//! [`EnergyFlow`] is the only direction enum here, and the register unit is
-//! **derived** from the OBIS code
-//! ([`ObisCode::register_unit`](crate::ObisCode::register_unit)) rather than
-//! stored — a stored unit can contradict the code that determines it.
+//! [`EnergyFlow`] is master data — what the point is *for*, including whether
+//! it is storage and whether it is bidirectional, neither of which any OBIS
+//! code states. [`Direction`] is the metered fact a register counts, and it
+//! comes from the OBIS code.
+//!
+//! Where both answer and disagree, [`MeasurementPoint::direction`] believes
+//! the code and [`MeasurementPoint::direction_conflict`] reports the
+//! disagreement — the only two facts on this type that are stated twice, and
+//! the reason the second one is a method rather than a silent tie-break.
+//!
+//! Everything else here is stated **once**: the register unit is derived from
+//! the OBIS code ([`ObisCode::register_unit`](crate::ObisCode::register_unit))
+//! rather than stored, because a stored unit can contradict the code that
+//! determines it.
+//!
+//! ## Which grid, and whose balance
+//!
+//! [`bilanzkreis`](MeasurementPoint::bilanzkreis) and
+//! [`bilanzierungsgebiet`](MeasurementPoint::bilanzierungsgebiet) are
+//! [`Eic`]s, the identifiers the market actually issues for them, so a MaBiS
+//! Summenzeitreihe can be grouped on a checked value rather than on free
+//! text — and [`Eic::regelzone`] reads the Regelzone straight off the
+//! Bilanzierungsgebiet's code.
 //!
 //! ## Relationship to MSCONS
 //!
@@ -40,8 +59,8 @@ use time::Date;
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
-use crate::ids::{BdewCode, MaloId, MeloId};
-use crate::interval::Sparte;
+use crate::ids::{BdewCode, Eic, MaloId, MeloId};
+use crate::interval::{Direction, Sparte};
 use crate::obis::{ObisCode, RegisterUnit};
 
 // ── MarktRolle ────────────────────────────────────────────────────────────────
@@ -148,12 +167,19 @@ impl MarktRolle {
 
 // ── EnergyFlow ────────────────────────────────────────────────────────────────
 
-/// Which way energy flows at this measurement point.
+/// What a measurement point is **for**.
 ///
-/// The **one** direction enum in this crate. It is master data — a statement of
-/// what the point is for — and the OBIS code is the metered fact. Where the two
-/// disagree, [`MeasurementPoint::is_bezug`] and
-/// [`is_einspeisung`](MeasurementPoint::is_einspeisung) believe the code.
+/// Master data — a statement of purpose — where
+/// [`Direction`] is the metered fact a register counts.
+/// The two are different questions and the answers have different arity: a
+/// battery's charge register counts `Import` but the point is a
+/// `StorageCharge`, and a four-quadrant meter at one connection is
+/// `Bidirectional` while each of its registers still counts exactly one way.
+///
+/// Where the declared purpose and the OBIS code disagree,
+/// [`MeasurementPoint::direction`] believes the **code** — it is what was
+/// measured — and [`MeasurementPoint::direction_conflict`] reports the
+/// disagreement rather than leaving it silent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[cfg_attr(feature = "serde", serde(rename_all = "SCREAMING_SNAKE_CASE"))]
@@ -214,6 +240,21 @@ impl EnergyFlow {
     #[must_use]
     pub const fn is_storage(self) -> bool {
         matches!(self, Self::StorageCharge | Self::StorageDischarge)
+    }
+
+    /// The flow direction this purpose implies, if it implies one.
+    ///
+    /// `None` for [`Bidirectional`](Self::Bidirectional), which is precisely
+    /// the case where neither direction is the point's purpose — reporting it
+    /// as `Import` because a four-quadrant meter usually draws would be a
+    /// guess dressed as master data.
+    #[must_use]
+    pub const fn direction(self) -> Option<Direction> {
+        match self {
+            Self::Consumption | Self::StorageCharge => Some(Direction::Import),
+            Self::Generation | Self::StorageDischarge => Some(Direction::Export),
+            Self::Bidirectional => None,
+        }
     }
 }
 
@@ -282,6 +323,28 @@ pub struct MeasurementPoint {
     /// market partner. Parse at the boundary.
     pub accountable_mp_id: BdewCode,
 
+    /// The **Bilanzkreis** this Marktlokation is assigned to.
+    ///
+    /// An [`Eic`], because that is what the market issues: BDEW
+    /// *Anwendungshilfe Energy Identification Codes* v1.0 gives a
+    /// Bilanzkreisverantwortlicher a `Y` code in the EIC function *Balance
+    /// Group*. Older Bilanzkreise carry an `X` code, a national usage the
+    /// ENTSO-E manual explicitly keeps valid for Germany, so
+    /// [`EicType`](crate::EicType) is **not** constrained here.
+    ///
+    /// `None` where the assignment is not known to this system — a MSB holds
+    /// meter data for points whose Bilanzkreis is the supplier's business.
+    pub bilanzkreis: Option<Eic>,
+
+    /// The **Bilanzierungsgebiet** this point lies in.
+    ///
+    /// A `Y` code in the EIC function *Metering Grid Area*, issued by the
+    /// Regelzonen-ÜNB. It is the grouping a MaBiS Summenzeitreihe is formed
+    /// per, and [`Eic::regelzone`] reads the Regelzone straight off it.
+    ///
+    /// `None` where it is not known.
+    pub bilanzierungsgebiet: Option<Eic>,
+
     /// `true` when this is a virtual/derived measurement point (GGV, Residuallast).
     pub is_virtual: bool,
 
@@ -313,41 +376,74 @@ impl MeasurementPoint {
         on_date >= self.valid_from && self.valid_to.is_none_or(|end| on_date <= end)
     }
 
-    /// `true` when this point measures Bezug — energy drawn from the grid.
+    /// Which way energy crosses this point.
     ///
     /// Decided by the **OBIS code**, which is the metered fact (direction is
-    /// value group C — see [`ObisCode::is_import`]), falling back to
-    /// [`energy_flow`](Self::energy_flow) only when the code carries no
-    /// direction, as a gas or heat code does not.
+    /// value group C — see [`ObisCode::direction`]), falling back to
+    /// [`energy_flow`](Self::energy_flow) only when the code carries none, as
+    /// a gas or heat code does not. `None` when neither answers: a gas volume
+    /// at a `Bidirectional` point states no direction anywhere.
     ///
-    /// Mutually exclusive with [`is_einspeisung`](Self::is_einspeisung) by
-    /// construction: a pair of predicates that can both be true is worse than
-    /// either being wrong, because nothing downstream can detect the
-    /// contradiction.
+    /// One value rather than a pair of predicates. Two booleans that can both
+    /// be `true` are worse than either being wrong, because nothing downstream
+    /// can detect the contradiction — and two that can both be `false` cannot
+    /// say whether the point has no direction or the caller forgot to set one.
     #[must_use]
-    pub fn is_bezug(&self) -> bool {
-        if self.obis_code.is_import() {
-            return true;
-        }
-        if self.obis_code.is_export() {
-            return false;
-        }
-        matches!(self.energy_flow, EnergyFlow::Consumption)
+    pub fn direction(&self) -> Option<Direction> {
+        self.obis_code
+            .direction()
+            .or_else(|| self.energy_flow.direction())
     }
 
-    /// `true` when this point measures Einspeisung — energy fed into the grid.
+    /// The two directions this point states, when they disagree.
     ///
-    /// The mirror of [`is_bezug`](Self::is_bezug), and mutually exclusive with
-    /// it by construction.
+    /// `Some((measured, declared))` — the direction the OBIS code counts, and
+    /// the one [`energy_flow`](Self::energy_flow) implies. `None` when they
+    /// agree, or when either says nothing.
+    ///
+    /// A `MeasurementPoint` holds the direction twice: once as the metered
+    /// fact and once as master data. That is not redundancy that could be
+    /// removed — [`EnergyFlow`] also distinguishes storage from load, which no
+    /// OBIS code does — so the crate's answer is the other one it uses
+    /// wherever a fact is stated twice: make the disagreement **reportable**
+    /// rather than resolving it silently.
+    ///
+    /// ```rust
+    /// # use metering::{Direction, EnergyFlow, MeasurementPoint, MarktRolle, ObisCode, Sparte};
+    /// # use rust_decimal::Decimal;
+    /// # use time::macros::date;
+    /// let mut mp = MeasurementPoint {
+    ///     malo_id: "51238696781".parse()?,
+    ///     melo_id: None,
+    ///     meter_serial: None,
+    ///     obis_code: ObisCode::STROM_BEZUG_TOTAL,
+    ///     sparte: Sparte::Strom,
+    ///     energy_flow: EnergyFlow::Generation, // ← contradicts the code
+    ///     accountable_role: MarktRolle::Lf,
+    ///     accountable_mp_id: "9900987654321".parse()?,
+    ///     bilanzkreis: None,
+    ///     bilanzierungsgebiet: None,
+    ///     is_virtual: false,
+    ///     wandler_factor: Decimal::ONE,
+    ///     valid_from: date!(2026 - 01 - 01),
+    ///     valid_to: None,
+    /// };
+    ///
+    /// assert_eq!(mp.direction(), Some(Direction::Import), "the code wins");
+    /// assert_eq!(
+    ///     mp.direction_conflict(),
+    ///     Some((Direction::Import, Direction::Export)),
+    /// );
+    ///
+    /// mp.energy_flow = EnergyFlow::Consumption;
+    /// assert_eq!(mp.direction_conflict(), None);
+    /// # Ok::<(), metering::ParseError>(())
+    /// ```
     #[must_use]
-    pub fn is_einspeisung(&self) -> bool {
-        if self.obis_code.is_export() {
-            return true;
-        }
-        if self.obis_code.is_import() {
-            return false;
-        }
-        matches!(self.energy_flow, EnergyFlow::Generation)
+    pub fn direction_conflict(&self) -> Option<(Direction, Direction)> {
+        let measured = self.obis_code.direction()?;
+        let declared = self.energy_flow.direction()?;
+        (measured != declared).then_some((measured, declared))
     }
 
     /// `true` when this point measures Blindarbeit / Blindleistung —
@@ -408,6 +504,8 @@ mod tests {
             energy_flow: EnergyFlow::Consumption,
             accountable_role: MarktRolle::Lf,
             accountable_mp_id: "9900987654321".parse().unwrap(),
+            bilanzkreis: None,
+            bilanzierungsgebiet: None,
             is_virtual: false,
             wandler_factor: Decimal::ONE,
             valid_from: date!(2026 - 01 - 01),
@@ -438,8 +536,7 @@ mod tests {
     #[test]
     fn bezug_detection() {
         let mp = bezug_point();
-        assert!(mp.is_bezug());
-        assert!(!mp.is_einspeisung());
+        assert_eq!(mp.direction(), Some(Direction::Import));
     }
 
     #[test]
@@ -447,8 +544,7 @@ mod tests {
         let mut mp = bezug_point();
         mp.obis_code = ObisCode::STROM_EINSPEISUNG_TOTAL;
         mp.energy_flow = EnergyFlow::Generation;
-        assert!(mp.is_einspeisung());
-        assert!(!mp.is_bezug());
+        assert_eq!(mp.direction(), Some(Direction::Export));
     }
 
     #[test]
@@ -502,28 +598,46 @@ mod tests {
         assert_eq!(mp.tariff_register(), Some(2));
     }
 
-    /// The direction predicates are mutually exclusive — the invariant that
-    /// had to be fixed twice while the concept existed twice.
+    /// One direction, from the metered code where there is one and from the
+    /// master data otherwise — and the disagreement is reported, not resolved
+    /// in silence.
     #[test]
-    fn direction_predicates_are_mutually_exclusive() {
+    fn the_metered_code_decides_the_direction_and_a_conflict_is_reported() {
         let mut mp = bezug_point();
         // Master data and the OBIS code disagree on purpose.
         mp.energy_flow = EnergyFlow::Generation;
         mp.obis_code = ObisCode::STROM_BEZUG_TOTAL;
-        assert!(mp.is_bezug(), "the metered code wins");
-        assert!(!mp.is_einspeisung());
+        assert_eq!(mp.direction(), Some(Direction::Import), "the code wins");
+        assert_eq!(
+            mp.direction_conflict(),
+            Some((Direction::Import, Direction::Export)),
+        );
 
-        // ...and where the code carries no direction, the master data decides.
+        // ...and where the code carries no direction, the master data decides
+        // — with nothing to conflict with.
         mp.obis_code = ObisCode::GAS_VOLUME_M3;
-        assert!(!mp.is_bezug());
-        assert!(mp.is_einspeisung());
+        assert_eq!(mp.direction(), Some(Direction::Export));
+        assert_eq!(mp.direction_conflict(), None);
 
+        // A bidirectional point declares no direction, so a gas volume there
+        // has none at all. `None` is the honest answer, not `Import`.
+        mp.energy_flow = EnergyFlow::Bidirectional;
+        assert_eq!(mp.direction(), None);
+
+        // Storage is a purpose, not a third direction.
+        mp.energy_flow = EnergyFlow::StorageCharge;
+        assert_eq!(mp.direction(), Some(Direction::Import));
+        mp.energy_flow = EnergyFlow::StorageDischarge;
+        assert_eq!(mp.direction(), Some(Direction::Export));
+
+        // Whatever the master data says, the code and the flow never produce
+        // two directions at once.
         for flow in EnergyFlow::ALL {
             mp.energy_flow = flow;
-            assert!(
-                !(mp.is_bezug() && mp.is_einspeisung()),
-                "{flow:?} must not be both"
-            );
+            for code in [ObisCode::STROM_BEZUG_TOTAL, ObisCode::GAS_VOLUME_M3] {
+                mp.obis_code = code;
+                assert!(mp.direction().is_some() || flow == EnergyFlow::Bidirectional);
+            }
         }
     }
 

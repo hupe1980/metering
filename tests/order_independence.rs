@@ -23,11 +23,12 @@
 //! asserted over random input, for every function the crate makes the claim
 //! about.
 
+use metering::session::{MeterSample, SessionSplitConfig, merge_sessions, split_session};
 use metering::{
-    AggregationConfig, DayBoundary, FillGapsConfig, IntervalResolution, LastgangConfig,
-    MeterInterval, MeterReading, QualityConfig, QualityFlag, ResampleConfig, ValidationConfig,
-    ValidationRuleId, Zaehlzeitdefinition, aggregate, fill_gaps, resample, score_intervals,
-    to_lastgang, validate_intervals,
+    AggregationConfig, AllocationBasis, AllocationPart, DayBoundary, FillGapsConfig,
+    IntervalResolution, LastgangConfig, MeterInterval, MeterReading, QualityConfig, QualityFlag,
+    ResampleConfig, ValidationConfig, ValidationRuleId, Zaehlzeitdefinition, aggregate, allocate,
+    fill_gaps, resample, score_intervals, sum_by_direction, to_lastgang, validate_intervals,
 };
 use proptest::prelude::*;
 use rust_decimal::Decimal;
@@ -341,5 +342,149 @@ proptest! {
             QualityFlag::worst_of(flags.iter().copied()),
             QualityFlag::worst_of(reversed.iter().copied()),
         );
+    }
+}
+
+// ── allocation, sessions and the directional balance ─────────────────────────
+
+/// Weighted, optionally ceilinged claims on a pool. Proportional only: a
+/// `Fraction` key's validity depends on the weights summing to at most 1, and
+/// the property here is about order, not about the guard.
+fn arb_parts() -> impl Strategy<Value = Vec<AllocationPart>> {
+    prop::collection::vec(
+        (
+            prop_oneof![
+                (0i64..40).prop_map(|n| Decimal::new(n * 500, 3)),
+                (0i64..40_000).prop_map(|milli| Decimal::new(milli, 3)),
+            ],
+            prop::option::of((0i64..40_000).prop_map(|milli| Decimal::new(milli, 3))),
+        ),
+        0..6,
+    )
+    .prop_map(|rows| {
+        rows.into_iter()
+            .enumerate()
+            .map(|(i, (weight, capacity))| {
+                let part = AllocationPart::new(format!("P{i}"), weight);
+                match capacity {
+                    Some(cap) => part.capped_at(cap),
+                    None => part,
+                }
+            })
+            .collect()
+    })
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
+
+    /// Shuffling the parts permutes the rows and changes nothing else. The
+    /// proportional denominator is a sum and the ceiling is per part, so this
+    /// has to hold — and a ceiling is exactly the kind of tie that hid the
+    /// two defects this file was written for.
+    #[test]
+    fn allocation_is_order_independent(
+        total in (0i64..40_000).prop_map(|milli| Decimal::new(milli, 3)),
+        parts in arb_parts(),
+    ) {
+        let mut reversed = parts.clone();
+        reversed.reverse();
+        let forward = allocate(total, parts, AllocationBasis::Proportional).unwrap();
+        let backward = allocate(total, reversed, AllocationBasis::Proportional).unwrap();
+
+        prop_assert_eq!(forward.residual, backward.residual);
+        prop_assert_eq!(forward.allocated(), backward.allocated());
+        for part in &forward.parts {
+            prop_assert_eq!(
+                Some(part.allocated),
+                backward.part(&part.key).map(|p| p.allocated),
+            );
+        }
+    }
+
+    /// Register readings describe the shape of a session, not the order they
+    /// were collected in — an OCPP backlog flushed out of sequence must place
+    /// the same kWh in the same slots.
+    #[test]
+    fn a_session_split_is_order_independent(
+        span in 60i64..40_000,
+        steps in prop::collection::vec(1i64..5_000, 0..5),
+        energy in (0i64..40_000).prop_map(|milli| Decimal::new(milli, 3)),
+    ) {
+        let from = BASE + Duration::seconds(37);
+        let to = from + Duration::seconds(span);
+
+        let mut at = from;
+        let mut reading = Decimal::ZERO;
+        let mut placed = Decimal::ZERO;
+        let mut samples = Vec::new();
+        for step in steps {
+            at += Duration::seconds(step);
+            if at >= to {
+                break;
+            }
+            let delta = (energy - placed) / Decimal::from(4u32);
+            placed += delta;
+            reading += delta;
+            samples.push(MeterSample::new(at, reading));
+        }
+
+        let cfg = SessionSplitConfig::quarter_hourly();
+        let mut reversed = samples.clone();
+        reversed.reverse();
+        prop_assert_eq!(
+            split_session(from, to, energy, &samples, &cfg),
+            split_session(from, to, energy, &reversed, &cfg),
+        );
+    }
+
+    /// Merging groups by slot and folds the quality with `worse_of`, whose
+    /// ranks are a strict total order — so which session was listed first
+    /// cannot reach the answer. This is the exact shape of the two defects
+    /// this file exists for.
+    #[test]
+    fn merging_sessions_is_order_independent(
+        offsets in prop::collection::vec(0i64..7_200, 1..5),
+        energies in prop::collection::vec(
+            (0i64..40_000).prop_map(|milli| Decimal::new(milli, 3)),
+            1..5,
+        ),
+    ) {
+        let cfg = SessionSplitConfig::quarter_hourly();
+        let series: Vec<Vec<MeterInterval>> = offsets
+            .iter()
+            .zip(energies.iter().cycle())
+            .map(|(offset, energy)| {
+                let from = BASE + Duration::seconds(*offset);
+                split_session(from, from + Duration::minutes(37), *energy, &[], &cfg).unwrap()
+            })
+            .collect();
+
+        let mut reversed = series.clone();
+        reversed.reverse();
+        prop_assert_eq!(merge_sessions(&series), merge_sessions(&reversed));
+    }
+
+    /// Three running sums, so the balance cannot depend on the slice order.
+    #[test]
+    fn the_directional_balance_is_order_independent(samples in arb_series()) {
+        let codes = ["1-0:1.8.0", "1-0:2.8.0", "1-0:3.8.0"];
+        let tag = |ivs: Vec<MeterInterval>| -> Vec<MeterInterval> {
+            ivs.into_iter()
+                .enumerate()
+                .map(|(i, iv)| MeterInterval { obis_code: Some(codes[i % 3].parse().unwrap()), ..iv })
+                .collect()
+        };
+        let (sorted, shuffled) = both_orders(&samples);
+        // Tag by slot, not by position, so both orders carry the same codes.
+        let by_slot = |ivs: Vec<MeterInterval>| -> Vec<MeterInterval> {
+            let mut v = ivs;
+            v.sort_by_key(|iv| iv.from);
+            tag(v)
+        };
+        let a = sum_by_direction(&by_slot(sorted));
+        let mut b = by_slot(shuffled);
+        b.reverse();
+        prop_assert_eq!(a, sum_by_direction(&b));
     }
 }

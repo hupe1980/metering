@@ -315,6 +315,111 @@ impl DayBoundary {
     pub fn year_end_utc(self, year: i32) -> OffsetDateTime {
         self.day_start_utc(jan_first(year + 1))
     }
+
+    /// The day `day` as a half-open UTC range `[start, end)`.
+    ///
+    /// The same two instants [`day_start_utc`](Self::day_start_utc) and
+    /// [`day_end_utc`](Self::day_end_utc) return, as the pair every period
+    /// consumer here takes — [`AggregationConfig::over_period`](crate::AggregationConfig::over_period), a validation
+    /// window, a resample bound.
+    #[must_use]
+    pub fn day_range_utc(self, day: Date) -> (OffsetDateTime, OffsetDateTime) {
+        (self.day_start_utc(day), self.day_end_utc(day))
+    }
+
+    /// The month containing `day` as a half-open UTC range `[start, end)`.
+    #[must_use]
+    pub fn month_range_utc(self, day: Date) -> (OffsetDateTime, OffsetDateTime) {
+        (self.month_start_utc(day), self.month_end_utc(day))
+    }
+
+    /// The year `year` as a half-open UTC range `[start, end)`.
+    #[must_use]
+    pub fn year_range_utc(self, year: i32) -> (OffsetDateTime, OffsetDateTime) {
+        (self.year_start_utc(year), self.year_end_utc(year))
+    }
+
+    /// The **Bilanzierungsmonat** named by a year and a month, as a half-open
+    /// UTC range.
+    ///
+    /// The settlement month of MaBiS and GaBi, addressed the way the market
+    /// addresses it — *"Juni 2021"* — rather than by a date the caller has to
+    /// construct first. Both boundaries are the same passage of EDI@Energy
+    /// *Allgemeine Festlegungen* v6.1c Kap. 3.1, quoted on this type: Strom
+    /// runs 00:00 to 00:00, Gas 06:00 to 06:00, and neither is a fixed number
+    /// of hours because the month may contain a DST transition.
+    ///
+    /// ```rust
+    /// use metering::calendar::DayBoundary;
+    /// use time::Month;
+    /// use time::macros::datetime;
+    ///
+    /// // March 2026 contains the spring-forward Sunday, so the electricity
+    /// // Bilanzierungsmonat is one hour short of 31 days.
+    /// let (from, to) = DayBoundary::Midnight.bilanzierungsmonat(2026, Month::March);
+    /// assert_eq!(from, datetime!(2026-02-28 23:00 UTC));
+    /// assert_eq!(to, datetime!(2026-03-31 22:00 UTC));
+    /// assert_eq!((to - from).whole_hours(), 31 * 24 - 1);
+    ///
+    /// // The gas month is the same span, shifted six hours.
+    /// let (gas_from, gas_to) = DayBoundary::Gastag.bilanzierungsmonat(2026, Month::March);
+    /// assert_eq!(gas_from, datetime!(2026-03-01 5:00 UTC));
+    /// assert_eq!(gas_to, datetime!(2026-04-01 4:00 UTC));
+    /// ```
+    #[must_use]
+    pub fn bilanzierungsmonat(self, year: i32, month: Month) -> (OffsetDateTime, OffsetDateTime) {
+        let first = first_of(year, month);
+        (self.day_start_utc(first), self.month_end_utc(first))
+    }
+
+    /// The half-open bucket `[start, end)` of `resolution` that contains `ts`.
+    ///
+    /// Day, month and year buckets are Europe/Berlin calendar periods cut on
+    /// this boundary, so their duration is whatever the calendar says — 23, 24
+    /// or 25 hours for a day; 28 to 31 days ±1 hour for a month. Sub-daily
+    /// buckets snap in UTC, which coincides with local snapping because every
+    /// Berlin offset is a whole number of hours.
+    ///
+    /// One implementation, shared by [`crate::resample()`] and
+    /// [`crate::session::split_session`]: the grid a series is aggregated onto
+    /// and the grid a session is distributed across have to be the same grid,
+    /// or energy moves between slots on the way through.
+    ///
+    /// ```rust
+    /// use metering::calendar::DayBoundary;
+    /// use metering::IntervalResolution;
+    /// use time::macros::datetime;
+    ///
+    /// let (from, to) = DayBoundary::Midnight
+    ///     .bucket_bounds(datetime!(2026-06-01 12:07 UTC), IntervalResolution::QuarterHour);
+    /// assert_eq!(from, datetime!(2026-06-01 12:00 UTC));
+    /// assert_eq!(to, datetime!(2026-06-01 12:15 UTC));
+    /// ```
+    #[must_use]
+    pub fn bucket_bounds(
+        self,
+        ts: OffsetDateTime,
+        resolution: IntervalResolution,
+    ) -> (OffsetDateTime, OffsetDateTime) {
+        match resolution {
+            IntervalResolution::Day => self.day_range_utc(self.local_day(ts)),
+            IntervalResolution::Month => self.month_range_utc(self.local_day(ts)),
+            IntervalResolution::Year => self.year_range_utc(self.local_year(ts)),
+            // Fixed-length resolutions: snap the Unix timestamp onto the grid.
+            // `fixed_seconds` answers `Some` for every one of them — a
+            // `CustomSeconds` cannot be zero — so the fallback is unreachable
+            // and exists only so this function is total without an `expect`.
+            fixed => {
+                let Some(secs) = fixed.fixed_seconds() else {
+                    return (ts, ts + Duration::seconds(1));
+                };
+                let s = i64::from(secs);
+                let snapped = ts.unix_timestamp().div_euclid(s) * s;
+                let start = OffsetDateTime::from_unix_timestamp(snapped).unwrap_or(ts);
+                (start, start + Duration::seconds(s))
+            }
+        }
+    }
 }
 
 /// The UTC instant at which the **Gastag** `day` begins — 06:00 Europe/Berlin.
@@ -771,7 +876,17 @@ fn first_of_next_month(day: Date) -> Date {
 }
 
 fn jan_first(year: i32) -> Date {
-    Date::from_calendar_date(year, Month::January, 1).unwrap_or(Date::MIN)
+    first_of(year, Month::January)
+}
+
+/// The first of `month` in `year`.
+///
+/// Total, like every other date helper here: the only input
+/// `Date::from_calendar_date` rejects for a first-of-month is a year outside
+/// `time`'s own range, and answering `Date::MIN` there keeps the whole
+/// calendar API free of an `Option` nothing in the German market can produce.
+fn first_of(year: i32, month: Month) -> Date {
+    Date::from_calendar_date(year, month, 1).unwrap_or(Date::MIN)
 }
 
 // ── tests ─────────────────────────────────────────────────────────────────────

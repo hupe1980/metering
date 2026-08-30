@@ -198,3 +198,18 @@ What does **not** carry over is `pool_cap`: § 42c contains no counterpart to
 ceiling. Eligibility — which delivery points can produce quarter-hour values at
 all — is [`sharing`](@/docs/regulatory-basis.md), a separate question from the
 allocation.
+
+## One arithmetic underneath
+
+`compute_community_allocation` is `allocation::allocate` applied once per
+quarter-hour: the generation is the pool, each participant's own draw is the
+ceiling, and the `AllocationKey` decides only how a weight becomes a share.
+`compute_ggv_allocation` applies the same cut and the same cap for one tenant.
+
+That matters beyond tidiness. The `Pos()` operator, the `ALLOCATION_DP` cut and
+the residual are defined in exactly one place, so a § 42b settlement, a § 42c
+contract key and a rule this crate has never heard of — a per-session split
+behind a charge-point Übergabestelle, say — cannot disagree about them.
+
+Any key the statutes do not publish is expressible directly:
+[Sessions and allocation](@/docs/sessions-and-allocation.md).

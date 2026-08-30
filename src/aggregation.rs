@@ -258,6 +258,103 @@ pub fn aggregate(intervals: &[MeterInterval], config: &AggregationConfig) -> Bil
     }
 }
 
+// ── directional balance ───────────────────────────────────────────────────────
+
+/// The energy that crossed a measurement point, split by
+/// [`Direction`](crate::Direction).
+///
+/// Three buckets, not two: an interval whose OBIS code has no direction — a
+/// reactive register, a gas volume, or no code at all — is counted in
+/// [`undirected`](Self::undirected) rather than silently dropped, so
+/// `import + export + undirected` is always the plain sum of the input and no
+/// energy disappears between the call and the result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct DirectionalEnergy {
+    /// Bezug — the sum over intervals whose code counts C = 1.
+    pub import: Decimal,
+    /// Einspeisung — the sum over intervals whose code counts C = 2.
+    pub export: Decimal,
+    /// Everything with no direction to read: no OBIS code, or a code that
+    /// counts something other than a directed active energy.
+    pub undirected: Decimal,
+}
+
+impl DirectionalEnergy {
+    /// `import − export` — the net flow across the point.
+    ///
+    /// Positive when the point drew more than it fed back. Excludes
+    /// [`undirected`](Self::undirected), which by definition has no side to
+    /// fall on.
+    #[must_use]
+    pub fn net(&self) -> Decimal {
+        self.import - self.export
+    }
+
+    /// `import + export + undirected` — the plain sum of everything counted.
+    #[must_use]
+    pub fn total(&self) -> Decimal {
+        self.import + self.export + self.undirected
+    }
+}
+
+/// Sum a series by flow direction.
+///
+/// The conservation check for a bidirectional measurement point. A charge
+/// point that supports V2G, a battery, a PV roof behind the grid meter — each
+/// delivers a Bezug *and* an Einspeisung series for the same quarter-hour, and
+/// an allocation of that point's energy is only correct if both sides balance:
+///
+/// ```rust
+/// use metering::{Direction, MeterInterval, QualityFlag, aggregation::sum_by_direction};
+/// use rust_decimal::dec;
+/// use time::macros::datetime;
+///
+/// let iv = |code: &str, kwh| MeterInterval {
+///     from: datetime!(2026-06-01 12:00 UTC),
+///     to:   datetime!(2026-06-01 12:15 UTC),
+///     value: kwh,
+///     quality: QualityFlag::Measured,
+///     obis_code: Some(code.parse().unwrap()),
+/// };
+///
+/// let grid = [iv("1-0:1.8.0", dec!(9)), iv("1-0:2.8.0", dec!(4))];
+/// let allocated = [
+///     iv("1-0:1.8.0", dec!(5)), iv("1-0:1.8.0", dec!(4)),   // two sessions
+///     iv("1-0:2.8.0", dec!(4)),                             // one discharge
+/// ];
+///
+/// let measured = sum_by_direction(&grid);
+/// let split = sum_by_direction(&allocated);
+///
+/// assert_eq!(measured.import - split.import, dec!(0));
+/// assert_eq!(measured.export - split.export, dec!(0));
+/// assert_eq!(measured.net(), dec!(5));
+/// ```
+///
+/// ## Every interval counts, billable or not
+///
+/// [`aggregate`] sums only the billable ones, because it answers *"can this
+/// period be invoiced"*. This is a **physical** balance — an allocation that
+/// drops a `Faulty` quarter-hour has still lost that energy — so it counts
+/// everything it is given. The divergence is the same one
+/// [`BillingPeriod::coverage_pct`] documents against
+/// [`QualityReport::coverage_pct`](crate::QualityReport::coverage_pct).
+///
+/// Order-independent: three sums, one pass, no allocation.
+#[must_use]
+pub fn sum_by_direction(intervals: &[MeterInterval]) -> DirectionalEnergy {
+    let mut out = DirectionalEnergy::default();
+    for iv in intervals {
+        match iv.direction() {
+            Some(crate::interval::Direction::Import) => out.import += iv.value,
+            Some(crate::interval::Direction::Export) => out.export += iv.value,
+            None => out.undirected += iv.value,
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1,7 +1,7 @@
 [package]
 name         = "metering"
-description  = "German energy metering domain library — DST-correct Europe/Berlin calendar arithmetic on both the Liefertag and the 06:00 Gastag, gas m3→kWh_Hs conversion, SigLinDe gas SLP, billing-period aggregation, Ersatzwertbildung, a robust validation engine, para 14a netzorientierte Steuerung and Modul 3 registers, para 42b/42c allocation, check-digit-validated MaLo-IDs and SLP/RLM/iMSys classification. Zero I/O, no async, no clock, exact decimal quantities."
-version      = "0.20.0"
+description  = "German energy metering domain library — DST-correct Europe/Berlin calendar arithmetic on both the Liefertag and the 06:00 Gastag, gas m3→kWh_Hs conversion, SigLinDe gas SLP, billing-period aggregation, Ersatzwertbildung, a robust validation engine, para 14a netzorientierte Steuerung and Modul 3 registers, conservation-checked allocation for para 42b/42c, charging sessions onto the settlement grid, check-digit-validated MaLo-IDs and EICs, and SLP/RLM/iMSys classification. Zero I/O, no async, no clock, exact decimal quantities."
+version      = "0.21.0"
 authors      = ["hupe1980"]
 edition      = "2024"
 license      = "MIT OR Apache-2.0"

@@ -1134,3 +1134,230 @@ fn unsymmetrie_section() {
     assert!(by_kw.within_limit(None));
     assert!(!by_kva.within_limit(None));
 }
+
+/// Docs — "Market identifiers", the EIC section.
+#[test]
+fn eic_section() {
+    use metering::ids::{Eic, EicType};
+
+    let regelzone: Eic = "10YDE-VE-------2".parse().unwrap();
+    assert_eq!(regelzone.object_type(), Some(EicType::Area));
+    assert_eq!(regelzone.issuing_office(), "10");
+
+    assert!("10YED-VE-------2".parse::<Eic>().is_err());
+}
+
+/// Docs — "Time and the calendar", the Bilanzierungsmonat.
+#[test]
+fn bilanzierungsmonat_section() {
+    use metering::calendar::DayBoundary;
+    use time::Month;
+
+    let (from, to) = DayBoundary::Midnight.bilanzierungsmonat(2026, Month::March);
+    assert_eq!(from, datetime!(2026-02-28 23:00 UTC));
+    assert_eq!(to, datetime!(2026-03-31 22:00 UTC));
+    assert_eq!((to - from).whole_hours(), 31 * 24 - 1);
+
+    let (gas_from, gas_to) = DayBoundary::Gastag.bilanzierungsmonat(2026, Month::March);
+    assert_eq!(gas_from, datetime!(2026-03-01 5:00 UTC));
+    assert_eq!(gas_to, datetime!(2026-04-01 4:00 UTC));
+}
+
+/// Docs — "Time and the calendar", the one grid every consumer buckets on.
+#[test]
+fn bucket_bounds_section() {
+    use metering::calendar::DayBoundary;
+
+    let (from, to) = DayBoundary::Midnight.bucket_bounds(
+        datetime!(2026-06-01 12:07 UTC),
+        IntervalResolution::QuarterHour,
+    );
+    assert_eq!(from, datetime!(2026-06-01 12:00 UTC));
+    assert_eq!(to, datetime!(2026-06-01 12:15 UTC));
+}
+
+/// Docs — "Sessions and allocation", clock-aligned samples make the middle
+/// slots exact.
+#[test]
+fn session_split_section() {
+    use metering::session::{MeterSample, SessionSplitConfig, split_session};
+    use rust_decimal::Decimal;
+
+    let samples = [
+        MeterSample::new(datetime!(2026-06-01 12:15 UTC), dec!(1000)),
+        MeterSample::new(datetime!(2026-06-01 12:30 UTC), dec!(1006)),
+    ];
+
+    let slots = split_session(
+        datetime!(2026-06-01 12:07 UTC),
+        datetime!(2026-06-01 12:37 UTC),
+        dec!(10),
+        &samples,
+        &SessionSplitConfig::quarter_hourly(),
+    )
+    .unwrap();
+
+    assert_eq!(slots[1].value, dec!(6));
+    assert_eq!(slots[1].quality, QualityFlag::Measured);
+    assert_eq!(slots[0].quality, QualityFlag::Estimated);
+    assert_eq!(slots[2].quality, QualityFlag::Estimated);
+    assert_eq!(slots.iter().map(|s| s.value).sum::<Decimal>(), dec!(10));
+}
+
+/// Docs — "Sessions and allocation", the DST grid is the calendar's.
+#[test]
+fn session_split_long_day_section() {
+    use metering::session::{SessionSplitConfig, split_session};
+    use rust_decimal::Decimal;
+
+    let long_day = date!(2026 - 10 - 25);
+    let slots = split_session(
+        calendar::day_start_utc(long_day),
+        calendar::day_end_utc(long_day),
+        dec!(100),
+        &[],
+        &SessionSplitConfig::quarter_hourly(),
+    )
+    .unwrap();
+
+    assert_eq!(slots.len(), 100);
+    assert_eq!(slots.iter().map(|s| s.value).sum::<Decimal>(), dec!(100));
+}
+
+/// Docs — "Sessions and allocation", one pool across many claims.
+#[test]
+fn allocate_section() {
+    use metering::allocation::{AllocationBasis, AllocationPart, allocate};
+
+    let row = allocate(
+        dec!(12),
+        vec![
+            AllocationPart::new("S1", dec!(6)).capped_at(dec!(6)),
+            AllocationPart::new("S2", dec!(3)).capped_at(dec!(3)),
+            AllocationPart::new("S3", dec!(3)).capped_at(dec!(1)),
+        ],
+        AllocationBasis::Proportional,
+    )
+    .unwrap();
+
+    assert_eq!(row.part("S3").unwrap().share, dec!(3));
+    assert_eq!(row.part("S3").unwrap().allocated, dec!(1));
+    assert!(row.part("S3").unwrap().capped());
+    assert_eq!(row.residual, dec!(2));
+    assert_eq!(row.allocated() + row.residual, row.total);
+}
+
+/// Docs — "Sessions and allocation", the directional balance of a
+/// bidirectional Zählpunkt.
+#[test]
+fn directional_balance_section() {
+    use metering::Direction;
+    use metering::aggregation::sum_by_direction;
+
+    let iv = |code: &str, kwh| MeterInterval {
+        from: datetime!(2026-06-01 12:00 UTC),
+        to: datetime!(2026-06-01 12:15 UTC),
+        value: kwh,
+        quality: QualityFlag::Measured,
+        obis_code: Some(code.parse().unwrap()),
+    };
+
+    let grid = [iv("1-0:1.8.0", dec!(9)), iv("1-0:2.8.0", dec!(4))];
+    let allocated = [
+        iv("1-0:1.8.0", dec!(5)),
+        iv("1-0:1.8.0", dec!(4)),
+        iv("1-0:2.8.0", dec!(4)),
+    ];
+
+    let measured = sum_by_direction(&grid);
+    let split = sum_by_direction(&allocated);
+
+    assert_eq!(measured.import - split.import, dec!(0));
+    assert_eq!(measured.export - split.export, dec!(0));
+    assert_eq!(measured.net(), dec!(5));
+    assert_eq!(
+        iv("1-0:2.8.0", dec!(1)).direction(),
+        Some(Direction::Export)
+    );
+}
+
+/// Docs — "Market identifiers", the Regelzone in position 4 of a
+/// Bilanzierungsgebiet EIC.
+#[test]
+fn regelzone_section() {
+    use metering::ids::{Eic, Regelzone};
+
+    let bg: Eic = "11YR-AMPRION-BG9".parse().unwrap();
+    assert_eq!(bg.regelzone(), Some(Regelzone::Amprion));
+    assert!(bg.is_german());
+
+    assert_eq!(
+        Regelzone::Amprion.control_area_eic().to_string(),
+        "10YDE-RWENET---I",
+    );
+    assert_eq!(Regelzone::Amprion.control_area_eic().regelzone(), None);
+}
+
+/// Docs — "Sessions and allocation", adding sessions up.
+#[test]
+fn merge_sessions_section() {
+    use metering::session::{SessionSplitConfig, merge_sessions, split_session};
+    use rust_decimal::Decimal;
+
+    let cfg = SessionSplitConfig::quarter_hourly();
+
+    let a = split_session(
+        datetime!(2026-06-01 12:00 UTC),
+        datetime!(2026-06-01 12:30 UTC),
+        dec!(8),
+        &[],
+        &cfg,
+    )
+    .unwrap();
+    let b = split_session(
+        datetime!(2026-06-01 12:15 UTC),
+        datetime!(2026-06-01 12:45 UTC),
+        dec!(4),
+        &[],
+        &cfg,
+    )
+    .unwrap();
+
+    let merged = merge_sessions(&[a, b]);
+    assert_eq!(merged.len(), 3);
+    assert_eq!(merged[1].value, dec!(6));
+    assert_eq!(merged.iter().map(|s| s.value).sum::<Decimal>(), dec!(12));
+}
+
+/// Docs — "Sessions and allocation", direction on a measurement point.
+#[test]
+fn measurement_point_direction_section() {
+    use metering::{Direction, EnergyFlow, MarktRolle, MeasurementPoint, Sparte};
+    use rust_decimal::Decimal;
+
+    let mut mp = MeasurementPoint {
+        malo_id: "51238696781".parse().unwrap(),
+        melo_id: None,
+        meter_serial: None,
+        obis_code: ObisCode::STROM_BEZUG_TOTAL,
+        sparte: Sparte::Strom,
+        energy_flow: EnergyFlow::Generation,
+        accountable_role: MarktRolle::Lf,
+        accountable_mp_id: "9900987654321".parse().unwrap(),
+        bilanzkreis: None,
+        bilanzierungsgebiet: None,
+        is_virtual: false,
+        wandler_factor: Decimal::ONE,
+        valid_from: date!(2026 - 01 - 01),
+        valid_to: None,
+    };
+
+    assert_eq!(mp.direction(), Some(Direction::Import));
+    assert_eq!(
+        mp.direction_conflict(),
+        Some((Direction::Import, Direction::Export))
+    );
+
+    mp.energy_flow = EnergyFlow::Consumption;
+    assert_eq!(mp.direction_conflict(), None);
+}

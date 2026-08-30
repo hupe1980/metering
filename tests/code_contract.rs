@@ -120,7 +120,7 @@ fn every_coded_enum_holds_the_contract() {
     use metering::classification::SeriesOrigin;
     use metering::conversion::G685FinalRounding;
     use metering::holiday::Holiday;
-    use metering::ids::{CodeVergabestelle, MaloIssuer};
+    use metering::ids::{CodeVergabestelle, EicType, MaloIssuer, Regelzone};
     use metering::lifecycle::{MeterLifecycleEventType, MeterStatus};
     use metering::load_profile::SlpDayType;
     use metering::measurement_series::ProvenanceEventType;
@@ -132,10 +132,13 @@ fn every_coded_enum_holds_the_contract() {
     // interval / quantities
     assert_contract!(Sparte);
     assert_contract!(QualityFlag);
+    assert_contract!(Direction);
 
     // identifiers and channels
     assert_contract!(MaloIssuer);
     assert_contract!(CodeVergabestelle);
+    assert_contract!(EicType);
+    assert_contract!(Regelzone);
     assert_contract!(RegisterUnit);
     assert_contract!(Phase);
 
@@ -169,6 +172,7 @@ fn every_coded_enum_holds_the_contract() {
     assert_contract!(MeterStatus);
     assert_contract!(MeterLifecycleEventType);
     assert_contract!(VirtualMeterKind);
+    assert_contract!(AllocationBasis);
 
     // regulatory classification
     assert_contract!(SteuVeFallgruppe);
@@ -230,6 +234,20 @@ fn input_aliases_normalise_onto_the_canonical_code() {
     assert_eq!("ÜNB".parse::<MarktRolle>().unwrap(), MarktRolle::Uenb);
     assert_eq!(MarktRolle::Uenb.abbreviation(), "ÜNB");
     assert_eq!(MarktRolle::Uenb.as_str(), "UENB");
+
+    // The market says Bezug and Einspeisung; the stored code matches the OBIS
+    // helpers that answer the same question, `is_import` / `is_export`.
+    assert_eq!("BEZUG".parse::<Direction>().unwrap(), Direction::Import);
+    assert_eq!(
+        "einspeisung".parse::<Direction>().unwrap(),
+        Direction::Export
+    );
+    assert_eq!(Direction::Export.to_string(), "EXPORT");
+    assert_eq!(Direction::Export.bezeichnung(), "Einspeisung");
+    assert!(
+        !Direction::CODES.contains(&"BEZUG"),
+        "an alias is not a code"
+    );
 }
 
 /// A code and a human-facing description are different things, and the types

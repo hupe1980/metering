@@ -1101,7 +1101,7 @@ mod tests {
         let filled = fill_gaps(
             &result.intervals,
             &FillGapsConfig::new(IntervalResolution::QuarterHour, from, to)
-                .because(crate::SubstitutionReason::PlausibilityCheckFailed),
+                .because(crate::SubstitutionReason::ImplausibleValue),
         );
         assert_eq!(filled.intervals.len(), 4);
         assert_eq!(filled.substituted_count(), 2);

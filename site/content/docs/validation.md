@@ -1,7 +1,7 @@
 +++
 title = "Validation and quality"
 description = "The order-independent rule engine V01–V12, why the outlier test is a Hampel identifier, and the A/B/C/F grade layered over it."
-weight = 5
+weight = 6
 +++
 
 ## The rules
@@ -28,6 +28,20 @@ written with.
 `MeterInterval` carries interval energy rather than a cumulative Zählerstand, so
 detection lives in [`reading`](@/docs/readings.md). The number stays unused so a
 stored `V10` finding cannot be reinterpreted.
+
+## Gaps are measured against what is covered, not against the previous interval
+
+V01 reports **any** uncovered span, not only a whole missing interval: a series
+whose intervals are the right length but sit off the grid — 00:00–00:15 then
+00:20–00:35 — leaves five minutes uncovered that V06 cannot see, because every
+interval is exactly 900 s.
+
+The span is measured from the **furthest end seen so far**, which is not the
+same as the previous interval's end once anything overlaps. Sorted by `from`, a
+short interval swallowed by a long one is followed by a start earlier than the
+long one's end, and comparing pairwise would report the covered remainder of the
+long interval as missing. An overlapping series is already an error (V02); a
+second, wrong finding on top of it sends the reader to a slot that has data.
 
 ## A clean report is not a clean series
 
@@ -107,16 +121,19 @@ carrying the length the run actually reached. `zero_run_threshold` decides
 *whether* to report it, never what number appears in the finding — a meter
 frozen for three weeks says three weeks.
 
+A **gap ends a run**: zeros either side of a hole are two runs, because what
+happened in the hole is unknown and reporting a stuck meter across it claims a
+measurement nobody took. Adjacency is the same test V01 uses for a gap.
+
 ## Declare the period, or gaps at the edges are invisible
 
 ```rust
 use metering::{ValidationConfig, validate_intervals};
-# use metering::{MeterInterval, QualityFlag};
+# use metering::MeterInterval;
 # use rust_decimal::dec;
 use time::macros::datetime;
-# let delivered = vec![MeterInterval {
-#     from: datetime!(2026-06-01 0:00 UTC), to: datetime!(2026-06-01 0:15 UTC),
-#     value: dec!(2.0), quality: QualityFlag::Measured, obis_code: None }];
+# let delivered =
+#     vec![MeterInterval::quarter_hour(datetime!(2026-06-01 0:00 UTC), dec!(2.0))];
 
 // Without a period the data defines its own extent — a truncated delivery is clean.
 assert!(validate_intervals(&delivered, &ValidationConfig::default()).is_clean());
@@ -224,11 +241,13 @@ letter, for callers who must decide "bill or review" and cannot read a list.
 |---|---|
 | `A` | no findings, coverage adequate |
 | `B` | findings, none blocking — bill it and note it |
-| `C` | at most three blocking findings — somebody has to look |
-| `F` | more than three blocking findings, or an empty series |
+| `C` | blocking findings within `max_review_findings`, coverage at or above `min_review_coverage_pct` — somebody has to look |
+| `F` | anything worse, and any empty series |
 
 The B/C line is **severity**, not a count: twenty spike warnings still bill, one
-gap does not.
+gap does not. Where the C/F line falls is `QualityConfig`'s — a Klärfall queue
+that absorbs three corrections a day cannot absorb thirty — and only `F` blocks
+automated billing.
 
 The grader computes no statistics of its own: every rule has one
 implementation, in the validation engine, and a test asserts the grade and the

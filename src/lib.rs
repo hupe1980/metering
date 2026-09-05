@@ -39,6 +39,7 @@
 //! | [`allocation`] | One pool across many claims — `Σ allocated + residual = total` |
 //! | [`session`] | A charging session or device log onto the settlement grid, and back into one series |
 //! | [`imbalance`] | Jahresmehr-/-mindermengen (GPKE Kap. 8.4) |
+//! | [`reactive`] | Blindmehrarbeit — the kvarh beyond the Netzbetreiber's Freigrenze |
 //! | [`losses`] | Netzverlust balance (§ 22 Abs. 1 EnWG) |
 //! | [`power_quality`] | EN 50160 — statistical, over a week of 10-minute means; VDE-AR-N 4100 Unsymmetrie |
 //! | [`measurement_point`] | What is metered, and on whose account |
@@ -87,7 +88,8 @@
 //!
 //! - **Cut to a documented number of places** when the quotient is a value a
 //!   consumer stores, prints or settles on, or when an identity depends on it:
-//!   [`ALLOCATION_DP`] (6), [`FORECAST_DP`] (3),
+//!   [`ALLOCATION_DP`] (6), [`SUBSTITUTE_DP`] (6), [`FORECAST_DP`] (3),
+//!   [`IMBALANCE_PCT_DP`] (2),
 //!   [`SigLinDe::H_VALUE_DP`](gas_slp::SigLinDe::H_VALUE_DP) (6),
 //!   [`KUNDENWERT_DP`](gas_slp::KUNDENWERT_DP) (4). A share carrying
 //!   twenty-seven decimal places is not a quantity, and it breaks the
@@ -471,6 +473,7 @@ pub mod obis;
 pub mod para14a;
 pub mod power_quality;
 pub mod quality;
+pub mod reactive;
 pub mod reading;
 pub mod resample;
 pub mod resolution;
@@ -485,7 +488,8 @@ pub mod zaehlzeit;
 // ── Re-exports ────────────────────────────────────────────────────────────────
 
 pub use aggregation::{
-    AggregationConfig, BillingPeriod, DirectionalEnergy, aggregate, sum_by_direction,
+    AggregationConfig, BENUTZUNGSDAUER_DP, BillingPeriod, DirectionalEnergy, aggregate,
+    sum_by_direction,
 };
 pub use aggregation_rule::{AggregationRule, VirtualMeterKind};
 pub use allocation::{
@@ -509,7 +513,7 @@ pub use gas_slp::{
 };
 pub use holiday::{Bundesland, Holiday, slp_day_type};
 pub use ids::{BdewCode, CodeVergabestelle, Eic, EicType, MaloId, MaloIssuer, MeloId, Regelzone};
-pub use imbalance::{ImbalanceSaldo, compute_imbalance};
+pub use imbalance::{IMBALANCE_PCT_DP, ImbalanceSaldo, compute_imbalance};
 pub use interval::{Direction, MeasurementUnit, MeterInterval, QualityFlag, Sparte, UnitScale};
 pub use lifecycle::{
     MeterExchangeEvent, MeterLifecycleEvent, MeterLifecycleEventType, MeterStatus,
@@ -534,6 +538,9 @@ pub use quality::{
     K_MAD, QualityConfig, QualityGrade, QualityReport, hampel_filter, hampel_filter_with_floor,
     score_intervals,
 };
+pub use reactive::{
+    RATIO_COS_PHI_0_9, RATIO_HALF, ReactiveBalance, ReactiveLimit, blindmehrarbeit,
+};
 pub use reading::{
     Anomaly, AnomalyKind, Lastgang, LastgangConfig, MeterReading, ResultChannel, Rollover,
     consumption_between, detect_reading_cadence, to_lastgang,
@@ -541,8 +548,8 @@ pub use reading::{
 pub use resample::{ResampleConfig, ResampledBucket, resample};
 pub use resolution::{CustomSeconds, IntervalResolution};
 pub use rollout::{
-    QuotaScope, ROLLOUT_MILESTONES, RolloutMilestone, RolloutObligation,
-    classify_rollout_obligation, next_milestone,
+    FeedInWaiver, MME_DEADLINE, QuotaScope, ROLLOUT_MILESTONES, RolloutAssessment,
+    RolloutMilestone, RolloutObligation, classify_rollout_obligation, next_milestone,
 };
 pub use session::{MeterSample, SessionError, SessionSplitConfig, merge_sessions, split_session};
 pub use sharing::{
@@ -551,7 +558,8 @@ pub use sharing::{
     combine_readiness,
 };
 pub use substitute::{
-    FillGapsConfig, FilledSeries, SubstituteEntry, SubstituteMethod, SubstitutionReason, fill_gaps,
+    FillGapsConfig, FilledSeries, ReferenceDayMatch, SUBSTITUTE_DP, SubstituteEntry,
+    SubstituteMethod, SubstitutionReason, fill_gaps,
 };
 pub use validation::{
     RuleSet, ValidationConfig, ValidationIssue, ValidationResult, ValidationRuleId,

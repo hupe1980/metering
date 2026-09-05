@@ -1,7 +1,7 @@
 +++
 title = "Sessions and allocation"
 description = "Placing a charging session or a device log on the metering grid without losing a kWh, and splitting one pool across many claims with the residual reported."
-weight = 12
+weight = 13
 +++
 
 Two operations sit either side of the settlement grid, and both are the same

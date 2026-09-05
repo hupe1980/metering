@@ -1,7 +1,7 @@
 +++
 title = "Gas conversion and units"
 description = "m³ to kWh_Hs under MessEG and DVGW G 685, the SigLinDe gas SLP arithmetic, the 06:00 Gastag, and unit normalisation that refuses to guess."
-weight = 9
+weight = 10
 +++
 
 ## The formula and why it is lawful

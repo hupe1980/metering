@@ -106,8 +106,8 @@ impl SteuVeFallgruppe {
 
     /// `true` for the two Fallgruppen the > 11 kW scaling rule applies to.
     ///
-    /// Ziff. 4.5.1 Satz 2 and Ziff. 4.5.2 Satz 3 both name *"Ziffern 2.4.1.b
-    /// sowie 2.4.1.c"* — Wärmepumpe and Raumkühlung — and no others. A
+    /// Ziff. 4.5.1 Satz 2 and Ziff. 4.5.2 Satz 3 both name *"Ziffern 2.4.1.b.
+    /// sowie 2.4.1.c."* — Wärmepumpe and Raumkühlung — and no others. A
     /// Ladepunkt or a Stromspeicher keeps the flat floor however large it is.
     #[must_use]
     pub const fn is_scaled_above_threshold(self) -> bool {
@@ -351,8 +351,8 @@ pub fn mindestleistung_direktansteuerung(
 ///
 /// Ziff. 4.5.2, verbatim:
 ///
-/// > ³Sofern Anlagen im Sinne der Ziffern 2.4.1.b sowie 2.4.1.c (jeweils
-/// > i.V.m. Ziffer 2.4.2), mit einer Netzanschlussleistung über 11 kW
+/// > ³Sofern Anlagen im Sinne der Ziffern 2.4.1.b. sowie 2.4.1.c. (jeweils
+/// > i.V.m. Ziffer 2.4.2.), mit einer Netzanschlussleistung über 11 kW
 /// > Bestandteil der Steuerung nach Ziffer 4.4.b sind, gilt:
 /// >
 /// > `P_min,14a = Max(0,4 x P_Summe WP; 0,4 x P_Summe Klima) + (n_steuVE − 1) x GZF x 4,2 kW`

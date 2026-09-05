@@ -9,8 +9,9 @@
 **German energy metering domain library for Rust.** Europe/Berlin calendar
 arithmetic — Liefertag *and* Gastag — Zählerstandsgang → Lastgang, charging
 sessions and device logs onto the settlement grid, gas m³→kWh_Hs and the
-SigLinDe gas SLP, Ersatzwertbildung, a robust validation engine, EN 50160,
-§14a Modul 3 tariff registers, conservation-checked allocation (§42b EnWG),
+SigLinDe gas SLP, Ersatzwertbildung in the market's own code list, a robust
+validation engine, EN 50160, §14a Modul 3 tariff registers, Benutzungsstundenzahl
+and Blindmehrarbeit, conservation-checked allocation (§42b EnWG),
 check-digit-validated MaLo-IDs and EICs, and Jahresprognose.
 
 > 🧊 **Zero I/O** · ⏱️ **no async** · 🕰️ **no clock** · 🔢 **exact decimal quantities**
@@ -46,17 +47,15 @@ cargo add metering --features serde
 ## 🚀 Quick start
 
 ```rust
-use metering::{AggregationConfig, MeterInterval, QualityFlag, aggregate};
+use metering::{AggregationConfig, MeterInterval, ObisCode, aggregate};
 use rust_decimal::dec;
 use time::macros::datetime;
 
-let intervals = vec![MeterInterval {
-    from: datetime!(2026-06-01 0:00 UTC),
-    to:   datetime!(2026-06-01 0:15 UTC),
-    value: dec!(2.345),
-    quality: QualityFlag::Measured,
-    obis_code: Some("1-0:1.8.0".parse().unwrap()),
-}];
+// One quarter-hour, measured, on the Bezug channel.
+let intervals = vec![
+    MeterInterval::quarter_hour(datetime!(2026-06-01 0:00 UTC), dec!(2.345))
+        .with_obis(ObisCode::STROM_BEZUG_TOTAL),
+];
 
 let period = aggregate(&intervals, &AggregationConfig::rlm());
 println!("Arbeitsmenge:    {} kWh", period.arbeitsmenge);
@@ -103,18 +102,14 @@ six hours later, not a different length — so it is a *boundary*, and
 `DayBoundary` carries it into the places a daily grid is actually built:
 
 ```rust
-use metering::{MeterInterval, QualityFlag, ResampleConfig, calendar, resample};
+use metering::{MeterInterval, ResampleConfig, calendar, resample};
 use rust_decimal::dec;
 use time::{Duration, macros::date};
 
 let start = calendar::gas_day_start_utc(date!(2026 - 01 - 15));
-let series: Vec<MeterInterval> = (0..48).map(|i| MeterInterval {
-    from: start + Duration::hours(i),
-    to:   start + Duration::hours(i + 1),
-    value: dec!(1),
-    quality: QualityFlag::Measured,
-    obis_code: None,
-}).collect();
+let series: Vec<MeterInterval> = (0..48)
+    .map(|i| MeterInterval::hour(start + Duration::hours(i), dec!(1)))
+    .collect();
 
 // Two whole Gastage...
 let gas_days = resample(&series, &ResampleConfig::to_gas_daily());
@@ -149,11 +144,12 @@ it. It asserts its own invariants, so CI runs it as a test.
 
 | Area | What it does | Guide |
 |---|---|---|
+| **Billing quantities** | Arbeitsmenge, Spitzenleistung with the interval it was reached in, the Benutzungsstundenzahl §17 StromNEV bands the Netzentgelt by, Blindmehrarbeit beyond the Freigrenze, and the import/export/undirected balance | [→](https://hupe1980.github.io/metering/docs/billing-quantities/) |
 | **Calendar** | Berlin days, months, years **and the 06:00 Gastag**; `DayBoundary` carries the choice into resampling and gap filling; DST-correct interval counts; Bundesland holidays | [→](https://hupe1980.github.io/metering/docs/time-and-calendar/) |
 | **Readings** | Zählerstandsgang → Lastgang, register rollover, meter exchange | [→](https://hupe1980.github.io/metering/docs/readings/) |
 | **Identifiers** | `MaloId` and `Eic` with their check characters verified at the parse; `MeloId` (= the Zählpunktbezeichnung); `BdewCode` Marktpartner-ID; the Regelzone read off a Bilanzierungsgebiet's EIC | [→](https://hupe1980.github.io/metering/docs/identifiers/) |
 | **Validation** | Order-independent rules V01–V12 (V10 retired), Hampel outlier test, A/B/C/F grading, and a `RuleSet` saying which rules actually ran; DST- and Gastag-aware daily lengths | [→](https://hupe1980.github.io/metering/docs/validation/) |
-| **Ersatzwerte** | Four methods, calendar-aware grid, audit trail of what actually ran | [→](https://hupe1980.github.io/metering/docs/substitute-values/) |
+| **Ersatzwerte** | Four methods, calendar-aware grid, the Vergleichstag matched on weekday or SLP day type, and the market's own 28 Ersatzwert reasons with their MSCONS codes | [→](https://hupe1980.github.io/metering/docs/substitute-values/) |
 | **Tariff registers** | HT/NT and §14a Modul 3 in one mechanism, plus a Modul 3 conformance check for curated DSO calendars | [→](https://hupe1980.github.io/metering/docs/tariff-registers/) |
 | **§14a steering** | `P_min,14a` with the published Gleichzeitigkeitsfaktor table, and the netzwirksamer Leistungsbezug | [→](https://hupe1980.github.io/metering/docs/paragraph-14a/) |
 | **Gas & units** | m³→kWh_Hs, the G 685-3 Zustandszahl and G 685 rounding, the SigLinDe gas SLP, exact-rational unit normalisation | [→](https://hupe1980.github.io/metering/docs/gas-and-units/) |
@@ -198,12 +194,17 @@ waiting on EU state-aid approval.
   one place — the outlier rule converts values to run the Hampel filter — and
   nothing a float touches is written back into a quantity.
 - **"Exact" means no float, and one rounding at most.** Sums, differences and
-  products of quantities do not round at all, so the conservation laws hold to
-  the digit: a register split reconstructs its Arbeitsmenge, a filled series
-  covers its grid, an allocation splits a consumption, a Lastgang sums to its
-  register difference. Division is where a choice has to be made, and the
-  quotients a consumer stores are cut to a documented number of places
-  (`ALLOCATION_DP`, `FORECAST_DP`, …) rather than handed back at twenty-eight.
+  products do not round, so the conservation laws hold to the digit. Division
+  makes a choice: a quotient a consumer stores is cut to a documented number of
+  places (`ALLOCATION_DP`, `SUBSTITUTE_DP`, `FORECAST_DP`, …), and every share
+  **multiplies before it divides**, because `a ÷ b × c` rounds first and then
+  scales the error up.
+- **The market's vocabulary, not a parallel one.** Where EDI@Energy publishes a
+  code list, the crate *is* that list: `SubstitutionReason` is the 28
+  Statusanlässe of `STS+Z40`, `SubstituteMethod::market_code` the
+  Ersatzwertbildungsverfahren of `STS+Z32` (which differ by commodity), and
+  `QualityFlag::market_code` the `QTY` qualifier. Where the market has no code,
+  the answer is `None` and the docs say why.
 - **One value, one string — and one meaning, one value.** `ObisCode` and
   `IntervalResolution` each have exactly one canonical spelling, and two
   distinct values can never mean the same thing: `IntervalResolution::Custom`
@@ -214,38 +215,33 @@ waiting on EU state-aid approval.
   crate writes; one test asserts all six properties for every one of them, and
   another reads the source so a new enum cannot skip that list.
 - **A clean validation report says which rules ran.** Four of the eleven are
-  opt-in — they need a number the library will not invent — and two more can be
-  switched off, so `ValidationResult::evaluated` and
-  `ValidationConfig::disabled_rules()` make the difference between "found
-  nothing" and "never looked" a fact you can log or assert on.
-- **Order in, order out.** `aggregate`, `resample`, `validate_intervals`,
-  `fill_gaps`, `split_energy`, `to_lastgang`, `allocate`, `split_session` and
-  `sum_by_direction` all give the same answer for a shuffled input, and a
-  proptest suite asserts it rather than the docs promising it. Order dependence
-  only shows on a **tie**, so the generator draws half its series from a coarse
-  value grid where ties are the norm.
+  opt-in and two more can be switched off, so `ValidationResult::evaluated` and
+  `ValidationConfig::disabled_rules()` make "found nothing" and "never looked"
+  distinguishable.
+- **Order in, order out.** Every entry point that promises it gives the same
+  answer for a shuffled input, held by proptest. Order dependence shows only on
+  a **tie**, so the generator draws half its series from a coarse value grid
+  where ties are the norm.
 - **Nothing created, nothing lost.** A session total placed on the grid sums
   back to itself; a pool split across claims satisfies
   `Σ allocated + residual = total`. Both identities are theorems rather than
   checks — the cut lands on the *cumulative*, so the slot differences telescope
   — and proptests hold them.
 - **No second copy of a fact.** A register's unit comes from its OBIS code, a
-  meter exchange's date from its instant, a series' worst quality from its
-  intervals, an interval's flow direction from its OBIS value group C — never
-  from a field that can drift out of step. Where a fact genuinely *is* stated
-  twice — a measurement point declares a purpose as well as carrying a directed
-  OBIS code — the disagreement is reportable (`direction_conflict`) rather than
-  resolved in silence.
-- **Serde tags are semver-covered**, pinned literally by a test. Instants
-  travel as RFC 3339 and dates as ISO 8601 in JSON, and keep `time`'s compact
-  tuple in bincode and postcard, where the hot types round-trip. Quantities are
-  exact decimal strings in every format, written on each field rather than
+  meter exchange's date from its instant, an interval's direction from OBIS
+  value group C. Where a fact genuinely *is* stated twice, the disagreement is
+  reportable (`direction_conflict`) rather than resolved in silence.
+- **Serde tags are semver-covered**, pinned literally by a test. Instants are
+  RFC 3339 and dates ISO 8601 in JSON, `time`'s compact tuple in binary formats;
+  quantities are exact decimal strings everywhere, written per field rather than
   inherited from a `rust_decimal` feature — so enabling `metering/serde` cannot
   change how a `Decimal` behaves in a crate that never named this one.
 - **Domain enums are exhaustive**; only error enums are `#[non_exhaustive]`.
 - **Unknown is not good.** Where a quantity cannot be determined the API says
-  so — an `Option`, or an error — rather than returning a benign-looking
-  default.
+  so — an `Option`, or an error — rather than a benign-looking default: a
+  dynamisation factor for day 400, a peak across mixed resolutions, a market
+  code the market does not have. Constructors are named for what they claim
+  (`MeterInterval::measured`), so nothing acquires a quality by omission.
 
 → [Design constraints](https://hupe1980.github.io/metering/docs/design/)
 
@@ -256,7 +252,13 @@ waiting on EU state-aid approval.
 Every provision is quoted from the published text and dated, and the library is
 explicit about the claims it *cannot* verify — the 2025 SLP dynamisation
 function is published as an image, G 685's final rounding diverges between
-Netzbetreiber, VDE-AR-N 4400 is paywalled. Those are parameters, not constants.
+Netzbetreiber, VDE-AR-N 4400 is paywalled, and no national rule fixes the
+Blindarbeit Freigrenze. Those are parameters, not constants.
+
+The quotes are checked mechanically, not by recollection: `just quotes` matches
+every German passage in the source, the site and this README against the PDFs
+`just specs` fetches. Sixty-five of sixty-six verify character for character; the
+one that cannot is a label inside a figure.
 
 → [Regulatory basis](https://hupe1980.github.io/metering/docs/regulatory-basis/)
 
@@ -270,6 +272,8 @@ Nothing here is legal advice.
 just ci     # everything CI runs, in CI order
 just test   # cargo test --all-features
 just purity # no clock, no I/O, no unsafe outside comments
+just specs  # fetch the primary sources every citation is checked against
+just quotes # check every German quote in src/, site/ and README against the PDFs
 just site   # serve the documentation site locally
 ```
 
@@ -302,6 +306,10 @@ Beyond the unit tests:
   documentation site, compiled and run
 - `tests/doc_conventions.rs` — no item doc over 60 lines, and no changelog
   prose in a reference doc
+- `tests/scale.rs` — a settlement year and a minute-sampled day through the
+  pipeline: a smoke alarm for accidental quadratic behaviour, not a benchmark
+- `scripts/verify_quotes.py` — every quoted passage against the published PDF
+  (`just quotes`; not a CI lane, because the corpus is not in the repository)
 
 ---
 

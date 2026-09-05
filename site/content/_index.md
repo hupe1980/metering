@@ -5,17 +5,14 @@ template = "index.html"
 +++
 
 ```rust
-use metering::{AggregationConfig, MeterInterval, QualityFlag, aggregate};
+use metering::{AggregationConfig, MeterInterval, ObisCode, aggregate};
 use rust_decimal::dec;
 use time::macros::datetime;
 
-let intervals = vec![MeterInterval {
-    from: datetime!(2026-06-01 0:00 UTC),
-    to:   datetime!(2026-06-01 0:15 UTC),
-    value: dec!(2.345),
-    quality: QualityFlag::Measured,
-    obis_code: Some("1-0:1.8.0".parse().unwrap()),
-}];
+let intervals = vec![
+    MeterInterval::quarter_hour(datetime!(2026-06-01 0:00 UTC), dec!(2.345))
+        .with_obis(ObisCode::STROM_BEZUG_TOTAL),
+];
 
 let period = aggregate(&intervals, &AggregationConfig::rlm());
 

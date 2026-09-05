@@ -1,7 +1,7 @@
 +++
 title = "Design constraints"
 description = "Determinism, exact decimals, one canonical string per value, serde stability and exhaustive domain enums — the invariants the library holds to."
-weight = 14
+weight = 15
 +++
 
 ## Determinism
@@ -60,8 +60,9 @@ Two ways, and which one applies is a rule rather than a case-by-case decision:
 
 - **Cut to a documented number of places** when the quotient is a value someone
   stores, prints or settles on — or when an identity depends on it.
-  `ALLOCATION_DP` (6), `FORECAST_DP` (3), `SigLinDe::H_VALUE_DP` (6),
-  `KUNDENWERT_DP` (4). A share carrying twenty-seven decimal places is not a
+  `ALLOCATION_DP` (6), `SUBSTITUTE_DP` (6), `SigLinDe::H_VALUE_DP` (6),
+  `KUNDENWERT_DP` (4), `FORECAST_DP` (3), `BENUTZUNGSDAUER_DP` (2),
+  `IMBALANCE_PCT_DP` (2). A share carrying twenty-seven decimal places is not a
   quantity, and it breaks the subtraction that follows it.
 - **Leave it at full width** when it is an intermediate nothing downstream can
   distinguish. `allocation_temperature` feeds only `h_value`, which crosses into
@@ -72,16 +73,56 @@ Where the rounding rule is the *market's* rather than this crate's it is a
 parameter with a documented default instead — `G685Rounding` is the case where
 published Netzbetreiber practice demonstrably disagrees with itself.
 
+### Multiply before you divide
+
+`a ÷ b × c` and `a × c ÷ b` are the same number in arithmetic and not in a
+`Decimal`: the first rounds the quotient to 28 significant digits and then
+scales the error up by `c`. Every share in this crate multiplies first. Three
+equal tenants against 9 kWh of generation exhaust it exactly that way, and come
+three millionths short the other.
+
+The same reasoning gives an interval's average power as `kWh × 3600 ÷ s` rather
+than `kWh ÷ (s ÷ 3600)` — one rounding instead of two, and identical for every
+interval length the market actually uses.
+
 ### The consequence that surprises people
 
 A quantity that has been cut is homogeneous only to its last reported place.
-Doubling every reading doubles a Jahresprognose to within `2 × 10⁻³` kWh, not
-exactly, because `round(2x)` and `2·round(x)` differ at a rounding boundary.
+Doubling every reading doubles a Jahresprognose to within a year's worth of
+`FORECAST_DP`, not exactly, because `round(2x)` and `2·round(x)` differ at a
+rounding boundary.
+
+That is a deliberate trade. The projection is computed from the **cut** daily
+average, not from a 28-digit one nobody can see, so an operator who recomputes
+`daily_average_kwh × year_days` gets the number the report states. MessEV
+§ 25 Nr. 7 asks that *die verwendeten Werte* be fit for the purpose; a value
+that cannot be re-derived from the figures beside it is not.
 
 The distinction is easy to overstate in either direction. The
 Allokationstemperatur has exact *weights* — eighths — and an inexact division
 by 15. `UnitScale` keeps the *defining identities* exact — 3.6 GJ is 1 000 kWh
 to the digit — and rounds everything else once.
+
+## The market's vocabulary, not a parallel one
+
+Where EDI@Energy publishes a code list for something this crate models, the
+crate **is** that list. An invented enum has to be mapped at the market
+boundary, the mapping is never quite one-to-one, and the meaning changes on the
+way out.
+
+| Crate | List | Segment |
+|---|---|---|
+| `SubstitutionReason` | 28 Gründe der Ersatzwertbildung | `STS+Z40` |
+| `SubstituteMethod::market_code` | 13 Ersatzwertbildungsverfahren | `STS+Z32` |
+| `QualityFlag::market_code` | the Mengen-Qualifier | `QTY` |
+
+Each variant carries three labels because they answer three questions:
+`code()` for the wire, `as_str()` for a database column (`Z81` says nothing to
+a reader, and a code starting with `Z` sorts badly), `description()` for a
+person — the published German title, verbatim.
+
+Where the market has no code, the answer is `None` rather than the nearest
+match. See [Ersatzwertbildung](@/docs/substitute-values.md).
 
 ## One value, one string
 
@@ -262,3 +303,17 @@ default.
   a billed quantity.
 - `ObisCode::as_lastgang()` returns `None` for a tariff register rather than
   inventing `1-0:1.29.1`, a code the market does not define.
+- `Dynamization::factor()` returns `None` outside day 1..=366. The polynomial is
+  a quartic *fitted* to a year: at day 400 the 1999 function has already fallen
+  through zero, so an off-by-one would otherwise scale every value it touches by
+  a plausible-looking number.
+- `BillingPeriod::uniform_resolution` is `false` where a series mixes interval
+  lengths, so a Spitzenleistung taken across them is an upper bound the caller
+  can qualify rather than a measurement it cannot.
+- `SubstituteMethod::market_code()` returns `None` where the market has no code —
+  a held value in Strom, a zero fill anywhere — instead of the nearest-looking
+  one.
+
+The same rule shapes the constructors. `MeterInterval::measured` is named for
+the claim it makes; there is no `new` that would have to pick a `QualityFlag`,
+and `Unknown` — the `Default` — is reachable only by asking for it.

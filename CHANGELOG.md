@@ -4,6 +4,183 @@ All notable changes to `metering` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the crate follows
 semver, with the `serde` representation explicitly in scope (see the crate docs).
 
+## [0.23.0] — 2026-09-05
+
+A full audit — of the arithmetic, of the vocabulary, and of every passage the
+crate presents as verbatim source text. Three findings shaped the release.
+
+**The Ersatzwert vocabulary was invented.** EDI@Energy publishes the list this
+crate needs: `STS+Z40 Grund der Ersatzwertbildung` names 28 reasons and
+`STS+Z32 Ersatzwertbildungsverfahren` 13 methods, in MSCONS MIG 2.4c. This
+crate had seven reasons of its own devising, which every consumer building a
+MSCONS had to map onto the real ones — a mapping that is not one-to-one, so the
+reason changed meaning at the market boundary. The published list replaces it,
+each variant carrying its code and its German title verbatim.
+
+**Two divisions ran in the wrong order.** `demand_kw` and the GGV share divided
+before multiplying, which rounds a quotient to 28 significant digits and then
+scales the error up. Both multiply first now. The visible consequence: three
+equal tenants against 9 kWh of generation now exhaust it exactly, where before
+they came three millionths short.
+
+**Three quotes did not match their sources.** A truncated sentence presented as
+complete, a paraphrase (*"sowie"* for a numbering the Festlegung prints with
+trailing dots), and an elision without an ellipsis. `just quotes` is the harness
+that found them, and it is now a script in the repository rather than a
+procedure in a notebook: it checks all 66 German passages against the PDFs in
+`specs/`, and 65 of them verify mechanically.
+
+### Added
+
+- **`MeterInterval::measured`, `::quarter_hour`, `::hour`, `::with_quality`,
+  `::with_obis`** — the hottest type in the crate no longer needs a five-field
+  struct literal at every call site. Named after what they claim: there is no
+  `new` that picks a quality nobody asked for, and `Unknown` — the `Default` —
+  stays reachable only by asking for it.
+- **`rollout::FeedInWaiver` and `RolloutAssessment`** — see *Fixed*.
+- **`rollout::MME_DEADLINE`** — § 29 Abs. 3 MsbG: an Optionsfall is not "nothing
+  is owed", it is a moderne Messeinrichtung by 31 December 2032.
+- **`substitute::ReferenceDayMatch`** — the Vergleichstag rule. A public holiday
+  is a Sunday in load terms, so averaging a 1 May gap over the previous working
+  Fridays overstates it. `FillGapsConfig::matching_day_types(land)` switches the
+  prior-period index from (weekday, time) to (SLP day type, time), which also
+  widens the pool: a Wednesday gap draws on every Werktag of the reference week
+  rather than on one Wednesday.
+- **`tests/scale.rs`** — a settlement year (35 040 quarter-hours) and a
+  minute-sampled day through the whole pipeline. Not a benchmark: a smoke alarm
+  for accidental quadratic behaviour, which reading alone has already missed
+  once.
+- **`SubstitutionReason` is the market's list** — 28 variants from `STS+Z40`,
+  MSCONS MIG 2.4c (binding since 03.04.2024; MIG 2.5, binding 01.10.2026,
+  carries the identical list). Each has `code()` (`"Z75"`), `from_code()`,
+  `description()` (the published German title) and `applies_to(Sparte)`.
+- **`SubstituteMethod::market_code(Sparte)`** — the `STS+Z32`
+  Ersatzwertbildungsverfahren, which depends on the commodity: interpolation is
+  `Z92` for both, a prior-period average is `ZJ2` for Strom and `Z95` for Gas,
+  and a held value is `Z93` for Gas and **has no Strom code at all**. A zero
+  fill has none anywhere, because it is not an Ersatzwertbildung.
+- **`QualityFlag::market_code()`** — the MSCONS `QTY` Mengen-Qualifier: `220`
+  Wahrer Wert, `67` Ersatzwert, `187` Prognosewert, `Z18` Vorläufiger Wert, `20`
+  Nicht verwendbarer Wert. `Calculated`, `Corrected` and `Unknown` return `None`,
+  and the documentation says what the market uses instead.
+- **`reactive`** — Blindmehrarbeit, the kvarh beyond the Netzbetreiber's
+  Freigrenze: `blindmehrarbeit(wirkarbeit, blindarbeit, limit)` with
+  `ReactiveLimit::half()` (the *50 % der Wirkarbeit* formulation) and
+  `::cos_phi_0_9()`. Exact — one product, one difference, no division.
+- **`BillingPeriod::benutzungsdauer_h`** — the Benutzungsstundenzahl
+  § 17 Abs. 1 StromNEV makes the Netzentgelt depend on, and whose 2 500 h kink
+  Anlage 4 zu § 17 Abs. 2 defines the Gleichzeitigkeitsgrad around. Cut to
+  `BENUTZUNGSDAUER_DP`.
+- **`BillingPeriod::uniform_resolution`** — `false` when the series mixes
+  interval lengths, which makes the Spitzenleistung an upper bound rather than a
+  measurement. The crate does not guess which resolution was meant and no longer
+  stays silent about the question being mixed.
+- **`FilledSeries::unplaced`** and `placed_everything()` — input intervals that
+  landed on no grid slot. `fill_gaps` had dropped them and substituted their
+  slots, which is the one outcome worse than refusing: a measured value silently
+  replaced by an invented one.
+- **`SUBSTITUTE_DP`, `IMBALANCE_PCT_DP`, `BENUTZUNGSDAUER_DP`** — the cuts for
+  values that reach a report, alongside the existing `ALLOCATION_DP` and
+  `FORECAST_DP`.
+- **`scripts/verify_quotes.py`** and `just quotes`.
+- `specs/` gained the MSCONS MIG 2.4c and 2.5, and `just specs` fetches them.
+
+### Changed — breaking
+
+- **`classify_rollout_obligation` returns a `RolloutAssessment`**, not a single
+  `RolloutObligation`, and takes a fourth argument (the § 29 Abs. 5 waiver). The
+  grounds of § 29 Abs. 1 are joined by *"sowie"* and are cumulative; a 9 000 kWh
+  household with a heat pump is Nr. 1 **and** Nr. 2a, and returning the first
+  match understated what is owed.
+- **`Dynamization::factor` and `::apply` return `Option`.** The polynomial is a
+  quartic fitted to a year: at `t = 400` the 1999 function has already fallen
+  through zero. A day number outside 1..=366 is now refused rather than scaled
+  by a plausible-looking value, and `DynamicSlpProfile::value_at` propagates the
+  refusal.
+- **`SubstitutionReason`'s variants are all new.** The nearest replacements:
+  `NoMeasurementAvailable` → `NoAccess` (`Z74`), `MeterFault` →
+  `MeteringEquipmentFault` (`Z81`), `GatewayCommFailure` →
+  `CommunicationFailure` (`Z75`), `PlausibilityCheckFailed` →
+  `ImplausibleValue` (`ZA1`), `MeterExchangeInterpolation` → `DeviceExchange`
+  (`Z78`), `ManualCorrection` → `CalculationChanged` (`ZA5`) or
+  `DataProcessingError` (`ZA7`) depending on which happened. `Other` has no
+  replacement: the market list is closed, and a reason outside it cannot be
+  transmitted.
+- **`MeterInterval::demand_kw` computes `value × 3600 ÷ secs`**, one division
+  instead of two. Unchanged for every interval length that divides 3 600 —
+  which is every one the market uses — and more accurate for the rest.
+  `resample` calls it rather than carrying a second copy of the formula.
+- **The GGV proportional share multiplies before it divides.** Shares can move
+  by up to one unit in the sixth decimal place, always towards the exact value.
+- **A substituted value is cut to `SUBSTITUTE_DP`.** An interpolation across an
+  awkward span and a prior-period average over a sample count that does not
+  divide could both write a 28-digit quotient into the returned series.
+- **`AnnualForecast::daily_average_kwh` is cut to `FORECAST_DP`, and the
+  projection is computed from the cut value**, so the projection reproduces from
+  the figures the report states — which is what MessEV § 25 Nr. 7 asks of *"die
+  verwendeten Werte"*. Doubling every reading now doubles the projection to
+  within a year's worth of the last reported place rather than exactly.
+- **The prediction interval uses Student's t with n − 1 degrees of freedom**
+  rather than the normal 1.96. σ is estimated from the same short window the
+  projection is; at the seven days the crate will project from, the interval is
+  25 % wider and the previous one was too narrow.
+- **`ImbalanceSaldo::delta_pct` is cut to `IMBALANCE_PCT_DP`** (2), matching
+  `NetworkLosses::verlust_prozent`.
+- **`QualityConfig` gained `max_review_findings` and
+  `min_review_coverage_pct`.** The `C`/`F` line was two literals in the grading
+  expression; where "route this to review" ends and "reject it" begins depends
+  on what a Klärfall queue can absorb, which is not this crate's decision.
+- `FilledSeries` and `BillingPeriod` gained fields, so struct literals of either
+  need updating.
+
+### Fixed
+
+- **§ 29 Abs. 1 Nr. 2 MsbG owes a Steuerungseinrichtung at *both* its letters.**
+  The crate asked for one only where a § 14a agreement existed; a plant above
+  7 kW needs one too, unless the Abs. 5 waiver applies — feed-in permanently
+  limited to 0 % **and** declared in Textform, both or neither.
+- **§ 29 Abs. 1 Nr. 2b is quota-conditional.** It applies *"soweit dies
+  erforderlich ist"* to reach the § 45 Abs. 1 quotas, which depends on the
+  Messstellenbetreiber's own portfolio. `RolloutObligation::is_quota_conditional`
+  reports the condition instead of treating every plant above 7 kW as due today.
+- **`ROLLOUT_MILESTONES` says which of the four § 45 Abs. 1 schedules it is** —
+  Nr. 4, the ordinary Letztverbraucher track. Nr. 1 and Nr. 2 are measured in
+  installed kilowatts and Nr. 3 splits by Einbaufallgruppe; presenting one table
+  as *the* Fahrplan made four different denominators look like one.
+- **§ 60 Abs. 2 MsbG places Ersatzwertbildung in the Smart-Meter-Gateway
+  *conditionally*.** The duty depends on a BSI assessment and a BNetzA
+  Festlegung, and until one exists Satz 2 expressly permits the preparation to
+  happen outside the gateway. The crate had quoted the first half and described
+  the placement as settled.
+- **§ 60 Abs. 6 is owed *"unter Beachtung mess- und eichrechtlicher Vorgaben"*.**
+  The three-year ceiling is not the only clause in the sentence.
+- **V05 breaks a zero run at a discontinuity.** Zeros either side of a gap are
+  two runs, not one: what happened in the hole is unknown, and reporting a stuck
+  meter across it claims a measurement nobody took. Adjacency is the same test
+  V01 uses, so the two rules cannot disagree about whether a series is
+  continuous.
+- **V01 no longer manufactures a gap behind an overlapping interval.** Sorted by
+  `from`, a short interval swallowed by a long one is followed by a start
+  earlier than the long one's end; the pairwise comparison reported the covered
+  space as missing. Gaps are measured against the furthest end seen so far — the
+  same correction V02 already had — at the head and tail as well.
+- **HeizkostenV constants are `dec!` literals.** They were parsed from strings
+  with `unwrap_or` fallbacks that would have silently computed with `2` instead
+  of `2,5`, or dropped an adjustment factor to `1`.
+- **`session::cumulative` no longer has a zero fallback** on an unreachable
+  branch. A cumulative that drops to zero mid-series turns the next slot
+  negative — an unreachable branch must not be the one that breaks the invariant
+  the module rests on.
+- **`gas_m3_to_kwh_hs`'s doc example** stated 1 029,90 kWh for an arithmetic
+  that yields 1 030,102, and asserted only that the result exceeded 1 000.
+- **`QualityFlag::Calculated`** was glossed *Vorläufiger Wert*, which is
+  `Preliminary`'s term. It is a *Rechenwert*.
+- The kW branch of `normalize_to_kwh` divides once rather than twice.
+- Three misquotes: the Anwendungshilfe sentence in `virtual_meter` was cut short
+  and closed with a full stop the source does not have; the § 14a Ziffern were
+  cited without the dots the Festlegung prints; and the Ziff. 2.4.2 grouping
+  sentence dropped *"im Sinne dieser Festlegung"* without an ellipsis.
+
 ## [0.22.0] — 2026-08-31
 
 A consumer-feedback round from a workspace that upgraded `metering` 0.19 → 0.21

@@ -462,21 +462,46 @@ impl Dynamization {
         }
     }
 
-    /// Dynamization factor for `day_of_year` (1..=366), rounded to 4 decimal
-    /// places per the Anwendungshilfe recommendation.
+    /// Dynamization factor for `day_of_year`, rounded to 4 decimal places per
+    /// the Anwendungshilfe recommendation.
+    ///
+    /// `None` outside **1..=366**, and that is the point. The function is a
+    /// quartic *fitted* to a year: at `t = 400` the 1999 polynomial has already
+    /// fallen through zero, and at `t = 5000` it returns −235. A day number
+    /// outside the year is a caller bug — an off-by-one, a `0`-based index, a
+    /// field that never got set — and answering it with a plausible-looking
+    /// number puts a silent few-percent error on every value it scales.
+    ///
+    /// ```rust
+    /// use metering::load_profile::Dynamization;
+    ///
+    /// let d = Dynamization::vdew_1999();
+    /// assert!(d.factor(1).is_some());
+    /// assert!(d.factor(366).is_some());
+    /// assert_eq!(d.factor(0), None, "day numbers are 1-based");
+    /// assert_eq!(d.factor(367), None, "no year is that long");
+    /// ```
     #[must_use]
-    pub fn factor(&self, day_of_year: u16) -> Decimal {
+    pub fn factor(&self, day_of_year: u16) -> Option<Decimal> {
+        if !(1..=366).contains(&day_of_year) {
+            return None;
+        }
         let t = f64::from(day_of_year);
         let [a, b, c, d, e] = self.coefficients;
         let f = a * t.powi(4) + b * t.powi(3) + c * t.powi(2) + d * t + e;
-        Decimal::try_from(f).unwrap_or(Decimal::ONE).round_dp(4)
+        // A supplied polynomial can overflow a `Decimal` where the published
+        // one cannot. Refusing beats a fallback factor of 1, which would look
+        // like "no dynamisation applies here" rather than "this did not work".
+        Some(Decimal::try_from(f).ok()?.round_dp(4))
     }
 
     /// Apply the factor to a profile value; the result is rounded to 3
     /// decimal places per the Anwendungshilfe.
+    ///
+    /// `None` for a `day_of_year` [`factor`](Self::factor) refuses.
     #[must_use]
-    pub fn apply(&self, profile_value: Decimal, day_of_year: u16) -> Decimal {
-        (profile_value * self.factor(day_of_year)).round_dp(3)
+    pub fn apply(&self, profile_value: Decimal, day_of_year: u16) -> Option<Decimal> {
+        Some((profile_value * self.factor(day_of_year)?).round_dp(3))
     }
 }
 
@@ -645,7 +670,7 @@ impl DynamicSlpProfile {
         // An unknown profile is treated as needing dynamization: the safe
         // failure is refusing to answer, not answering with a raw value.
         if self.profile.is_none_or(LoadProfile::requires_dynamization) {
-            return Some(self.dynamization?.apply(raw, day_of_year));
+            return self.dynamization?.apply(raw, day_of_year);
         }
         Some(raw)
     }
@@ -835,14 +860,43 @@ mod tests {
         use rust_decimal::dec;
         let d = Dynamization::vdew_1999();
         // Factors are 4-decimal rounded; winter above 1, summer below 1.
-        let jan = d.factor(15);
-        let jul = d.factor(196);
+        let jan = d.factor(15).expect("mid-January");
+        let jul = d.factor(196).expect("mid-July");
         assert!(jan > Decimal::ONE, "winter factor {jan} > 1");
         assert!(jul < Decimal::ONE, "summer factor {jul} < 1");
         assert_eq!(jan, jan.round_dp(4));
         // Result rounding to 3 decimals (Anwendungshilfe, verbatim rule).
-        let applied = d.apply(dec!(1.23456), 15);
+        let applied = d.apply(dec!(1.23456), 15).expect("mid-January");
         assert_eq!(applied, applied.round_dp(3));
+    }
+
+    /// A quartic fitted to a year says nothing outside it. At t = 400 the 1999
+    /// polynomial has already fallen through zero, so a day number that is not
+    /// a day of the year is refused rather than scaled by a plausible-looking
+    /// number.
+    #[test]
+    fn dynamization_refuses_a_day_outside_the_year() {
+        use rust_decimal::dec;
+        let d = Dynamization::vdew_1999();
+        assert!(d.factor(1).is_some());
+        assert!(d.factor(366).is_some());
+        assert_eq!(d.factor(0), None);
+        assert_eq!(d.factor(367), None);
+        assert_eq!(d.factor(u16::MAX), None);
+        assert_eq!(d.apply(dec!(1), 0), None);
+
+        // ...and the profile lookup propagates the refusal rather than
+        // returning an undynamized value.
+        let h25 = DynamicSlpProfile {
+            profile: Some(LoadProfile::H25),
+            dynamization: Some(d),
+            values: std::collections::BTreeMap::from([(
+                (1, SlpDayType::Werktag),
+                vec![dec!(1); 96],
+            )]),
+        };
+        assert!(h25.value_at(1, SlpDayType::Werktag, 0, 15).is_some());
+        assert_eq!(h25.value_at(1, SlpDayType::Werktag, 0, 400), None);
     }
 
     #[test]

@@ -98,7 +98,14 @@ impl AnnualForecast {
     /// ```text
     /// Var(total) = Y² · σ²/n   (the daily mean is estimated from n days)
     ///            + Y  · σ²     (the remaining days vary around it)
+    ///
+    /// half-width  = t(0.975, n−1) · √Var(total) · seasonal factor
     /// ```
+    ///
+    /// The multiplier is **Student's t**, not the normal 1.96: σ is estimated
+    /// from the same handful of days the projection is, so the interval has to
+    /// pay for that uncertainty. At the seven days this crate will project
+    /// from, t is 2.447 — 25 % wider — and the gap closes as the window grows.
     ///
     /// The first term dominates for a short window: with `Y = 365` and
     /// `n = 14` it is twenty-six times the second, so omitting it would report
@@ -111,17 +118,23 @@ impl AnnualForecast {
     /// uncertainty, not a confidence statement about the year.
     #[must_use]
     pub const fn prediction_interval_note() -> &'static str {
-        "95 % interval from daily-sum variability, assuming independent days; \
-         real load profiles are autocorrelated and seasonal, so the true spread is wider"
+        "95 % interval from daily-sum variability (Student's t, n − 1 df), assuming \
+         independent days; real load profiles are autocorrelated and seasonal, so the \
+         true spread is wider"
     }
 
-    /// Mean daily consumption over the observation window (kWh/day).
+    /// Mean daily consumption over the observation window (kWh/day), to
+    /// [`FORECAST_DP`] places.
+    ///
+    /// Cut for the same reason [`projected_annual`](Self::projected_annual) is:
+    /// the division rarely terminates, and this is a number that goes into a
+    /// report rather than into another calculation.
     #[must_use]
     pub fn daily_average_kwh(&self) -> Decimal {
         if self.observed_days == 0 {
             return Decimal::ZERO;
         }
-        self.observed / Decimal::from(self.observed_days)
+        (self.observed / Decimal::from(self.observed_days)).round_dp(FORECAST_DP)
     }
 }
 
@@ -211,7 +224,13 @@ pub fn project_annual_consumption(
 
     let target_year = crate::calendar::local_year(last_to);
     let target_year_days = crate::calendar::days_in_year(target_year);
-    let daily_avg = observed / Decimal::from(observed_days);
+    // Cut here, not only at the end. The projection is a number an operator
+    // has to be able to re-derive from the figures the report states — MessEV
+    // § 25 Nr. 7 asks for the method *and the values used* — and a projection
+    // computed from a 28-digit average nobody can see does not reproduce from
+    // the 3-place average beside it. `AnnualForecast::daily_average_kwh`
+    // returns exactly this value.
+    let daily_avg = (observed / Decimal::from(observed_days)).round_dp(FORECAST_DP);
 
     // The flag says whether the correction ran, not whether the factor differs
     // from 1 — a legitimately neutral factor is still a correction.
@@ -280,13 +299,52 @@ fn prediction_half_width(
     // windows.
     let total_variance = variance * (y * y / n + y);
     let factor = seasonal_factor.to_f64()?;
-    let half = 1.96 * total_variance.sqrt() * factor.abs();
+    // Student's t with n − 1 degrees of freedom, not the normal 1.96: σ is
+    // estimated from the same short window the projection is, and pretending it
+    // is known reports an interval that is too narrow exactly when the caller
+    // most needs it wide. At the seven days this function will accept, t is
+    // 2.447 against 1.96 — a quarter wider.
+    let half = t_quantile_975(values.len() - 1) * total_variance.sqrt() * factor.abs();
     if !half.is_finite() {
         return None;
     }
     Decimal::try_from(half)
         .ok()
         .map(|d| d.round_dp(FORECAST_DP))
+}
+
+/// The two-sided 97.5 % quantile of Student's t with `df` degrees of freedom.
+///
+/// Tabulated to three decimal places for `df` 1–30 — the range where t and the
+/// normal quantile differ enough to matter, and where no series expansion is
+/// accurate — and continued by the Cornish–Fisher expansion beyond it, whose
+/// error against the published table is below `5 × 10⁻⁴` from `df = 30` upward
+/// and falls as `df` grows. `df = 0` has no quantile; the caller cannot reach it
+/// (two daily sums are required for a variance at all) and it answers with the
+/// first tabulated value rather than an infinity that would poison the interval.
+fn t_quantile_975(df: usize) -> f64 {
+    /// Two-sided 95 % (upper-tail 2.5 %) critical values, `df` = 1…30.
+    const TABLE: [f64; 30] = [
+        12.706, 4.303, 3.182, 2.776, 2.571, 2.447, 2.365, 2.306, 2.262, 2.228, 2.201, 2.179, 2.160,
+        2.145, 2.131, 2.120, 2.110, 2.101, 2.093, 2.086, 2.080, 2.074, 2.069, 2.064, 2.060, 2.056,
+        2.052, 2.048, 2.045, 2.042,
+    ];
+    /// Φ⁻¹(0.975).
+    const Z: f64 = 1.959_963_984_540_054;
+
+    if df == 0 {
+        return TABLE[0];
+    }
+    if df <= TABLE.len() {
+        return TABLE[df - 1];
+    }
+    let v = df as f64;
+    let (z3, z5, z7, z9) = (Z.powi(3), Z.powi(5), Z.powi(7), Z.powi(9));
+    Z + (z3 + Z) / (4.0 * v)
+        + (5.0 * z5 + 16.0 * z3 + 3.0 * Z) / (96.0 * v * v)
+        + (3.0 * z7 + 19.0 * z5 + 17.0 * z3 - 15.0 * Z) / (384.0 * v * v * v)
+        + (79.0 * z9 + 776.0 * z7 + 1482.0 * z5 - 1920.0 * z3 - 945.0 * Z)
+            / (92160.0 * v * v * v * v)
 }
 
 /// The prior year's daily rate over the matching window, relative to its
@@ -498,9 +556,11 @@ mod tests {
         assert_eq!(f.confidence_upper, Some(f.projected_annual));
     }
 
-    /// The estimation term dominates a short window. Omitting it — as the
-    /// previous `1.96 · σ · √Y` did — reported an interval about five times
-    /// too narrow at n = 14.
+    /// The estimation term dominates a short window.
+    ///
+    /// `1.96 · σ · √Y` — the interval for a *known* σ over Y independent days —
+    /// is about five times too narrow at n = 14, because it charges nothing for
+    /// the daily mean itself being an estimate.
     #[test]
     fn the_interval_includes_the_estimation_error() {
         let base = crate::calendar::day_start_utc(date!(2026 - 01 - 01));
@@ -519,20 +579,48 @@ mod tests {
             .to_f64()
             .unwrap();
 
-        // Daily sums alternate 96 and 192 kWh: σ ≈ 49.9 over n = 14.
+        // Daily sums alternate 96 and 192 kWh: σ ≈ 49.9 over n = 14, so
+        // t(0.975, 13) = 2.160 rather than the normal 1.96.
         let sigma = 49.9_f64;
         let y = 365.0_f64;
-        let old = 1.96 * sigma * y.sqrt(); // the formula that was there
-        let new = 1.96 * (sigma * sigma * (y * y / 14.0 + y)).sqrt();
+        let residual_only = 1.96 * sigma * y.sqrt();
+        let expected = 2.160 * (sigma * sigma * (y * y / 14.0 + y)).sqrt();
 
         assert!(
-            (half - new).abs() / new < 0.05,
-            "half-width {half:.0} should be near {new:.0}"
+            (half - expected).abs() / expected < 0.05,
+            "half-width {half:.0} should be near {expected:.0}"
         );
         assert!(
-            half > old * 4.0,
-            "the corrected interval must be several times the old one: {half:.0} vs {old:.0}"
+            half > residual_only * 4.0,
+            "an interval that ignores the estimation error is several times too \
+             narrow: {half:.0} vs {residual_only:.0}"
         );
+    }
+
+    /// The tabulated quantiles and the expansion that continues them agree
+    /// where they meet, and both match the published table.
+    #[test]
+    fn the_t_quantile_matches_the_published_table() {
+        // Table values, two-sided 95 %.
+        for (df, expected) in [(1, 12.706), (6, 2.447), (13, 2.160), (30, 2.042)] {
+            assert!((t_quantile_975(df) - expected).abs() < 1e-9, "df {df}");
+        }
+        // Cornish–Fisher beyond the table, against the same published source.
+        for (df, expected) in [(40, 2.021), (60, 2.000), (120, 1.980)] {
+            let got = t_quantile_975(df);
+            assert!(
+                (got - expected).abs() < 5e-4,
+                "df {df}: {got} vs {expected}"
+            );
+        }
+        // Monotone, and converging on the normal quantile from above.
+        let mut previous = f64::MAX;
+        for df in 1..500 {
+            let q = t_quantile_975(df);
+            assert!(q < previous, "df {df} is not below df {}", df - 1);
+            assert!(q > 1.959_963, "df {df} fell below the normal quantile");
+            previous = q;
+        }
     }
 
     /// A longer window shrinks the interval, which is the whole point of the

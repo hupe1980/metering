@@ -496,7 +496,8 @@ fn ggv_constant<S: BuildHasher>(
 /// The zero-denominator branch follows the Anwendungshilfe: *"Ist die
 /// Energiemenge einer Marktlokation zugeordneten Messlokation = 0, so ist auch
 /// der Verbrauch der Marktlokation auf 0 zu setzen. Dies verhindert auch eine
-/// Division durch 0."* With quantities positive-or-zero (Codeliste v2.5c
+/// Division durch 0, falls alle Messlokationen eine Energiemenge von 0
+/// aufweisen."* With quantities positive-or-zero (Codeliste v2.5c
 /// §2.1), `total = 0` implies this tenant's own consumption is 0, so the net
 /// is 0 by the identity rather than by a special case — which is why the net
 /// is computed the same way in both branches instead of being forced to zero.
@@ -529,8 +530,12 @@ fn ggv_proportional<S: BuildHasher>(
             continue;
         };
 
+        // Multiply before dividing. `value ÷ total × generation` rounds the
+        // quotient to 28 significant digits *before* scaling it up, so the
+        // error rides the multiplication; one division at the end keeps every
+        // digit the inputs carry.
         let share = allocation_share(if total > Decimal::ZERO {
-            tenant_iv.value / total * plant_iv.value
+            tenant_iv.value * plant_iv.value / total
         } else {
             Decimal::ZERO
         });
@@ -1481,18 +1486,17 @@ mod ggv_allocation_tests {
             assert_eq!(iv.allocated, iv.share);
             total_share += iv.share;
         }
-        // The shares exhaust the generation to the last representable place,
-        // and never past it. Exhausting it *exactly* is what would require an
-        // unrepresentable share: 4 ÷ 12 × 9 is 2.999…7 at `Decimal`'s full
-        // width, and `ALLOCATION_DP` cuts it toward zero to 2.999999. Erring
-        // downwards is deliberate — it keeps `Σ share ≤ generation`, so the
-        // § 42b Abs. 5 ceiling holds without a second clamp.
+        // Three equal tenants of 4 kWh each against 9 kWh of generation:
+        // `4 × 9 ÷ 12` is exactly 3, so the shares exhaust the generation
+        // exactly. That is a property of the *order* of the operations —
+        // `4 ÷ 12 × 9` rounds 0.333…3 first and lands at 2.999999 after the
+        // `ALLOCATION_DP` cut, three millionths short — and it is why the
+        // share multiplies before it divides.
+        assert_eq!(total_share, dec!(9));
+        // Where the quotient genuinely does not terminate the cut still errs
+        // downwards, which is what keeps `Σ share ≤ generation` and with it the
+        // § 42b Abs. 5 ceiling, without a second clamp.
         assert!(total_share <= dec!(9), "never over the generation");
-        assert!(
-            dec!(9) - total_share < dec!(0.00001),
-            "and within a hundredth of a milliwatt-hour of it: {total_share}"
-        );
-        assert_eq!(total_share, dec!(8.999999));
     }
 
     /// A zero total is the Anwendungshilfe's division-by-zero guard. With

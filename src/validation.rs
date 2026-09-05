@@ -1006,6 +1006,12 @@ fn expected_length_secs(iv: &MeterInterval, expected_secs: u32, boundary: DayBou
 ///
 /// One finding per run, anchored at its first interval, so a series with two
 /// separate outages reports two.
+///
+/// **A gap ends a run.** Zeros either side of a hole are not consecutive
+/// readings of zero — they are two runs with an unknown stretch between them,
+/// and joining them would report a stuck meter over a period nobody measured.
+/// Adjacency is `next.from == previous.to`, the same test V01 uses for a gap,
+/// so the two rules cannot disagree about whether a series is continuous.
 fn zero_run_rule(
     intervals: &[MeterInterval],
     order: &[usize],
@@ -1037,8 +1043,14 @@ fn zero_run_rule(
         );
     };
 
+    let mut previous_end: Option<OffsetDateTime> = None;
     for &idx in order {
-        if intervals[idx].value.is_zero() {
+        let iv = &intervals[idx];
+        let contiguous = previous_end.is_none_or(|end| iv.from == end);
+        if !contiguous {
+            close(run.take(), &mut issues);
+        }
+        if iv.value.is_zero() {
             run = Some(match run {
                 Some((start_idx, len)) => (start_idx, len + 1),
                 None => (idx, 1),
@@ -1046,6 +1058,7 @@ fn zero_run_rule(
         } else {
             close(run.take(), &mut issues);
         }
+        previous_end = Some(iv.to);
     }
     close(run, &mut issues);
     issues
@@ -1187,23 +1200,32 @@ fn gap_rules(
         return issues;
     };
 
-    // Interior gaps. **Any** uncovered second is reported, not only a whole
-    // missing interval: a series whose intervals are the right length but sit
-    // off the grid — 00:00–00:15 then 00:20–00:35 — leaves five minutes
-    // uncovered that V06 cannot see, because every interval is exactly 900 s.
-    // Requiring a full `step` let that pass as clean.
-    for window in order.windows(2) {
-        let (a, b) = (&intervals[window[0]], &intervals[window[1]]);
-        if b.from > a.to {
-            issues.push(gap_issue(a.to, b.from, expected_secs, Some(window[1])));
+    // Interior gaps. **Any** uncovered second counts, not only a whole missing
+    // interval: an off-grid series — 00:00–00:15 then 00:20–00:35 — leaves five
+    // minutes uncovered that V06 cannot see, every interval being exactly 900 s.
+    //
+    // Measured against the furthest end seen so far, as V02 is: sorted by
+    // `from`, one long interval can swallow several short ones, and a pairwise
+    // comparison would report the space behind a swallowed interval as missing
+    // while the long one covers it.
+    let mut covered_to: Option<OffsetDateTime> = None;
+    for &idx in order {
+        let iv = &intervals[idx];
+        if let Some(end) = covered_to
+            && iv.from > end
+        {
+            issues.push(gap_issue(end, iv.from, expected_secs, Some(idx)));
         }
+        covered_to = Some(covered_to.map_or(iv.to, |end| end.max(iv.to)));
     }
 
     // Head and tail, against the declared period. Without a period the series
     // defines its own extent and a truncated delivery is invisible.
     if let Some((period_from, period_to)) = config.period {
         let first = &intervals[order[0]];
-        let last = &intervals[*order.last().expect("non-empty")];
+        // The furthest end, again: with an overlapping series the last
+        // interval by `from` need not be the one that reaches furthest.
+        let last_to = covered_to.unwrap_or(first.to);
         if first.from > period_from {
             issues.push(gap_issue(
                 period_from,
@@ -1212,8 +1234,8 @@ fn gap_rules(
                 Some(order[0]),
             ));
         }
-        if period_to > last.to {
-            issues.push(gap_issue(last.to, period_to, expected_secs, None));
+        if period_to > last_to {
+            issues.push(gap_issue(last_to, period_to, expected_secs, None));
         }
     }
 
@@ -1504,6 +1526,7 @@ mod gap_grid_tests {
     use super::*;
     use crate::interval::QualityFlag;
     use rust_decimal::dec;
+    use time::Duration;
     use time::macros::datetime;
 
     fn iv(from: OffsetDateTime, to: OffsetDateTime) -> MeterInterval {
@@ -1514,6 +1537,112 @@ mod gap_grid_tests {
             quality: QualityFlag::Measured,
             obis_code: None,
         }
+    }
+
+    /// Two zeros either side of a hole are not four consecutive zeros: what
+    /// happened in the hole is unknown, and reporting a stuck meter across it
+    /// claims a measurement nobody took.
+    #[test]
+    fn a_gap_ends_a_zero_run() {
+        let zero = |from: OffsetDateTime, to: OffsetDateTime| MeterInterval {
+            value: dec!(0),
+            ..iv(from, to)
+        };
+        // Four zeros, but the middle two are an hour later — one hole between
+        // two runs of two, and the threshold is four.
+        let series = vec![
+            zero(
+                datetime!(2026-06-01 0:00 UTC),
+                datetime!(2026-06-01 0:15 UTC),
+            ),
+            zero(
+                datetime!(2026-06-01 0:15 UTC),
+                datetime!(2026-06-01 0:30 UTC),
+            ),
+            zero(
+                datetime!(2026-06-01 1:30 UTC),
+                datetime!(2026-06-01 1:45 UTC),
+            ),
+            zero(
+                datetime!(2026-06-01 1:45 UTC),
+                datetime!(2026-06-01 2:00 UTC),
+            ),
+        ];
+        let result = validate_intervals(&series, &ValidationConfig::default());
+        assert_eq!(
+            result.by_rule(ValidationRuleId::SuspiciousZeroRun).count(),
+            0,
+            "two runs of two, not one run of four"
+        );
+
+        // Contiguous, and the same four zeros do trip it.
+        let contiguous: Vec<_> = (0..4)
+            .map(|i| {
+                zero(
+                    datetime!(2026-06-01 0:00 UTC) + Duration::minutes(15 * i),
+                    datetime!(2026-06-01 0:15 UTC) + Duration::minutes(15 * i),
+                )
+            })
+            .collect();
+        let tripped = validate_intervals(&contiguous, &ValidationConfig::default());
+        assert_eq!(
+            tripped.by_rule(ValidationRuleId::SuspiciousZeroRun).count(),
+            1
+        );
+    }
+
+    /// A swallowed interval leaves no gap behind it.
+    ///
+    /// Sorted by `from`, the short interval inside a long one is followed by a
+    /// start earlier than the long one's end, so a pairwise comparison reports
+    /// the space *after* the short one as missing — while the long interval
+    /// covers it. An overlapping series is already an error; a second, wrong
+    /// finding on top of it sends the reader to a slot that has data.
+    #[test]
+    fn an_overlap_does_not_manufacture_a_gap() {
+        let series = vec![
+            iv(
+                datetime!(2026-06-01 0:00 UTC),
+                datetime!(2026-06-01 1:00 UTC),
+            ),
+            iv(
+                datetime!(2026-06-01 0:15 UTC),
+                datetime!(2026-06-01 0:30 UTC),
+            ),
+        ];
+        let result = validate_intervals(&series, &ValidationConfig::default());
+        assert_eq!(result.by_rule(ValidationRuleId::OverlapDetected).count(), 1);
+        assert_eq!(
+            result.by_rule(ValidationRuleId::GapDetected).count(),
+            0,
+            "the hour covers 00:30–01:00, so nothing is missing"
+        );
+    }
+
+    /// The same reasoning at the tail: the interval that reaches furthest is
+    /// not always the last one by `from`.
+    #[test]
+    fn the_tail_gap_is_measured_from_the_furthest_end() {
+        let series = vec![
+            iv(
+                datetime!(2026-06-01 0:00 UTC),
+                datetime!(2026-06-01 1:00 UTC),
+            ),
+            iv(
+                datetime!(2026-06-01 0:15 UTC),
+                datetime!(2026-06-01 0:30 UTC),
+            ),
+        ];
+        let cfg = ValidationConfig::default().over_period(
+            datetime!(2026-06-01 0:00 UTC),
+            datetime!(2026-06-01 1:00 UTC),
+        );
+        let result = validate_intervals(&series, &cfg);
+        assert_eq!(
+            result.by_rule(ValidationRuleId::GapDetected).count(),
+            0,
+            "measured from 01:00, not from the swallowed interval's 00:30"
+        );
     }
 
     /// A hole shorter than one interval is still a hole. V06 cannot see it —

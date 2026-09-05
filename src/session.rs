@@ -530,11 +530,22 @@ fn cumulative(
     // the one containing `t` is at or after it. The scan from there is bounded
     // by how far the cursor has yet to advance, and across a whole session it
     // walks the list once.
-    let Some(seg) = segments[hint.min(segments.len())..]
+    let found = segments[hint.min(segments.len())..]
         .iter()
         .find(|s| s.start < t && t <= s.end)
-    else {
-        return Decimal::ZERO;
+        // The hint is a cursor into a list the caller walks forward; if it ever
+        // pointed past `t`, a full scan still answers correctly.
+        .or_else(|| segments.iter().find(|s| s.start < t && t <= s.end));
+    let Some(seg) = found else {
+        // Unreachable: the segments tile `[from, to)` and `from < t < to` here.
+        // The fallback is the total delivered by the last segment rather than
+        // zero, because a cumulative that drops to zero mid-series turns the
+        // next slot difference negative — an unreachable branch must not be
+        // the one that breaks the invariant the whole module rests on.
+        debug_assert!(false, "segments do not tile the session span");
+        return segments
+            .last()
+            .map_or(Decimal::ZERO, |s| allocation_share(s.cum_before + s.energy));
     };
     let span = (seg.end - seg.start).whole_seconds();
     if span <= 0 {

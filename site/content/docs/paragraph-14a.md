@@ -1,7 +1,7 @@
 +++
 title = "§ 14a steering"
 description = "The two powers a netzorientierte Steuerung turns on: the netzwirksamer Leistungsbezug it reduces, and the Mindestleistung it may not reduce past."
-weight = 8
+weight = 9
 +++
 
 BNetzA **BK6-22-300** (27.11.2023, in force 01.01.2024) lets a Netzbetreiber cut
@@ -82,8 +82,8 @@ site.
 Ziff. 4.5.2, verbatim:
 
 ```text
-Sofern Anlagen im Sinne der Ziffern 2.4.1.b sowie 2.4.1.c (jeweils i.V.m.
-Ziffer 2.4.2), mit einer Netzanschlussleistung über 11 kW Bestandteil der
+Sofern Anlagen im Sinne der Ziffern 2.4.1.b. sowie 2.4.1.c. (jeweils i.V.m.
+Ziffer 2.4.2.), mit einer Netzanschlussleistung über 11 kW Bestandteil der
 Steuerung nach Ziffer 4.4.b sind, gilt:
 
   P_min,14a = Max(0,4 x P_Summe WP; 0,4 x P_Summe Klima) + (n_steuVE − 1) x GZF x 4,2 kW
@@ -138,8 +138,8 @@ and at `n = 1` the term it multiplies is zero anyway.
 
 ## Which devices scale, and which do not
 
-Ziff. 4.5.1 Satz 2 and Ziff. 4.5.2 Satz 3 both name *"Ziffern 2.4.1.b sowie
-2.4.1.c"* — Wärmepumpe and Raumkühlung — and no others. So a 50 kW Ladepunkt
+Ziff. 4.5.1 Satz 2 and Ziff. 4.5.2 Satz 3 both name *"Ziffern 2.4.1.b. sowie
+2.4.1.c."* — Wärmepumpe and Raumkühlung — and no others. So a 50 kW Ladepunkt
 keeps the flat 4,2 kW floor while a 20 kW heat pump scales to 8 kW, and the
 threshold is strict: exactly 11 kW is not *"über 11 kW"*.
 
@@ -175,8 +175,8 @@ has to clear the threshold, so group first.
 
 Ziff. 2.4.2: where several Anlagen of Fallgruppe b or c sit behind one
 Netzanschluss, what matters is whether **their sum** exceeds 4,2 kW, and in that
-case *"werden diese gruppierten Anlagen als eine steuerbare
-Verbrauchseinrichtung behandelt"*.
+case *"werden im Sinne dieser Festlegung diese gruppierten Anlagen als eine
+steuerbare Verbrauchseinrichtung behandelt"*.
 
 So grouping changes both the branch and the count. Three ungrouped 5 kW heat
 pumps are three steuVE, none over 11 kW, and take the flat branch; the same

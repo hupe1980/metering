@@ -1,13 +1,18 @@
 +++
 title = "Regulatory basis"
 description = "Every provision this library implements, quoted from the published text and dated — including the ones it deliberately does not claim."
-weight = 13
+weight = 14
 +++
 
 Every citation below is checked against the current published text — most
-recently in August 2026, against the EDI@Energy versions binding since
+recently in September 2026, against the EDI@Energy versions binding since
 1 April 2026. Where a claim cannot be verified, the library says so rather than
 asserting it.
+
+Checked how, exactly: every German passage the crate presents as verbatim source
+text is matched against the published PDF, character for character, by
+`just quotes`. Sixty-five of the sixty-six verify mechanically; the one that does
+not is a label inside a figure, which no text extractor can read.
 
 *Allgemeine Festlegungen* v6.1d becomes binding on 1 October 2026 and carries
 every passage cited here unchanged, so the v6.1c references below stay accurate
@@ -46,12 +51,14 @@ anerkannte Regel in question.
 
 | Topic | Basis |
 |---|---|
-| Ersatzwertbildung, Datenübermittlung | § 60 Abs. 1, 2 MsbG; procedures per BNetzA BK6-24-174, VDE-AR-N 4400 |
-| Löschung / Anonymisierung | § 60 Abs. 6 MsbG — a **ceiling** of three years, not a retention duty |
+| Ersatzwertbildung, Datenübermittlung | § 60 Abs. 1, 2 MsbG; procedures per BNetzA BK6-24-174, VDE-AR-N 4400. The Smart-Meter-Gateway placement of Abs. 2 is **conditional** on a BSI assessment and a BNetzA Festlegung; until then Satz 2 permits the preparation outside the gateway |
+| Löschung / Anonymisierung | § 60 Abs. 6 MsbG — a **ceiling** of three years, not a retention duty, and owed *"unter Beachtung mess- und eichrechtlicher Vorgaben"* |
 | Zählerstandsgangmessung | § 2 Satz 1 Nr. 27 MsbG; BNetzA BK6-24-174, in force 6 June 2025 |
 | Spitzenleistung / Jahreshöchstleistung | § 17 Abs. 2 StromNEV |
-| iMSys Pflichteinbaufälle | § 29 Abs. 1 MsbG — > 6 000 kWh/a; § 14a agreement; > 7 kW |
-| Rollout-Fahrplan | § 45 Abs. 1 MsbG |
+| iMSys Pflichteinbaufälle | § 29 Abs. 1 MsbG — > 6 000 kWh/a (Nr. 1); § 14a agreement (Nr. 2a); a plant > 7 kW (Nr. 2b). The grounds are **cumulative**, the Steuerungseinrichtung belongs to **Nr. 2 as a whole**, and Nr. 2b applies only *"soweit dies erforderlich ist"* to meet the § 45 quotas |
+| Steuerungseinrichtung, waiver | § 29 Abs. 5 MsbG — lifted where feed-in is permanently limited to 0 % **and** declared in Textform; both, or neither |
+| Moderne Messeinrichtung | § 29 Abs. 3 MsbG — everything the iMSys duty does not reach, by 31 December 2032 (new and majorly renovated buildings: at completion) |
+| Rollout-Fahrplan | § 45 Abs. 1 **Nr. 4** MsbG — the ordinary Letztverbraucher track. Nr. 1–3 are three further schedules, two of them measured in installed **kilowatts** rather than in Messstellen |
 | Zeitvariable Netzentgelte | § 14a EnWG Modul 3 (BNetzA BK8-22/010-A) — three levels, mandatory for every NB since 1 April 2025 |
 | Modul-3-Rahmenbedingungen | BDEW *Anwendungshilfe für die Umsetzung von Modul 3* v1.1, 07.02.2025, §2 — HT ≥ 2 h/Tag, ganzjährig identische Zeitfenster, ≥ 2 Quartale, nur mit Modul 1, iMSys, kein RLM |
 | Netzorientierte Steuerung, netzwirksamer Leistungsbezug | BNetzA **BK6-22-300** Anlage 1 (27.11.2023, in Kraft 01.01.2024) Ziff. 2.3 — a definition, not a formula |
@@ -77,6 +84,11 @@ anerkannte Regel in question.
 | Bilanzierungsmonat Strom 00:00, Gas 06:00 | EDI@Energy Allgemeine Festlegungen v6.1c, Kap. 3.1 |
 | SLP-Typtage, Feiertagskalender | BDEW *Hinweise zu den aktualisierten SLP Strom*, 17.03.2025 |
 | Netzqualität | EN 50160 |
+| Benutzungsstundenzahl | § 17 Abs. 1 StromNEV; Anlage 4 zu § 17 Abs. 2 — the Gleichzeitigkeitsgrad's two lines meet *"durch die Jahresbenutzungsdauer 2 500 Stunden"* and reach 1 at 8 760 Stunden |
+| Blindmehrarbeit | No national rule. The Freigrenze is the Netzbetreiber's, from its Preisblatt — 50 % der Wirkarbeit or `cos φ = 0,9`; both are offered, neither presumed |
+| Wertestatus eines Messwerts | EDI@Energy **MSCONS MIG 2.4c**, `QTY` Mengen-Qualifier — `220` Wahrer Wert, `67` Ersatzwert, `187` Prognosewert, `Z18` Vorläufiger Wert, `20` Nicht verwendbarer Wert |
+| Ersatzwertbildungsverfahren | MSCONS MIG 2.4c, `STS+Z32` — 13 codes; `Z92` Interpolation, `Z93` Haltewert (Gas), `Z95` Historische Messwerte (Gas), `ZJ2` Statistische Methode (Strom) |
+| Grund der Ersatzwertbildung | MSCONS MIG 2.4c, `STS+Z40` — the 28 Statusanlässe `SubstitutionReason` is |
 
 ## Repealed ordinances
 
@@ -101,6 +113,20 @@ That matters for two provisions commonly still quoted:
 - **G 685 final rounding.** Published Netzbetreiber Merkblätter demonstrably
   diverge between whole-kWh and two-decimal results, and the normative text is
   not freely citable. It is a setting.
+- **Whether a *particular* plant above 7 kW is due for an iMSys.** § 29 Abs. 1
+  Nr. 2b applies *"soweit dies erforderlich ist"* to reach the § 45 Abs. 1
+  quotas, which depends on how much installed capacity the Messstellenbetreiber
+  has already equipped in its own Netzgebiet. The crate reports the condition
+  (`RolloutObligation::is_quota_conditional`) and leaves the portfolio question
+  where it belongs.
+- **The Blindarbeit Freigrenze.** There is no national rule: § 17 Abs. 1
+  StromNEV leaves it to the Netzbetreiber's Ergänzende Bedingungen, and
+  published Preisblätter state it both as *50 % der Wirkarbeit* and as
+  `cos φ = 0,9`. Both ratios are offered as constants **because they are
+  published practice**, not because either is the rule; a third value is passed
+  in. The conversion `tan(arccos(cos φ))` is stated rather than computed, since
+  a square root has no exact decimal and no float touches a number that
+  multiplies a billed quantity.
 - **VDE-AR-N 4400 thresholds.** A paywalled Anwendungsregel whose text cannot be
   reproduced here, so every threshold is a parameter with a documented default.
 - **EN 50160 voltage unbalance.** Needs phase angles this data does not carry.

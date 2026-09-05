@@ -38,6 +38,13 @@ use rust_decimal::Decimal;
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
+/// Decimal places [`ImbalanceSaldo::delta_pct`] is cut to: **2**.
+///
+/// The same width as [`NetworkLosses::verlust_prozent`](crate::losses::NetworkLosses::verlust_prozent),
+/// so the two percentages a settlement report prints side by side are cut the
+/// same way.
+pub const IMBALANCE_PCT_DP: u32 = 2;
+
 /// Result of a Mehr-/Mindermengensaldo calculation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
@@ -84,15 +91,29 @@ impl ImbalanceSaldo {
         self.delta_kwh.abs()
     }
 
-    /// Imbalance as a percentage of contracted quantity.
+    /// Imbalance as a percentage of the contracted quantity, to
+    /// [`IMBALANCE_PCT_DP`] places.
     ///
-    /// Returns `None` when `contracted_kwh` is zero.
+    /// Cut, because this is a figure someone reads: the quotient
+    /// `delta ÷ contracted` does not generally terminate, and a percentage
+    /// carrying twenty-eight significant digits is not a percentage. Two
+    /// places is what a Mehr-/Mindermengen report prints, and it matches
+    /// [`NetworkLosses::verlust_prozent`](crate::losses::NetworkLosses::verlust_prozent).
+    ///
+    /// `None` when `contracted_kwh` is zero — a share of nothing is not zero
+    /// percent, it is undefined.
     #[must_use]
     pub fn delta_pct(&self) -> Option<Decimal> {
         if self.contracted_kwh.is_zero() {
             None
         } else {
-            Some(self.delta_kwh / self.contracted_kwh * Decimal::from(100u32))
+            Some(
+                (self.delta_kwh / self.contracted_kwh * Decimal::ONE_HUNDRED)
+                    .round_dp_with_strategy(
+                        IMBALANCE_PCT_DP,
+                        rust_decimal::RoundingStrategy::MidpointAwayFromZero,
+                    ),
+            )
         }
     }
 }

@@ -15,13 +15,10 @@ use time::macros::{date, datetime};
 
 #[test]
 fn quick_start() {
-    let intervals = vec![MeterInterval {
-        from: datetime!(2026-06-01 0:00 UTC),
-        to: datetime!(2026-06-01 0:15 UTC),
-        value: dec!(2.345),
-        quality: QualityFlag::Measured,
-        obis_code: Some("1-0:1.8.0".parse().unwrap()),
-    }];
+    let intervals = vec![
+        MeterInterval::quarter_hour(datetime!(2026-06-01 0:00 UTC), dec!(2.345))
+            .with_obis(ObisCode::STROM_BEZUG_TOTAL),
+    ];
 
     let period = aggregate(&intervals, &AggregationConfig::rlm());
     assert_eq!(period.arbeitsmenge, dec!(2.345));
@@ -652,13 +649,7 @@ fn gas_day_resample_section() {
 
     let start = calendar::gas_day_start_utc(date!(2026 - 01 - 15));
     let series: Vec<MeterInterval> = (0..48)
-        .map(|i| MeterInterval {
-            from: start + Duration::hours(i),
-            to: start + Duration::hours(i + 1),
-            value: dec!(1),
-            quality: QualityFlag::Measured,
-            obis_code: None,
-        })
+        .map(|i| MeterInterval::hour(start + Duration::hours(i), dec!(1)))
         .collect();
 
     let gas_days = resample(&series, &ResampleConfig::to_gas_daily());
@@ -682,13 +673,7 @@ fn readme_gas_day_section() {
 
     let start = calendar::gas_day_start_utc(date!(2026 - 01 - 15));
     let series: Vec<MeterInterval> = (0..48)
-        .map(|i| MeterInterval {
-            from: start + Duration::hours(i),
-            to: start + Duration::hours(i + 1),
-            value: dec!(1),
-            quality: QualityFlag::Measured,
-            obis_code: None,
-        })
+        .map(|i| MeterInterval::hour(start + Duration::hours(i), dec!(1)))
         .collect();
 
     let gas_days = resample(&series, &ResampleConfig::to_gas_daily());
@@ -1383,4 +1368,154 @@ fn measurement_point_direction_section() {
 
     mp.energy_flow = EnergyFlow::Consumption;
     assert_eq!(mp.direction_conflict(), None);
+}
+
+// ── docs/billing-quantities.md ───────────────────────────────────────────────
+
+/// Docs — "Arbeit and Leistung", and "Benutzungsstundenzahl".
+#[test]
+fn billing_quantities_section() {
+    use time::Duration;
+
+    let day: Vec<MeterInterval> = (0..96)
+        .map(|i| {
+            MeterInterval::quarter_hour(
+                datetime!(2026-06-01 0:00 UTC) + Duration::minutes(15 * i),
+                dec!(1),
+            )
+        })
+        .collect();
+
+    let period = aggregate(&day, &AggregationConfig::rlm());
+    assert_eq!(period.arbeitsmenge, dec!(96));
+    assert_eq!(period.spitzenleistung_kw, Some(dec!(4)));
+    assert_eq!(
+        period.spitzenleistung_at,
+        Some(datetime!(2026-06-01 0:00 UTC))
+    );
+    assert_eq!(period.benutzungsdauer_h(), Some(dec!(24)));
+    assert!(period.uniform_resolution);
+}
+
+/// Docs — "One resolution, or none".
+#[test]
+fn mixed_resolution_section() {
+    let quarter = MeterInterval::quarter_hour(datetime!(2026-06-01 0:00 UTC), dec!(1));
+    let hour = MeterInterval::hour(datetime!(2026-06-01 0:15 UTC), dec!(2));
+
+    let mixed = aggregate(&[quarter, hour], &AggregationConfig::rlm());
+    assert!(!mixed.uniform_resolution);
+    assert_eq!(mixed.spitzenleistung_kw, Some(dec!(4)));
+}
+
+/// Docs — "Blindmehrarbeit".
+#[test]
+fn blindmehrarbeit_section() {
+    use metering::reactive::{ReactiveLimit, blindmehrarbeit};
+
+    let balance = blindmehrarbeit(dec!(100000), dec!(62000), ReactiveLimit::half());
+    assert_eq!(balance.freigrenze_kvarh, dec!(50000.0));
+    assert_eq!(balance.blindmehrarbeit_kvarh, dec!(12000.0));
+
+    let strict = blindmehrarbeit(dec!(100000), dec!(62000), ReactiveLimit::cos_phi_0_9());
+    assert_eq!(strict.blindmehrarbeit_kvarh, dec!(13570.0000));
+
+    let compensated = blindmehrarbeit(dec!(100000), dec!(20000), ReactiveLimit::half());
+    assert_eq!(compensated.headroom_kvarh(), dec!(30000.0));
+}
+
+/// Docs — "Import, export, and what has neither".
+#[test]
+fn directional_balance_page_section() {
+    use metering::aggregation::sum_by_direction;
+
+    let iv = |code: &str, kwh| {
+        MeterInterval::quarter_hour(datetime!(2026-06-01 12:00 UTC), kwh)
+            .with_obis(code.parse().unwrap())
+    };
+
+    let balance = sum_by_direction(&[iv("1-0:1.8.0", dec!(9)), iv("1-0:2.8.0", dec!(4))]);
+    assert_eq!(balance.net(), dec!(5));
+    assert_eq!(balance.total(), dec!(13));
+}
+
+// ── docs/substitute-values.md ────────────────────────────────────────────────
+
+/// Docs — "The vocabulary is the market's, not this crate's".
+#[test]
+fn market_code_section() {
+    use metering::{SubstituteMethod, SubstitutionReason};
+
+    let reason = SubstitutionReason::CommunicationFailure;
+    assert_eq!(reason.code(), "Z75");
+    assert_eq!(reason.as_str(), "COMMUNICATION_FAILURE");
+    assert_eq!(reason.description(), "Kommunikationsstörung");
+    assert_eq!(SubstitutionReason::from_code("Z75"), Some(reason));
+
+    assert!(SubstitutionReason::VoltageFailure.applies_to(Sparte::Strom));
+    assert!(!SubstitutionReason::VoltageFailure.applies_to(Sparte::Gas));
+
+    assert_eq!(
+        SubstituteMethod::PriorPeriodAverage.market_code(Sparte::Gas),
+        Some("Z95")
+    );
+    assert_eq!(
+        SubstituteMethod::PriorPeriodAverage.market_code(Sparte::Strom),
+        Some("ZJ2")
+    );
+    assert_eq!(
+        SubstituteMethod::LastValueCarryForward.market_code(Sparte::Strom),
+        None
+    );
+    assert_eq!(
+        SubstituteMethod::LinearInterpolation.market_code(Sparte::Strom),
+        Some("Z92")
+    );
+
+    assert_eq!(QualityFlag::Measured.market_code(), Some("220"));
+    assert_eq!(QualityFlag::Substituted.market_code(), Some("67"));
+    assert_eq!(QualityFlag::Unknown.market_code(), None);
+}
+
+/// Docs — "Which days count as comparable".
+#[test]
+fn vergleichstag_section() {
+    use metering::substitute::ReferenceDayMatch;
+    use metering::{Bundesland, FillGapsConfig, IntervalResolution};
+
+    let cfg = FillGapsConfig::new(
+        IntervalResolution::QuarterHour,
+        datetime!(2026-05-01 0:00 UTC),
+        datetime!(2026-05-02 0:00 UTC),
+    )
+    .matching_day_types(Bundesland::By);
+
+    assert_eq!(
+        cfg.reference_days,
+        ReferenceDayMatch::DayType(Bundesland::By)
+    );
+}
+
+/// Docs — "Nothing measured is silently replaced".
+#[test]
+fn unplaced_intervals_section() {
+    use metering::{FillGapsConfig, fill_gaps};
+
+    let off_grid = MeterInterval::measured(
+        datetime!(2026-01-01 0:07 UTC),
+        datetime!(2026-01-01 0:22 UTC),
+        dec!(9),
+    );
+
+    let filled = fill_gaps(
+        std::slice::from_ref(&off_grid),
+        &FillGapsConfig::new(
+            IntervalResolution::QuarterHour,
+            datetime!(2026-01-01 0:00 UTC),
+            datetime!(2026-01-01 0:30 UTC),
+        ),
+    );
+
+    assert!(!filled.placed_everything());
+    assert_eq!(filled.unplaced, vec![off_grid]);
 }

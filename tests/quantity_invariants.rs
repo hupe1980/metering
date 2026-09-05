@@ -311,13 +311,15 @@ proptest! {
         }
     }
 
-    /// Doubling every reading doubles the projection — **to its last reported
-    /// place**.
+    /// Doubling every reading doubles the projection — **to the last reported
+    /// place of the daily average it is built on**.
     ///
     /// Scaling is what an extrapolation *is*, so it must survive one. It
-    /// survives it only to `FORECAST_DP`, because `round(2x)` and `2·round(x)`
-    /// differ at a rounding boundary, and the projection is cut to three places
-    /// so that an annual figure is a number somebody can put on an Abschlag.
+    /// survives it only up to a rounding boundary: the daily average is cut to
+    /// `FORECAST_DP` before it is multiplied out, so that the projection can be
+    /// re-derived from the figures the report itself states, and `round(2x)`
+    /// and `2·round(x)` differ by up to one unit in that place — which the
+    /// multiplication then scales by the length of the year.
     #[test]
     fn a_projection_scales_with_its_input(series in arb_series(700..900)) {
         let Some(base) = project_annual_consumption(&series, None) else {
@@ -332,11 +334,109 @@ proptest! {
         prop_assert_eq!(scaled.observed, base.observed * Decimal::TWO);
         prop_assert_eq!(scaled.observed_days, base.observed_days);
         let drift = scaled.projected_annual - base.projected_annual * Decimal::TWO;
+        // One unit in the average's last place, carried through a year, plus
+        // the projection's own final rounding.
+        let tolerance = Decimal::new(1, metering::FORECAST_DP)
+            * Decimal::from(scaled.target_year_days)
+            + Decimal::new(1, metering::FORECAST_DP);
         prop_assert!(
-            drift.abs() <= Decimal::new(2, metering::FORECAST_DP),
+            drift.abs() <= tolerance,
             "{} vs 2 × {}",
             scaled.projected_annual,
             base.projected_annual,
+        );
+
+        // ...and the projection is exactly what the reported average says it
+        // is, which is the property the cut exists for.
+        prop_assert_eq!(
+            scaled.projected_annual,
+            (scaled.daily_average_kwh() * Decimal::from(scaled.target_year_days))
+                .round_dp(metering::FORECAST_DP),
+        );
+    }
+}
+
+// ── reactive energy and utilisation hours ────────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
+
+    /// The Blindarbeit balance splits the meter's own kvarh and invents none.
+    ///
+    /// `Freigrenze + Blindmehrarbeit` equals the Blindarbeit whenever there is
+    /// an excess, and exceeds it exactly by the unused headroom when there is
+    /// not — so no kvarh appears or disappears between the register and the
+    /// bill.
+    #[test]
+    fn the_reactive_balance_conserves_the_register(
+        kwh in 0i64..2_000_000,
+        kvarh in 0i64..2_000_000,
+        ratio_millis in 0i64..2_000,
+    ) {
+        let wirk = Decimal::from(kwh);
+        let blind = Decimal::from(kvarh);
+        let limit = metering::ReactiveLimit::new(Decimal::new(ratio_millis, 3));
+        let b = metering::blindmehrarbeit(wirk, blind, limit);
+
+        prop_assert_eq!(b.freigrenze_kvarh, limit.ratio * wirk);
+        prop_assert!(b.blindmehrarbeit_kvarh >= Decimal::ZERO);
+        prop_assert!(b.headroom_kvarh() >= Decimal::ZERO);
+        // Exactly one of the two is non-zero, and together they close the gap.
+        prop_assert_eq!(
+            b.freigrenze_kvarh + b.blindmehrarbeit_kvarh - b.headroom_kvarh(),
+            b.blindarbeit_kvarh
+        );
+        prop_assert_eq!(b.is_chargeable(), blind > b.freigrenze_kvarh);
+    }
+
+    /// A stricter ratio never charges less.
+    #[test]
+    fn a_smaller_freigrenze_never_charges_less(
+        kwh in 1i64..1_000_000,
+        kvarh in 0i64..1_000_000,
+    ) {
+        let wirk = Decimal::from(kwh);
+        let blind = Decimal::from(kvarh);
+        let loose = metering::blindmehrarbeit(wirk, blind, metering::ReactiveLimit::half());
+        let strict =
+            metering::blindmehrarbeit(wirk, blind, metering::ReactiveLimit::cos_phi_0_9());
+        prop_assert!(strict.blindmehrarbeit_kvarh >= loose.blindmehrarbeit_kvarh);
+    }
+
+    /// The Benutzungsstundenzahl is bounded by the period it is measured over:
+    /// a load that never exceeds its own peak cannot run more hours than the
+    /// period holds, and a flat load runs exactly all of them.
+    #[test]
+    fn the_utilisation_hours_are_bounded_by_the_period(
+        values in prop::collection::vec(1i64..4_000, 96..=96),
+    ) {
+        let base = datetime!(2026-06-01 0:00 UTC);
+        let day: Vec<MeterInterval> = values
+            .iter()
+            .enumerate()
+            .map(|(i, v)| MeterInterval {
+                from: base + Duration::minutes(15 * i as i64),
+                to: base + Duration::minutes(15 * i as i64 + 15),
+                value: Decimal::new(*v, 2),
+                quality: QualityFlag::Measured,
+                obis_code: None,
+            })
+            .collect();
+
+        let period = aggregate(&day, &AggregationConfig::rlm());
+        let hours = period.benutzungsdauer_h().expect("a positive peak");
+        prop_assert!(hours > Decimal::ZERO);
+        prop_assert!(hours <= Decimal::from(24u32), "{hours} h in a 24 h day");
+        prop_assert!(period.uniform_resolution);
+
+        // A flat day uses every hour of itself.
+        let flat: Vec<MeterInterval> = day
+            .iter()
+            .map(|iv| MeterInterval { value: Decimal::ONE, ..iv.clone() })
+            .collect();
+        prop_assert_eq!(
+            aggregate(&flat, &AggregationConfig::rlm()).benutzungsdauer_h(),
+            Some(Decimal::from(24u32))
         );
     }
 }

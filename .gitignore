@@ -24,3 +24,16 @@ target
 # directory rather than `--root`, so a stray invocation lands it at the repo root.
 site/public/
 /public/
+
+# Primary sources (see specs/README.md). Third-party publications — BNetzA
+# Festlegungen, BDEW/VKU/GEODE Leitfäden, EDI@Energy Codelisten, VDE FNN
+# Hinweise — redistributed under their own terms, so they are staged rather
+# than committed. `just specs` rebuilds the folder from the index.
+/specs/
+
+# Internal design notes (see concepts/README.md). Working documents: they quote
+# the regulatory sources by clause and page, and record what each design
+# decision cost. `site/` is the public narrative, `CHANGELOG.md` the history and
+# the rustdoc the API contract; `concepts/` is none of the three, and nothing in
+# the build reads it.
+/concepts/

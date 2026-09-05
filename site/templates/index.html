@@ -6,8 +6,8 @@
     A pure Rust domain library for the quantity calculations German metering
     requires — Europe/Berlin calendar arithmetic that knows a day is sometimes
     23 hours and a Gastag starts at 06:00, Zählerstandsgang to Lastgang, gas
-    m³→kWh_Hs and the SigLinDe gas SLP, Ersatzwertbildung with an audit trail,
-    check-digit-validated MaLo-IDs, and §14a Modul 3 tariff registers.
+    m³→kWh_Hs and the SigLinDe gas SLP, Ersatzwertbildung in the market's own
+    code list, check-digit-validated MaLo-IDs, and §14a Modul 3 tariff registers.
   </p>
   <p class="badges">
     <span class="chip">Zero I/O</span>
@@ -47,9 +47,10 @@
     <article>
       <h3>Every citation is checked</h3>
       <p>
-        Provisions are quoted from the published text and dated. Where a claim
-        could not be verified — the 2025 SLP dynamisation is printed as an image
-        — the library says so instead of asserting it.
+        Every German passage is matched against the published PDF, character
+        for character, by a harness in the repository. Where a claim cannot be
+        verified — the 2025 SLP dynamisation is printed as an image — the
+        library says so instead of asserting it.
       </p>
       <p><a href="{{ get_url(path='@/docs/regulatory-basis.md') }}">Regulatory basis →</a></p>
     </article>

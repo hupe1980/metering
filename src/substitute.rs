@@ -5,32 +5,37 @@
 //! - **§ 60 Abs. 1 MsbG** places the duty on the Messstellenbetreiber: the data
 //!   collected under §§ 55–59 must be *aufbereitet* and transmitted to the
 //!   berechtigte Stellen.
-//! - **§ 60 Abs. 2 MsbG** names what that preparation includes and where it
-//!   should happen, verbatim: *"Bei Messstellen mit intelligenten Messsystemen
-//!   sollen die Aufbereitung der Messwerte, insbesondere die Plausibilisierung
-//!   und die Ersatzwertbildung im Smart-Meter-Gateway, und die Datenübermittlung
-//!   über das Smart-Meter-Gateway direkt an die berechtigten Stellen erfolgen…"*
+//! - **§ 60 Abs. 2 MsbG** names what that preparation includes: *"Bei
+//!   Messstellen mit intelligenten Messsystemen sollen die Aufbereitung der
+//!   Messwerte, insbesondere die Plausibilisierung und die Ersatzwertbildung im
+//!   Smart-Meter-Gateway, und die Datenübermittlung über das Smart-Meter-Gateway
+//!   direkt an die berechtigten Stellen erfolgen, soweit das Bundesamt für
+//!   Sicherheit in der Informationstechnik dies als technisch möglich bewertet
+//!   und die Bundesnetzagentur auf Basis dieser Bewertung eine Festlegung nach
+//!   § 75 Satz 1 Nummer 4 trifft."*
 //!
-//!   Note what that sentence does **not** contain: any procedure. It says
-//!   Ersatzwertbildung is owed and where it belongs; it prescribes no method,
-//!   no reference period and no ranking between them.
+//!   Two things that sentence does **not** say. It prescribes no *procedure* —
+//!   no method, no reference period, no ranking. And its *placement* in the
+//!   Smart-Meter-Gateway is conditional on a BSI assessment and a BNetzA
+//!   Festlegung: until one is made, Satz 2 permits the preparation to happen
+//!   *"außerhalb des Smart-Meter-Gateways"*, which is the case this crate is
+//!   written for.
 //! - **BNetzA Festlegungen** — the current consolidated MaKo Lesefassungen are
 //!   **BK6-24-174** (GPKE / WiM / MaBiS, in force 6 June 2025) — carry the
 //!   process rules, and **VDE-AR-N 4400 (Metering Code)** the technical ones.
 //!
 //! ## Why the methods are configuration, not constants
 //!
-//! VDE-AR-N 4400 is a paywalled VDE Anwendungsregel, so its text cannot be
-//! reproduced or verified here. Every threshold this module uses is therefore a
-//! parameter with a documented default rather than a hard-coded claim of
-//! conformance: the operator's own metering-code settings win. What the module
-//! guarantees is the arithmetic and the audit trail, not that a particular
-//! default matches a document neither the author nor the reader can cite.
+//! VDE-AR-N 4400 is a paywalled Anwendungsregel whose text cannot be reproduced
+//! or verified here, so every threshold is a parameter with a documented default
+//! and the operator's own metering-code settings win. What this module
+//! guarantees is the arithmetic and the audit trail, not conformance to a
+//! document neither the author nor the reader can cite.
 //!
 //! | This crate | Corresponds to | Configurable |
 //! |---|---|---|
 //! | [`SubstituteMethod::LinearInterpolation`] | interpolation across a short gap | [`FillGapsConfig::short_gap_threshold`] |
-//! | [`SubstituteMethod::PriorPeriodAverage`] | Vergleichstag: the same slot a week earlier | [`REFERENCE_PERIOD_DAYS`] |
+//! | [`SubstituteMethod::PriorPeriodAverage`] | Vergleichstag: the same slot on comparable days of the preceding week | [`REFERENCE_PERIOD_DAYS`], [`ReferenceDayMatch`] |
 //! | [`SubstituteMethod::LastValueCarryForward`] | Fortschreibung des letzten plausiblen Wertes | — |
 //! | [`SubstituteMethod::ZeroFill`] | documented shutdown / confirmed zero delivery | — |
 //!
@@ -46,11 +51,13 @@
 //! ## Retention
 //!
 //! § 60 Abs. 6 MsbG is a **deletion** obligation, not a retention mandate:
-//! personenbezogene Messwerte must be erased or anonymised as soon as they are
-//! no longer needed, *"spätestens jedoch nach drei Jahren ab dem Schluss des
-//! Kalenderjahres, in dem der jeweilige Messwert erhoben wurde"*. Substitute
-//! values are Messwerte for this purpose. A system that keeps them for three
-//! years *because the law says so* has read the provision backwards.
+//! personenbezogene Messwerte must be erased or anonymised *"unter Beachtung
+//! mess- und eichrechtlicher Vorgaben"* as soon as they are no longer needed,
+//! *"spätestens jedoch nach drei Jahren ab dem Schluss des Kalenderjahres, in
+//! dem der jeweilige Messwert erhoben wurde"*. Substitute values are Messwerte
+//! for this purpose. Keeping them for three years *because the law says so*
+//! reads the provision backwards; deleting on the anniversary regardless reads
+//! past its opening clause.
 
 use std::collections::BTreeMap;
 
@@ -59,7 +66,7 @@ use time::{Duration, OffsetDateTime};
 use time_tz::{OffsetDateTimeExt as _, timezones};
 
 use crate::calendar::DayBoundary;
-use crate::interval::{MeterInterval, QualityFlag};
+use crate::interval::{MeterInterval, QualityFlag, Sparte};
 use crate::resolution::IntervalResolution;
 
 /// Length of the reference period used by
@@ -71,6 +78,24 @@ use crate::resolution::IntervalResolution;
 /// ([`crate::calendar::shift_back_days`]), and a fixed-duration window would
 /// exclude it.
 pub const REFERENCE_PERIOD_DAYS: i64 = 7;
+
+/// Decimal places a **synthesised** value is cut to: **6**, a millionth of a
+/// kWh.
+///
+/// Two of the four methods divide — an interpolation by the distance between
+/// its anchors, a prior-period average by its sample count — and a `Decimal`
+/// quotient carries up to 28 significant digits. What comes out is not an
+/// intermediate: it is written into the returned series, stored, and settled
+/// on, so it has to be a number someone can write down. The cut is the same
+/// width and the same reason as
+/// [`ALLOCATION_DP`](crate::ALLOCATION_DP), four orders of magnitude finer
+/// than anything the market settles.
+///
+/// Rounding is half-away-from-zero rather than truncation: no conservation
+/// identity runs through a substitute value — a filled series is complete, not
+/// balanced — so the nearest representable value is the honest one, and
+/// truncating would bias a long outage downwards.
+pub const SUBSTITUTE_DP: u32 = 6;
 
 // ── SubstituteMethod ──────────────────────────────────────────────────────────
 
@@ -130,6 +155,52 @@ impl SubstituteMethod {
         }
     }
 
+    /// The market's own code for this Ersatzwertbildungsverfahren, if it has
+    /// one for `sparte`.
+    ///
+    /// `STS+Z32` Statusanlass, EDI@Energy **MSCONS MIG 2.4c** (binding since
+    /// 03.04.2024; MIG 2.5, binding 01.10.2026, carries the same 13 codes
+    /// unchanged). The list is annotated per commodity and the annotations do
+    /// not agree, which is why this takes a [`Sparte`]:
+    ///
+    /// | Method | Strom | Gas |
+    /// |---|---|---|
+    /// | [`LinearInterpolation`](Self::LinearInterpolation) | `Z92` | `Z92` |
+    /// | [`PriorPeriodAverage`](Self::PriorPeriodAverage) | `ZJ2` | `Z95` |
+    /// | [`LastValueCarryForward`](Self::LastValueCarryForward) | — | `Z93` |
+    /// | [`ZeroFill`](Self::ZeroFill) | — | — |
+    ///
+    /// `None` is a real answer twice over. **A held value has no Strom code**:
+    /// `Z93 Haltewert` is annotated *Gas* and the Strom list offers only
+    /// `ZJ2 Statistische Methode`, which is the Vergleichswertverfahren and
+    /// not a carry-forward. And **a zero fill is not an Ersatzwertbildung at
+    /// all**: it asserts that nothing was delivered, which is a statement about
+    /// the world rather than a method of reconstructing one, so no code
+    /// describes it.
+    ///
+    /// A caller that must state a code where this returns `None` has a process
+    /// question, not a formatting one — the honest options are a different
+    /// method or a manual Klärfall.
+    ///
+    /// ```rust
+    /// use metering::{Sparte, SubstituteMethod};
+    ///
+    /// assert_eq!(SubstituteMethod::LinearInterpolation.market_code(Sparte::Strom), Some("Z92"));
+    /// assert_eq!(SubstituteMethod::PriorPeriodAverage.market_code(Sparte::Gas), Some("Z95"));
+    /// assert_eq!(SubstituteMethod::LastValueCarryForward.market_code(Sparte::Strom), None);
+    /// ```
+    #[must_use]
+    pub const fn market_code(self, sparte: Sparte) -> Option<&'static str> {
+        match (self, sparte) {
+            (Self::LinearInterpolation, _) => Some("Z92"),
+            (Self::PriorPeriodAverage, Sparte::Strom) => Some("ZJ2"),
+            (Self::PriorPeriodAverage, _) => Some("Z95"),
+            (Self::LastValueCarryForward, Sparte::Strom) => None,
+            (Self::LastValueCarryForward, _) => Some("Z93"),
+            (Self::ZeroFill, _) => None,
+        }
+    }
+
     /// German description, for an audit record or an invoice annex.
     #[must_use]
     pub const fn description(self) -> &'static str {
@@ -144,72 +215,318 @@ impl SubstituteMethod {
 
 // ── SubstitutionReason ────────────────────────────────────────────────────────
 
-/// Why a substitute value was needed.
+/// Why a substitute value was needed — the market's own list.
 ///
-/// Distinct from [`SubstituteMethod`], which says how one was produced. The
-/// reason is an input the caller knows and the method is an output this module
+/// These are the *Statusanlässe* of `STS+Z40 Grund der Ersatzwertbildung`,
+/// EDI@Energy **MSCONS MIG 2.4c** (binding since 03.04.2024; MIG 2.5, binding
+/// 01.10.2026, carries the same 28 codes unchanged). Every value a
+/// Messstellenbetreiber may state for an Ersatzwert is here, and nothing else
+/// is: an invented vocabulary would have to be mapped onto this one at the
+/// market boundary, and a mapping that is not one-to-one is a place where the
+/// reason changes meaning on the way out.
+///
+/// [`code`](Self::code) is the market code, [`description`](Self::description)
+/// the published German title, and [`as_str`](Self::as_str) this crate's own
+/// stable label for a database column — a code beginning with `Z` sorts and
+/// reads badly in one, and `Z81` says nothing to a reader.
+///
+/// Distinct from [`SubstituteMethod`], which says *how* a value was produced.
+/// The reason is an input the caller knows; the method is an output this module
 /// determines.
+///
+/// ```rust
+/// use metering::SubstitutionReason;
+///
+/// let reason = SubstitutionReason::CommunicationFailure;
+/// assert_eq!(reason.code(), "Z75");
+/// assert_eq!(reason.as_str(), "COMMUNICATION_FAILURE");
+/// assert_eq!(reason.description(), "Kommunikationsstörung");
+/// assert_eq!(SubstitutionReason::from_code("Z75"), Some(reason));
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(rename_all = "SCREAMING_SNAKE_CASE"))]
 pub enum SubstitutionReason {
-    /// No measurement arrived for the interval.
+    /// `Z74` — the meter could not be reached for an on-site reading.
     #[default]
-    NoMeasurementAvailable,
-    /// Meter hardware failure.
-    MeterFault,
-    /// The Smart-Meter-Gateway was unreachable.
-    GatewayCommFailure,
-    /// A plausibility check rejected the delivered value.
-    PlausibilityCheckFailed,
-    /// Manual correction by the MSB or an operator.
-    ManualCorrection,
-    /// A meter exchange; the value spans the replacement boundary.
-    MeterExchangeInterpolation,
-    /// Another documented reason.
-    Other,
+    NoAccess,
+    /// `Z75` — remote read-out did not complete in time.
+    CommunicationFailure,
+    /// `Z76` — loss of a whole network area / missing primary voltage.
+    GridOutage,
+    /// `Z77` — loss of the measuring or auxiliary voltage (Strom).
+    VoltageFailure,
+    /// `Z78` — values incomplete because the device was exchanged.
+    DeviceExchange,
+    /// `Z79` — maintenance or repair on a calibrated device (Strom).
+    Calibration,
+    /// `Z80` — the device is running outside its permitted operating conditions.
+    OutsideOperatingConditions,
+    /// `Z81` — a defect was established at the metering equipment.
+    MeteringEquipmentFault,
+    /// `Z82` — possible defect; the equipment is under examination.
+    MeasurementUncertain,
+    /// `Z98` — Normvolumen taken from the Störmengenzählwerk (Gas).
+    FaultRegisterUsed,
+    /// `Z99` — factors needed for the Mengenumwertung are unavailable (Gas).
+    ConversionIncomplete,
+    /// `ZA0` — the device clock was outside its permitted bounds and was set.
+    ClockAdjusted,
+    /// `ZA1` — the delivered value is implausible.
+    ImplausibleValue,
+    /// `ZA3` — wrong transformer ratio.
+    WrongTransformerRatio,
+    /// `ZA4` — misread, transposed digits, wrong metering point.
+    FaultyReading,
+    /// `ZA5` — the calculation rule changed, or a sub-meter was taken into account.
+    CalculationChanged,
+    /// `ZA6` — the Messlokation was rebuilt.
+    MeteringPointRebuilt,
+    /// `ZA7` — an error in data processing.
+    DataProcessingError,
+    /// `ZB0` — a technical fault in the metering equipment.
+    MeteringEquipmentDefect,
+    /// `ZB9` — the tariff switching times changed.
+    TariffTimesChanged,
+    /// `ZC2` — the Tarifschaltgerät is defective (Strom).
+    TariffSwitchDeviceDefect,
+    /// `ZC4` — too few pulses under the Eichordnung to carry a value.
+    InsufficientPulseWeight,
+    /// `ZR1` — maintenance or repair on a calibrated device (Gas).
+    MaintenanceCalibratedDevice,
+    /// `ZR2` — the device marks its own results as disturbed (Gas).
+    DeviceReportsDisturbedValues,
+    /// `ZR3` — maintenance on eichrechtskonforme devices (Gas).
+    MaintenanceConformantDevice,
+    /// `ZR4` — G 685 Kap. 2.4/2.5 consistency and synchronicity check failed (Gas).
+    ConsistencyCheckFailed,
+    /// `ZS9` — the reasons are stated per Messlokation, for a 1:N relationship.
+    StatedPerMeteringPoint,
+    /// `ZT8` — a value was requested for a past instant the MSB holds none for.
+    RetrospectiveRequest,
 }
 
 impl SubstitutionReason {
-    /// Every reason, in declaration order.
-    pub const ALL: [Self; 7] = [
-        Self::NoMeasurementAvailable,
-        Self::MeterFault,
-        Self::GatewayCommFailure,
-        Self::PlausibilityCheckFailed,
-        Self::ManualCorrection,
-        Self::MeterExchangeInterpolation,
-        Self::Other,
+    /// Every reason, in the order the MIG lists them.
+    pub const ALL: [Self; 28] = [
+        Self::NoAccess,
+        Self::CommunicationFailure,
+        Self::GridOutage,
+        Self::VoltageFailure,
+        Self::DeviceExchange,
+        Self::Calibration,
+        Self::OutsideOperatingConditions,
+        Self::MeteringEquipmentFault,
+        Self::MeasurementUncertain,
+        Self::FaultRegisterUsed,
+        Self::ConversionIncomplete,
+        Self::ClockAdjusted,
+        Self::ImplausibleValue,
+        Self::WrongTransformerRatio,
+        Self::FaultyReading,
+        Self::CalculationChanged,
+        Self::MeteringPointRebuilt,
+        Self::DataProcessingError,
+        Self::MeteringEquipmentDefect,
+        Self::TariffTimesChanged,
+        Self::TariffSwitchDeviceDefect,
+        Self::InsufficientPulseWeight,
+        Self::MaintenanceCalibratedDevice,
+        Self::DeviceReportsDisturbedValues,
+        Self::MaintenanceConformantDevice,
+        Self::ConsistencyCheckFailed,
+        Self::StatedPerMeteringPoint,
+        Self::RetrospectiveRequest,
     ];
 
     /// Stable DB/wire label. Matches the `serde` tag and
     /// [`FromStr`](std::str::FromStr) input.
+    ///
+    /// [`code`](Self::code) is the market's own three-character code and
+    /// [`description`](Self::description) the German title.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::NoMeasurementAvailable => "NO_MEASUREMENT_AVAILABLE",
-            Self::MeterFault => "METER_FAULT",
-            Self::GatewayCommFailure => "GATEWAY_COMM_FAILURE",
-            Self::PlausibilityCheckFailed => "PLAUSIBILITY_CHECK_FAILED",
-            Self::ManualCorrection => "MANUAL_CORRECTION",
-            Self::MeterExchangeInterpolation => "METER_EXCHANGE_INTERPOLATION",
-            Self::Other => "OTHER",
+            Self::NoAccess => "NO_ACCESS",
+            Self::CommunicationFailure => "COMMUNICATION_FAILURE",
+            Self::GridOutage => "GRID_OUTAGE",
+            Self::VoltageFailure => "VOLTAGE_FAILURE",
+            Self::DeviceExchange => "DEVICE_EXCHANGE",
+            Self::Calibration => "CALIBRATION",
+            Self::OutsideOperatingConditions => "OUTSIDE_OPERATING_CONDITIONS",
+            Self::MeteringEquipmentFault => "METERING_EQUIPMENT_FAULT",
+            Self::MeasurementUncertain => "MEASUREMENT_UNCERTAIN",
+            Self::FaultRegisterUsed => "FAULT_REGISTER_USED",
+            Self::ConversionIncomplete => "CONVERSION_INCOMPLETE",
+            Self::ClockAdjusted => "CLOCK_ADJUSTED",
+            Self::ImplausibleValue => "IMPLAUSIBLE_VALUE",
+            Self::WrongTransformerRatio => "WRONG_TRANSFORMER_RATIO",
+            Self::FaultyReading => "FAULTY_READING",
+            Self::CalculationChanged => "CALCULATION_CHANGED",
+            Self::MeteringPointRebuilt => "METERING_POINT_REBUILT",
+            Self::DataProcessingError => "DATA_PROCESSING_ERROR",
+            Self::MeteringEquipmentDefect => "METERING_EQUIPMENT_DEFECT",
+            Self::TariffTimesChanged => "TARIFF_TIMES_CHANGED",
+            Self::TariffSwitchDeviceDefect => "TARIFF_SWITCH_DEVICE_DEFECT",
+            Self::InsufficientPulseWeight => "INSUFFICIENT_PULSE_WEIGHT",
+            Self::MaintenanceCalibratedDevice => "MAINTENANCE_CALIBRATED_DEVICE",
+            Self::DeviceReportsDisturbedValues => "DEVICE_REPORTS_DISTURBED_VALUES",
+            Self::MaintenanceConformantDevice => "MAINTENANCE_CONFORMANT_DEVICE",
+            Self::ConsistencyCheckFailed => "CONSISTENCY_CHECK_FAILED",
+            Self::StatedPerMeteringPoint => "STATED_PER_METERING_POINT",
+            Self::RetrospectiveRequest => "RETROSPECTIVE_REQUEST",
         }
     }
 
-    /// German description, for an audit record.
+    /// The market code — `STS+Z40` Statusanlass, MSCONS MIG 2.4c.
+    ///
+    /// What a MSCONS writer puts on the wire. The mapping is one-to-one in
+    /// both directions; [`from_code`](Self::from_code) inverts it.
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::NoAccess => "Z74",
+            Self::CommunicationFailure => "Z75",
+            Self::GridOutage => "Z76",
+            Self::VoltageFailure => "Z77",
+            Self::DeviceExchange => "Z78",
+            Self::Calibration => "Z79",
+            Self::OutsideOperatingConditions => "Z80",
+            Self::MeteringEquipmentFault => "Z81",
+            Self::MeasurementUncertain => "Z82",
+            Self::FaultRegisterUsed => "Z98",
+            Self::ConversionIncomplete => "Z99",
+            Self::ClockAdjusted => "ZA0",
+            Self::ImplausibleValue => "ZA1",
+            Self::WrongTransformerRatio => "ZA3",
+            Self::FaultyReading => "ZA4",
+            Self::CalculationChanged => "ZA5",
+            Self::MeteringPointRebuilt => "ZA6",
+            Self::DataProcessingError => "ZA7",
+            Self::MeteringEquipmentDefect => "ZB0",
+            Self::TariffTimesChanged => "ZB9",
+            Self::TariffSwitchDeviceDefect => "ZC2",
+            Self::InsufficientPulseWeight => "ZC4",
+            Self::MaintenanceCalibratedDevice => "ZR1",
+            Self::DeviceReportsDisturbedValues => "ZR2",
+            Self::MaintenanceConformantDevice => "ZR3",
+            Self::ConsistencyCheckFailed => "ZR4",
+            Self::StatedPerMeteringPoint => "ZS9",
+            Self::RetrospectiveRequest => "ZT8",
+        }
+    }
+
+    /// The reason a market code names, or `None` for a code outside the list.
+    ///
+    /// Case-insensitive, whitespace-tolerant. `None` rather than a default:
+    /// a code this crate does not know is a statement about the message, not
+    /// about the value it describes.
+    #[must_use]
+    pub fn from_code(code: &str) -> Option<Self> {
+        let upper = code.trim().to_uppercase();
+        Self::ALL.into_iter().find(|r| r.code() == upper)
+    }
+
+    /// The published German title, verbatim from the MIG.
     #[must_use]
     pub const fn description(self) -> &'static str {
         match self {
-            Self::NoMeasurementAvailable => "Kein Messwert verfügbar",
-            Self::MeterFault => "Zählerdefekt",
-            Self::GatewayCommFailure => "SMGW-Kommunikationsfehler",
-            Self::PlausibilityCheckFailed => "Plausibilitätsprüfung fehlgeschlagen",
-            Self::ManualCorrection => "Manuelle Korrektur durch MSB/Betreiber",
-            Self::MeterExchangeInterpolation => "Zählerwechsel — Interpolation über Wechselgrenze",
-            Self::Other => "Sonstiger dokumentierter Grund",
+            Self::NoAccess => "kein Zugang",
+            Self::CommunicationFailure => "Kommunikationsstörung",
+            Self::GridOutage => "Netzausfall",
+            Self::VoltageFailure => "Spannungsausfall",
+            Self::DeviceExchange => "Gerätewechsel",
+            Self::Calibration => "Kalibrierung",
+            Self::OutsideOperatingConditions => "Gerät arbeitet außerhalb der Betriebsbedingungen",
+            Self::MeteringEquipmentFault => "Messeinrichtung gestört/defekt",
+            Self::MeasurementUncertain => "Unsicherheit Messung",
+            Self::FaultRegisterUsed => "Berücksichtigung Störmengenzählwerk",
+            Self::ConversionIncomplete => "Mengenumwertung unvollständig",
+            Self::ClockAdjusted => "Uhrzeit gestellt /Synchronisation",
+            Self::ImplausibleValue => "Messwert unplausibel",
+            Self::WrongTransformerRatio => "Falscher Wandlerfaktor",
+            Self::FaultyReading => "Fehlerhafte Ablesung",
+            Self::CalculationChanged => "Änderung der Berechnung",
+            Self::MeteringPointRebuilt => "Umbau der Messlokation",
+            Self::DataProcessingError => "Datenbearbeitungsfehler",
+            Self::MeteringEquipmentDefect => "Störung / Defekt Messeinrichtung",
+            Self::TariffTimesChanged => "Änderung Tarifschaltzeiten",
+            Self::TariffSwitchDeviceDefect => "Tarifschaltgerät defekt",
+            Self::InsufficientPulseWeight => "Impulswertigkeit nicht ausreichend",
+            Self::MaintenanceCalibratedDevice => "Wartungsarbeiten an geeichtem Messgerät",
+            Self::DeviceReportsDisturbedValues => "gestörte Werte",
+            Self::MaintenanceConformantDevice => {
+                "Wartungsarbeiten an eichrechtskonformen Messgeräten"
+            }
+            Self::ConsistencyCheckFailed => "Konsistenz- und Synchronprüfung",
+            Self::StatedPerMeteringPoint => {
+                "Grund der Ersatzwertbildung gemäß Angaben auf Ebene der Messlokation"
+            }
+            Self::RetrospectiveRequest => {
+                "Anforderung in die Vergangenheit, zum angeforderten Zeitpunkt liegt kein Wert vor."
+            }
         }
     }
+
+    /// Whether the MIG states this reason for a commodity.
+    ///
+    /// The MIG annotates most codes *Strom*, *Gas* or *Strom / Gas*; a few
+    /// carry no annotation at all, and those are reported as applying to both
+    /// rather than to neither. Advisory: it says what the code list documents,
+    /// not what a Netzbetreiber will accept.
+    #[must_use]
+    pub const fn applies_to(self, sparte: Sparte) -> bool {
+        match self {
+            // Strom only.
+            Self::VoltageFailure | Self::Calibration | Self::TariffSwitchDeviceDefect => {
+                matches!(sparte, Sparte::Strom)
+            }
+            // Gas only.
+            Self::FaultRegisterUsed
+            | Self::ConversionIncomplete
+            | Self::MaintenanceCalibratedDevice
+            | Self::DeviceReportsDisturbedValues
+            | Self::MaintenanceConformantDevice
+            | Self::ConsistencyCheckFailed => matches!(sparte, Sparte::Gas),
+            // Stated for both, or stated for neither.
+            _ => true,
+        }
+    }
+}
+
+/// Which prior-period days count as comparable — the Vergleichstag rule.
+///
+/// [`PriorPeriodAverage`](SubstituteMethod::PriorPeriodAverage) averages the
+/// *same slot* over the preceding [`REFERENCE_PERIOD_DAYS`]. Which days that
+/// leaves is a convention, and the two the German market uses differ on
+/// exactly the days that matter most:
+///
+/// | | Werktag gap | Gap on 3 October, a Friday |
+/// |---|---|---|
+/// | [`Weekday`](Self::Weekday) | the previous Friday | the previous Friday — **a working day** |
+/// | [`DayType`](Self::DayType) | the previous Werktage | the previous Sonn- und Feiertage |
+///
+/// A public holiday is a Sunday in load terms, so averaging it over working
+/// days overstates it — and averaging a working day over a week containing a
+/// holiday understates it. [`DayType`](Self::DayType) needs a
+/// [`Bundesland`](crate::Bundesland), because the German holiday calendar is a
+/// state one; [`Weekday`](Self::Weekday) needs no calendar at all and is the
+/// default for that reason, not because it is the better rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "SCREAMING_SNAKE_CASE"))]
+pub enum ReferenceDayMatch {
+    /// Same weekday, same time of day. No holiday calendar consulted.
+    #[default]
+    Weekday,
+    /// Same [`SlpDayType`](crate::SlpDayType) in this Bundesland, same time of
+    /// day — the Vergleichstag as the SLP procedures define it.
+    ///
+    /// Widens the pool as well as correcting it: a Wednesday gap draws on every
+    /// Werktag of the reference week rather than on the one previous Wednesday,
+    /// so a single missing reference no longer drops the method to a
+    /// carry-forward.
+    DayType(crate::holiday::Bundesland),
 }
 
 crate::codes::string_codes! {
@@ -287,6 +604,13 @@ pub struct FillGapsConfig {
 
     /// Recorded on every generated entry.
     pub reason: SubstitutionReason,
+
+    /// Which prior-period days count as comparable.
+    ///
+    /// [`ReferenceDayMatch::Weekday`] by default — the rule that needs no
+    /// holiday calendar. See [`ReferenceDayMatch`] for what that costs on a
+    /// public holiday.
+    pub reference_days: ReferenceDayMatch,
 }
 
 impl FillGapsConfig {
@@ -301,7 +625,8 @@ impl FillGapsConfig {
             prior_period_intervals: Vec::new(),
             short_gap_threshold: 3,
             day_boundary: DayBoundary::Midnight,
-            reason: SubstitutionReason::NoMeasurementAvailable,
+            reason: SubstitutionReason::NoAccess,
+            reference_days: ReferenceDayMatch::Weekday,
         }
     }
 
@@ -365,6 +690,28 @@ impl FillGapsConfig {
         self.reason = reason;
         self
     }
+
+    /// Match reference days on the SLP day type in `land` rather than on the
+    /// weekday — so a public holiday averages over Sundays and holidays.
+    ///
+    /// ```rust
+    /// use metering::{Bundesland, FillGapsConfig, IntervalResolution};
+    /// use metering::substitute::ReferenceDayMatch;
+    /// use time::macros::datetime;
+    ///
+    /// let cfg = FillGapsConfig::new(
+    ///     IntervalResolution::QuarterHour,
+    ///     datetime!(2026-10-03 0:00 UTC),
+    ///     datetime!(2026-10-04 0:00 UTC),
+    /// )
+    /// .matching_day_types(Bundesland::By);
+    /// assert_eq!(cfg.reference_days, ReferenceDayMatch::DayType(Bundesland::By));
+    /// ```
+    #[must_use]
+    pub const fn matching_day_types(mut self, land: crate::holiday::Bundesland) -> Self {
+        self.reference_days = ReferenceDayMatch::DayType(land);
+        self
+    }
 }
 
 // ── FilledSeries ──────────────────────────────────────────────────────────────
@@ -377,6 +724,18 @@ pub struct FilledSeries {
     pub intervals: Vec<MeterInterval>,
     /// One entry per synthesised value, ascending.
     pub substitutions: Vec<SubstituteEntry>,
+    /// Input intervals that landed on no grid slot, ascending.
+    ///
+    /// An interval is placed by its `from` timestamp falling exactly on a slot
+    /// start inside the period. Anything else — a series that sits off the
+    /// grid, one that starts on a different boundary, an interval outside the
+    /// requested period — is **not** in
+    /// [`intervals`](Self::intervals), and its slot was filled with an invented
+    /// value instead. That is a real answer to a real question ("complete this
+    /// grid"), but a silent one, and silently replacing a measured value with a
+    /// substitute is the worst outcome this module can produce. They are
+    /// reported here so a caller can refuse, requantise, or widen the period.
+    pub unplaced: Vec<MeterInterval>,
 }
 
 impl FilledSeries {
@@ -384,6 +743,15 @@ impl FilledSeries {
     #[must_use]
     pub fn substituted_count(&self) -> usize {
         self.substitutions.len()
+    }
+
+    /// `true` when every supplied interval landed on a grid slot.
+    ///
+    /// A `false` here means part of the input was replaced by a substitute —
+    /// see [`unplaced`](Self::unplaced).
+    #[must_use]
+    pub fn placed_everything(&self) -> bool {
+        self.unplaced.is_empty()
     }
 
     /// Share of the series that is measured rather than substituted, 0–100.
@@ -473,6 +841,7 @@ pub fn fill_gaps(intervals: &[MeterInterval], config: &FillGapsConfig) -> Filled
         return FilledSeries {
             intervals: Vec::new(),
             substitutions: Vec::new(),
+            unplaced: intervals.to_vec(),
         };
     }
 
@@ -482,8 +851,11 @@ pub fn fill_gaps(intervals: &[MeterInterval], config: &FillGapsConfig) -> Filled
         .iter()
         .map(|iv| (iv.from.unix_timestamp(), iv))
         .collect();
+    // Which of them a slot actually claimed. Anything left over was replaced
+    // by an invented value, which the caller has to be told about.
+    let mut placed: std::collections::BTreeSet<i64> = std::collections::BTreeSet::new();
 
-    let reference = PriorPeriodIndex::build(&config.prior_period_intervals);
+    let reference = PriorPeriodIndex::build(&config.prior_period_intervals, config.reference_days);
 
     let mut out: Vec<MeterInterval> = Vec::new();
     let mut substitutions: Vec<SubstituteEntry> = Vec::new();
@@ -512,6 +884,7 @@ pub fn fill_gaps(intervals: &[MeterInterval], config: &FillGapsConfig) -> Filled
         let ts = cursor.unix_timestamp();
 
         if let Some(&iv) = measured.get(&ts) {
+            placed.insert(ts);
             out.push(iv.clone());
             if iv.quality.is_billable() {
                 anchor = Some((idx, iv.value));
@@ -546,6 +919,9 @@ pub fn fill_gaps(intervals: &[MeterInterval], config: &FillGapsConfig) -> Filled
         };
         let (value, applied, reference_count) =
             current.synthesise(effective, idx, cursor, &reference, anchor.map(|(_, v)| v));
+        // Cut once, where the value is formed. Both dividing methods can leave
+        // a 28-digit quotient, and this one is written into the series.
+        let value = value.round_dp(SUBSTITUTE_DP);
 
         let interval = MeterInterval {
             from: cursor,
@@ -566,9 +942,17 @@ pub fn fill_gaps(intervals: &[MeterInterval], config: &FillGapsConfig) -> Filled
         idx += 1;
     }
 
+    let mut unplaced: Vec<MeterInterval> = intervals
+        .iter()
+        .filter(|iv| !placed.contains(&iv.from.unix_timestamp()))
+        .cloned()
+        .collect();
+    unplaced.sort_by_key(|iv| (iv.from, iv.to));
+
     FilledSeries {
         intervals: out,
         substitutions,
+        unplaced,
     }
 }
 
@@ -724,21 +1108,23 @@ impl Gap {
 
 // ── prior-period reference ────────────────────────────────────────────────────
 
-/// Reference values indexed by (weekday, hour, minute) in German local time.
+/// Reference values indexed by comparable day and time of day, in German local
+/// time.
 struct PriorPeriodIndex {
     slots: BTreeMap<(u8, u8, u8), Vec<(OffsetDateTime, Decimal)>>,
+    matching: ReferenceDayMatch,
 }
 
 impl PriorPeriodIndex {
-    fn build(intervals: &[MeterInterval]) -> Self {
+    fn build(intervals: &[MeterInterval], matching: ReferenceDayMatch) -> Self {
         let mut slots: BTreeMap<(u8, u8, u8), Vec<(OffsetDateTime, Decimal)>> = BTreeMap::new();
         for iv in intervals.iter().filter(|iv| iv.quality.is_billable()) {
             slots
-                .entry(slot_key(iv.from))
+                .entry(slot_key(iv.from, matching))
                 .or_default()
                 .push((iv.from, iv.value));
         }
-        Self { slots }
+        Self { slots, matching }
     }
 
     /// Mean of the matching slot over the [`REFERENCE_PERIOD_DAYS`] preceding
@@ -752,7 +1138,7 @@ impl PriorPeriodIndex {
         // degrading the configured method to carry-forward for the week after
         // every October transition.
         let window_start = crate::calendar::shift_back_days(target, REFERENCE_PERIOD_DAYS);
-        let samples = self.slots.get(&slot_key(target))?;
+        let samples = self.slots.get(&slot_key(target, self.matching))?;
         let matching: Vec<Decimal> = samples
             .iter()
             .filter(|(at, _)| *at >= window_start && *at < target)
@@ -766,14 +1152,25 @@ impl PriorPeriodIndex {
     }
 }
 
-/// (weekday, hour, minute) in Europe/Berlin.
-fn slot_key(ts: OffsetDateTime) -> (u8, u8, u8) {
+/// (comparable day, hour, minute) in Europe/Berlin.
+///
+/// The first component is the weekday, or the SLP day type where the caller
+/// supplied a Bundesland. Day types are offset past the seven weekdays so the
+/// two rules can never collide in one index — they do not share a map, but a
+/// key space that overlaps invites the bug where they do.
+fn slot_key(ts: OffsetDateTime, matching: ReferenceDayMatch) -> (u8, u8, u8) {
     let local = ts.to_timezone(timezones::db::europe::BERLIN);
-    (
-        local.weekday().number_days_from_monday(),
-        local.hour(),
-        local.minute(),
-    )
+    let day = match matching {
+        ReferenceDayMatch::Weekday => local.weekday().number_days_from_monday(),
+        ReferenceDayMatch::DayType(land) => {
+            7 + match crate::holiday::slp_day_type(local.date(), land) {
+                crate::load_profile::SlpDayType::Werktag => 0,
+                crate::load_profile::SlpDayType::Samstag => 1,
+                crate::load_profile::SlpDayType::SonnFeiertag => 2,
+            }
+        }
+    };
+    (day, local.hour(), local.minute())
 }
 
 // ── tests ─────────────────────────────────────────────────────────────────────
@@ -1209,11 +1606,11 @@ mod tests {
     fn every_substitute_carries_its_reason_and_flag() {
         let filled = fill_gaps(
             &[iv(0, dec!(2.0)), iv(45, dec!(2.0))],
-            &cfg(0, 60).because(SubstitutionReason::GatewayCommFailure),
+            &cfg(0, 60).because(SubstitutionReason::CommunicationFailure),
         );
         assert_eq!(filled.substituted_count(), 2);
         for entry in &filled.substitutions {
-            assert_eq!(entry.reason, SubstitutionReason::GatewayCommFailure);
+            assert_eq!(entry.reason, SubstitutionReason::CommunicationFailure);
             assert_eq!(entry.interval.quality, QualityFlag::Substituted);
             assert!(!entry.reason.description().is_empty());
             assert!(!entry.method.description().is_empty());
@@ -1389,7 +1786,178 @@ mod tests {
             assert!(!r.description().is_empty(), "{r:?}");
         }
         assert_eq!(SubstituteMethod::ALL.len(), 4);
-        assert_eq!(SubstitutionReason::ALL.len(), 7);
+        assert_eq!(
+            SubstitutionReason::ALL.len(),
+            28,
+            "STS+Z40 lists 28 Statusanlässe in MSCONS MIG 2.4c and 2.5 alike"
+        );
+    }
+
+    /// The market codes are what a MSCONS writer puts on the wire, so the
+    /// mapping has to be a bijection: two reasons sharing a code would make
+    /// the round trip lossy, and a code of the wrong shape would be rejected
+    /// by the counterparty rather than by us.
+    #[test]
+    fn every_reason_carries_a_distinct_well_formed_market_code() {
+        let mut seen: Vec<&str> = Vec::new();
+        for reason in SubstitutionReason::ALL {
+            let code = reason.code();
+            assert_eq!(code.len(), 3, "{reason:?} → {code}");
+            assert!(
+                code.starts_with('Z')
+                    && code
+                        .chars()
+                        .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit()),
+                "{reason:?} → {code}"
+            );
+            assert!(!seen.contains(&code), "{code} used twice");
+            seen.push(code);
+            assert_eq!(SubstitutionReason::from_code(code), Some(reason));
+            assert_eq!(
+                SubstitutionReason::from_code(&code.to_lowercase()),
+                Some(reason)
+            );
+        }
+        assert_eq!(SubstitutionReason::from_code("ZZZ"), None);
+        assert_eq!(SubstitutionReason::from_code(""), None);
+    }
+
+    /// The Ersatzwertbildungsverfahren list is annotated per commodity, and the
+    /// two annotations differ — a held value has no Strom code at all, and a
+    /// zero fill has none anywhere.
+    #[test]
+    fn method_market_codes_follow_the_commodity() {
+        use SubstituteMethod as M;
+        assert_eq!(
+            M::LinearInterpolation.market_code(Sparte::Strom),
+            Some("Z92")
+        );
+        assert_eq!(M::LinearInterpolation.market_code(Sparte::Gas), Some("Z92"));
+        assert_eq!(
+            M::PriorPeriodAverage.market_code(Sparte::Strom),
+            Some("ZJ2")
+        );
+        assert_eq!(M::PriorPeriodAverage.market_code(Sparte::Gas), Some("Z95"));
+        assert_eq!(
+            M::LastValueCarryForward.market_code(Sparte::Gas),
+            Some("Z93")
+        );
+        assert_eq!(M::LastValueCarryForward.market_code(Sparte::Strom), None);
+        for sparte in Sparte::ALL {
+            assert_eq!(M::ZeroFill.market_code(sparte), None);
+        }
+    }
+
+    /// A commodity annotation the MIG actually states, in both directions.
+    #[test]
+    fn reason_commodity_applicability_matches_the_mig() {
+        use SubstitutionReason as R;
+        assert!(R::VoltageFailure.applies_to(Sparte::Strom));
+        assert!(!R::VoltageFailure.applies_to(Sparte::Gas));
+        assert!(R::ConversionIncomplete.applies_to(Sparte::Gas));
+        assert!(!R::ConversionIncomplete.applies_to(Sparte::Strom));
+        // Stated "Strom / Gas", so both.
+        assert!(R::NoAccess.applies_to(Sparte::Strom));
+        assert!(R::NoAccess.applies_to(Sparte::Gas));
+    }
+
+    /// A prior-period average over a sample count that does not divide the sum
+    /// is exactly where an uncut quotient would reach the returned series.
+    #[test]
+    fn a_synthesised_value_is_cut_to_a_representable_width() {
+        let prior: Vec<MeterInterval> = [7, 14, 21]
+            .into_iter()
+            .map(|days_back| MeterInterval {
+                from: BASE - Duration::days(days_back) + Duration::minutes(15),
+                to: BASE - Duration::days(days_back) + Duration::minutes(30),
+                value: dec!(1) / Decimal::from(3u32) * Decimal::from(days_back),
+                quality: QualityFlag::Measured,
+                obis_code: None,
+            })
+            .collect();
+
+        let filled = fill_gaps(
+            &[iv(0, dec!(2.0)), iv(30, dec!(2.0))],
+            &cfg(0, 45).prior_period(prior).short_gap_threshold(0),
+        );
+        let synthesised = filled.substitutions[0].interval.value;
+        assert!(
+            synthesised.scale() <= SUBSTITUTE_DP,
+            "{synthesised} carries {} places",
+            synthesised.scale()
+        );
+    }
+
+    /// A public holiday is a Sunday in load terms. Matching on the weekday
+    /// averages the previous working Fridays into a 3 October gap and
+    /// overstates it; matching on the day type draws on Sundays and holidays.
+    #[test]
+    fn a_holiday_gap_can_be_averaged_over_comparable_days() {
+        use crate::holiday::Bundesland;
+        use time::macros::date;
+
+        // 3 October 2026 is a Saturday, so take 2027: it falls on a Sunday.
+        // Use 1 May 2026 instead — Tag der Arbeit, a Friday.
+        let gap_day = date!(2026 - 05 - 01);
+        let slot = crate::calendar::day_start_utc(gap_day) + Duration::hours(12);
+
+        // A fortnight of references: working days draw 10, Sundays and the
+        // Ascension holiday (14 May) draw 2. Only the days *before* the gap
+        // count, so build the two weeks before 1 May.
+        let mut prior = Vec::new();
+        for back in 1..=7i64 {
+            let day = gap_day - Duration::days(back);
+            let at = crate::calendar::day_start_utc(day) + Duration::hours(12);
+            let quiet = Bundesland::By.is_holiday(day) || day.weekday() == time::Weekday::Sunday;
+            prior.push(MeterInterval::quarter_hour(
+                at,
+                if quiet { dec!(2) } else { dec!(10) },
+            ));
+        }
+
+        let cfg = |c: FillGapsConfig| {
+            fill_gaps(&[], &c.prior_period(prior.clone()).short_gap_threshold(0))
+        };
+        let period = (slot, slot + Duration::minutes(15));
+
+        let by_weekday = cfg(FillGapsConfig::new(
+            IntervalResolution::QuarterHour,
+            period.0,
+            period.1,
+        ));
+        let by_day_type =
+            cfg(
+                FillGapsConfig::new(IntervalResolution::QuarterHour, period.0, period.1)
+                    .matching_day_types(Bundesland::By),
+            );
+
+        // The previous Friday (24 April) is an ordinary working day.
+        assert_eq!(by_weekday.intervals[0].value, dec!(10));
+        // Sunday 26 April is the only comparable day in the week before.
+        assert_eq!(by_day_type.intervals[0].value, dec!(2));
+        assert_eq!(
+            by_day_type.substitutions[0].method,
+            SubstituteMethod::PriorPeriodAverage
+        );
+    }
+
+    /// An interval that sits off the grid is not silently swapped for an
+    /// invented one: it is reported, so the caller can refuse the fill.
+    #[test]
+    fn an_off_grid_interval_is_reported_rather_than_dropped() {
+        let off_grid = MeterInterval {
+            from: BASE + Duration::minutes(7),
+            to: BASE + Duration::minutes(22),
+            value: dec!(9.0),
+            quality: QualityFlag::Measured,
+            obis_code: None,
+        };
+        let filled = fill_gaps(&[iv(0, dec!(2.0)), off_grid.clone()], &cfg(0, 45));
+
+        assert!(!filled.placed_everything());
+        assert_eq!(filled.unplaced, vec![off_grid]);
+        // ...and the slot it should have occupied was substituted instead.
+        assert_eq!(filled.substituted_count(), 2);
     }
 }
 

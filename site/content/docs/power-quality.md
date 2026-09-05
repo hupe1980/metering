@@ -1,7 +1,7 @@
 +++
 title = "Power quality"
 description = "EN 50160 is a statistical standard over a week of 10-minute means, not a per-interval threshold — and what that changes."
-weight = 10
+weight = 11
 +++
 
 It is tempting to write `voltage > 253 V → non-compliant`. EN 50160 says no such

@@ -205,7 +205,7 @@ fn fill(
     metering::fill_gaps(
         intervals,
         &FillGapsConfig::new(IntervalResolution::QuarterHour, from, to)
-            .because(SubstitutionReason::PlausibilityCheckFailed),
+            .because(SubstitutionReason::ImplausibleValue),
     )
 }
 

@@ -346,9 +346,13 @@ fn tags_added_in_0_17_are_pinned() {
         r#""PRIOR_PERIOD_AVERAGE""#
     );
     assert_eq!(
-        serde_json::to_string(&SubstitutionReason::GatewayCommFailure).unwrap(),
-        r#""GATEWAY_COMM_FAILURE""#
+        serde_json::to_string(&SubstitutionReason::CommunicationFailure).unwrap(),
+        r#""COMMUNICATION_FAILURE""#
     );
+    // The market code is a separate surface from the wire tag, and both are
+    // pinned: a consumer generates a database CHECK from one and a MSCONS
+    // STS+Z40 from the other.
+    assert_eq!(SubstitutionReason::CommunicationFailure.code(), "Z75");
 
     // Every variant of each new enum round-trips.
     for h in Holiday::ALL {
@@ -1383,4 +1387,35 @@ fn every_quantity_round_trips_through_json_and_postcard() {
         prop_assert_eq!(back.value, value);
         prop_assert_eq!(back.value.scale(), value.scale());
     });
+}
+
+/// The Vergleichstag rule is a data-carrying enum, so it is not a coded one —
+/// its wire shape is pinned here instead, in both directions.
+#[test]
+fn the_reference_day_rule_round_trips_in_both_shapes() {
+    use metering::{Bundesland, ReferenceDayMatch};
+
+    assert_eq!(
+        serde_json::to_string(&ReferenceDayMatch::Weekday).unwrap(),
+        r#""WEEKDAY""#
+    );
+    assert_eq!(
+        serde_json::to_string(&ReferenceDayMatch::DayType(Bundesland::By)).unwrap(),
+        r#"{"DAY_TYPE":"BY"}"#
+    );
+    for value in [
+        ReferenceDayMatch::Weekday,
+        ReferenceDayMatch::DayType(Bundesland::Nw),
+    ] {
+        let json = serde_json::to_string(&value).unwrap();
+        assert_eq!(
+            serde_json::from_str::<ReferenceDayMatch>(&json).unwrap(),
+            value
+        );
+        let bytes = postcard::to_allocvec(&value).unwrap();
+        assert_eq!(
+            postcard::from_bytes::<ReferenceDayMatch>(&bytes).unwrap(),
+            value
+        );
+    }
 }

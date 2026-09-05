@@ -650,7 +650,7 @@ mod tests {
             vec![],
             MeasurementSource::AutoSubstitute {
                 method: crate::substitute::SubstituteMethod::ZeroFill,
-                reason: crate::substitute::SubstitutionReason::NoMeasurementAvailable,
+                reason: crate::substitute::SubstitutionReason::NoAccess,
             },
             INGEST,
         );
@@ -685,7 +685,7 @@ mod tests {
             },
             MeasurementSource::AutoSubstitute {
                 method: crate::substitute::SubstituteMethod::LinearInterpolation,
-                reason: crate::substitute::SubstitutionReason::MeterFault,
+                reason: crate::substitute::SubstitutionReason::MeteringEquipmentFault,
             },
             MeasurementSource::RetroactiveCorrection {
                 correction_ref: "corr-2026-0001".to_owned(),

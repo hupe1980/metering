@@ -137,13 +137,13 @@ impl GasConversionParams {
 /// use metering::gas_m3_to_kwh_hs;
 /// use rust_decimal::Decimal;
 ///
-/// // 100 m³ × 10.55 kWh/m³ × 0.9764 = 1029.90 kWh_Hs (rounded)
+/// // 100 m³ × 10.55 kWh/m³ × 0.9764 = 1 030.102 kWh_Hs, exactly.
 /// let kwh = gas_m3_to_kwh_hs(
 ///     Decimal::from(100u32),
 ///     Decimal::from_str_exact("10.55").unwrap(),
 ///     Decimal::from_str_exact("0.9764").unwrap(),
 /// );
-/// assert!(kwh > Decimal::from(1000u32));
+/// assert_eq!(kwh, Decimal::from_str_exact("1030.102000").unwrap());
 /// ```
 #[must_use]
 pub fn gas_m3_to_kwh_hs(
@@ -227,8 +227,10 @@ impl Default for G685Rounding {
 /// G 685 thermal-energy calculation with explicit rounding.
 ///
 /// `kWh = V(m³) × round(Hs, brennwert_dp) × round(z, zustandszahl_dp)`,
-/// then the configured final rounding. Rounding is kaufmännisch
-/// (`MidpointAwayFromZero`), the German commercial rule (§ 1 Abs. 4 analog).
+/// then the configured final rounding. Rounding is *kaufmännisch* — half away
+/// from zero — which is what the published Netzbetreiber Merkblätter compute
+/// with; `Decimal`'s own default is the same rule, and it is stated here rather
+/// than assumed.
 #[must_use]
 pub fn gas_m3_to_kwh_hs_rounded(
     volume_m3: Decimal,
@@ -475,8 +477,10 @@ pub fn normalize_to_kwh(
         if secs <= 0 {
             return Err(ConversionError::MissingDuration);
         }
-        let hours = Decimal::from(secs) / Decimal::from(3600u32);
-        return Ok(value * hours);
+        // `P × secs ÷ 3600`, not `P × (secs ÷ 3600)`: the parenthesised
+        // quotient does not terminate for most second counts, and rounding it
+        // first carries the error into the product.
+        return Ok(value * Decimal::from(secs) / Decimal::from(3600u32));
     }
 
     let scale = MeasurementUnit::parse_scaled(trimmed)
@@ -637,6 +641,31 @@ mod tests {
 
 // ── Warm water → heat energy (HeizkostenV §9 Abs. 2) ─────────────────────────
 
+/// The `2,5` of HeizkostenV §9 Abs. 2 Satz 2 — a Zahlenwertgleichung constant.
+///
+/// A `dec!` literal rather than a parsed string: a parse that cannot fail does
+/// not need a fallback, and every fallback here would have been a *different
+/// number* applied silently to a billed quantity.
+const WARMWASSER_FAKTOR: Decimal = dec!(2.5);
+
+/// The assumed cold-water inlet temperature of §9 Abs. 2 Satz 2, in °C.
+const KALTWASSER_TEMPERATUR_C: Decimal = dec!(10);
+
+/// The `32` of HeizkostenV §9 Abs. 2 Satz 4, in kWh per m² and year.
+const WARMWASSER_FLAECHENFAKTOR: Decimal = dec!(32);
+
+/// §9 Abs. 2 Satz 6: *"bei brennwertbezogener Abrechnung von Erdgas mit 1,11 zu
+/// multiplizieren"*.
+const BRENNWERT_ERDGAS_FAKTOR: Decimal = dec!(1.11);
+
+/// §9 Abs. 2 Satz 6: *"bei eigenständiger gewerblicher Wärmelieferung durch
+/// 1,15 zu dividieren"*.
+const GEWERBLICHE_WAERMELIEFERUNG_DIVISOR: Decimal = dec!(1.15);
+
+/// §9 Abs. 2 Satz 6: *"bei dem Betrieb einer monovalenten Wärmepumpe mit 0,30
+/// zu multiplizieren"*.
+const MONOVALENTE_WAERMEPUMPE_FAKTOR: Decimal = dec!(0.30);
+
 /// Adjustments applied to a §9 Abs. 2 result.
 ///
 /// §9 Abs. 2 Satz 6 applies these to the result of *either* Zahlenwertgleichung
@@ -665,13 +694,13 @@ impl WarmWaterAdjustments {
     fn apply(self, base: Decimal) -> Decimal {
         let mut q = base;
         if self.brennwert_erdgas {
-            q *= Decimal::from_str_exact("1.11").unwrap_or(Decimal::ONE);
+            q *= BRENNWERT_ERDGAS_FAKTOR;
         }
         if self.eigenstaendige_gewerbliche_waermelieferung {
-            q /= Decimal::from_str_exact("1.15").unwrap_or(Decimal::ONE);
+            q /= GEWERBLICHE_WAERMELIEFERUNG_DIVISOR;
         }
         if self.monovalente_waermepumpe {
-            q *= Decimal::from_str_exact("0.30").unwrap_or(Decimal::ONE);
+            q *= MONOVALENTE_WAERMEPUMPE_FAKTOR;
         }
         q
     }
@@ -719,9 +748,7 @@ pub fn warm_water_heat_kwh(
     mean_temp_c: Decimal,
     adjustments: WarmWaterAdjustments,
 ) -> Decimal {
-    let factor = Decimal::from_str_exact("2.5").unwrap_or(Decimal::from(2u32));
-    let cold_inlet = Decimal::from(10u32);
-    adjustments.apply(factor * volume_m3 * (mean_temp_c - cold_inlet))
+    adjustments.apply(WARMWASSER_FAKTOR * volume_m3 * (mean_temp_c - KALTWASSER_TEMPERATUR_C))
 }
 
 /// Heat attributable to a central warm-water system from **floor area**, per
@@ -745,7 +772,7 @@ pub fn warm_water_heat_kwh_unmetered(
     flaeche_m2: Decimal,
     adjustments: WarmWaterAdjustments,
 ) -> Decimal {
-    adjustments.apply(Decimal::from(32u32) * flaeche_m2)
+    adjustments.apply(WARMWASSER_FLAECHENFAKTOR * flaeche_m2)
 }
 
 #[cfg(test)]

@@ -436,7 +436,7 @@ impl DayBoundary {
 /// exactly as a calendar day is. Note **which** Gastag that is: the clocks
 /// change at 02:00/03:00 local, which lies before 06:00 — so the long or
 /// short Gastag is the one *named after the Saturday*, not the transition
-/// Sunday. The SLP-Gas Leitfaden calls this out: *"die Zeitumstellung \[ist\]
+/// Sunday. The SLP-Gas Leitfaden calls this out: *"Daher ist die Zeitumstellung
 /// in den Werten für den Samstag vor der Umstellung zu berücksichtigen."*
 ///
 /// ```rust

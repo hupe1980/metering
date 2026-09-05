@@ -141,6 +141,9 @@ pub struct BillingPeriod {
     /// A flat load reaches its maximum in many intervals, so the tie is broken
     /// by the **earliest** `from` rather than by whichever the caller listed
     /// first — see [`aggregate`].
+    ///
+    /// Only comparable across one resolution — see
+    /// [`uniform_resolution`](Self::uniform_resolution).
     #[cfg_attr(feature = "serde", serde(with = "crate::wire::rfc3339_option"))]
     pub spitzenleistung_at: Option<OffsetDateTime>,
 
@@ -151,6 +154,24 @@ pub struct BillingPeriod {
 
     /// Number of intervals supplied but excluded as non-billable.
     pub excluded_count: usize,
+
+    /// `true` when every billable interval was the same length.
+    ///
+    /// The Jahreshöchstleistung of § 17 Abs. 2 StromNEV is defined on the
+    /// metered Viertelstunde, and an average power over an hour is not
+    /// comparable with one over a quarter-hour: the hour has already averaged
+    /// away the peak the quarter-hour would have shown. A maximum taken over a
+    /// series that mixes the two is not a Spitzenleistung of anything.
+    ///
+    /// This crate does not guess which resolution was meant, and it does not
+    /// silently drop the answer either — it reports that the question was
+    /// mixed, so a caller can refuse the figure, resample first, or record the
+    /// caveat. `false` here makes
+    /// [`spitzenleistung_kw`](Self::spitzenleistung_kw) an upper bound rather
+    /// than a measurement.
+    ///
+    /// Vacuously `true` for a series with fewer than two billable intervals.
+    pub uniform_resolution: bool,
 
     /// Share of the period covered by billable intervals, 0–100.
     ///
@@ -172,6 +193,15 @@ pub struct BillingPeriod {
     /// 0 % here, and that divergence is the point rather than a discrepancy.
     pub coverage_pct: f64,
 }
+
+/// Decimal places [`BillingPeriod::benutzungsdauer_h`] is cut to: **2**.
+///
+/// The quotient `kWh ÷ kW` rarely terminates, and the number it produces is
+/// read against a threshold — Anlage 4 zu § 17 Abs. 2 StromNEV puts the kink of
+/// the Gleichzeitigkeitsgrad at 2 500 Stunden, and Netzentgelt price sheets
+/// split on the same figure. A hundredth of an hour is thirty-six seconds:
+/// finer than any published threshold, coarse enough to be a number on a page.
+pub const BENUTZUNGSDAUER_DP: u32 = 2;
 
 /// Aggregate meter intervals into a [`BillingPeriod`].
 ///
@@ -215,6 +245,8 @@ pub fn aggregate(intervals: &[MeterInterval], config: &AggregationConfig) -> Bil
     let mut covered_secs = 0i64;
     let mut earliest: Option<OffsetDateTime> = None;
     let mut latest: Option<OffsetDateTime> = None;
+    let mut length: Option<i64> = None;
+    let mut uniform_resolution = true;
 
     for iv in intervals {
         if !iv.quality.is_billable() {
@@ -223,7 +255,13 @@ pub fn aggregate(intervals: &[MeterInterval], config: &AggregationConfig) -> Bil
         }
         billable_count += 1;
         arbeitsmenge += iv.value;
-        covered_secs += iv.duration_secs().max(0);
+        let secs = iv.duration_secs();
+        covered_secs += secs.max(0);
+        match length {
+            Some(first) if first != secs => uniform_resolution = false,
+            Some(_) => {}
+            None => length = Some(secs),
+        }
         earliest = Some(earliest.map_or(iv.from, |e: OffsetDateTime| e.min(iv.from)));
         latest = Some(latest.map_or(iv.to, |l: OffsetDateTime| l.max(iv.to)));
 
@@ -256,6 +294,7 @@ pub fn aggregate(intervals: &[MeterInterval], config: &AggregationConfig) -> Bil
         spitzenleistung_at: peak.map(|(_, at)| at),
         billable_count,
         excluded_count,
+        uniform_resolution,
         coverage_pct,
     }
 }
@@ -285,6 +324,55 @@ pub struct DirectionalEnergy {
     pub undirected: Decimal,
 }
 
+impl BillingPeriod {
+    /// Benutzungsstundenzahl — `Arbeitsmenge ÷ Spitzenleistung`, in hours.
+    ///
+    /// § 17 Abs. 1 StromNEV makes the Netzentgelt depend on *"der jeweiligen
+    /// **Benutzungsstundenzahl** der Entnahmestelle"*, and Anlage 4 zu § 17
+    /// Abs. 2 builds the Gleichzeitigkeitsgrad on the Jahresbenutzungsdauer,
+    /// with its two straight lines meeting *"durch die Jahresbenutzungsdauer
+    /// 2 500 Stunden"* and reaching 1 at 8 760 Stunden. It is the figure a
+    /// price sheet's two tariff bands are separated by, so it decides which
+    /// column an RLM Entnahmestelle is billed from — while itself being a pure
+    /// quantity, which is why it is here and its price is not.
+    ///
+    /// Cut to [`BENUTZUNGSDAUER_DP`] places.
+    ///
+    /// `None` when there is no Spitzenleistung to divide by — the config
+    /// switched it off, nothing billable arrived, or the peak is zero. A
+    /// **year** is the period the 2 500 h threshold is stated for; over a month
+    /// the same arithmetic answers a different question, and over a series that
+    /// mixes resolutions ([`uniform_resolution`](Self::uniform_resolution)) it
+    /// answers none.
+    ///
+    /// ```rust
+    /// use metering::{AggregationConfig, MeterInterval, QualityFlag, aggregate};
+    /// use rust_decimal::dec;
+    /// use time::{Duration, macros::datetime};
+    ///
+    /// // A flat 4 kW draw for a day: 96 kWh against a 4 kW peak is 24 hours.
+    /// let day: Vec<MeterInterval> = (0..96).map(|i| MeterInterval {
+    ///     from: datetime!(2026-06-01 0:00 UTC) + Duration::minutes(15 * i),
+    ///     to:   datetime!(2026-06-01 0:00 UTC) + Duration::minutes(15 * i + 15),
+    ///     value: dec!(1),
+    ///     quality: QualityFlag::Measured,
+    ///     obis_code: None,
+    /// }).collect();
+    ///
+    /// let period = aggregate(&day, &AggregationConfig::rlm());
+    /// assert_eq!(period.spitzenleistung_kw, Some(dec!(4)));
+    /// assert_eq!(period.benutzungsdauer_h(), Some(dec!(24)));
+    /// ```
+    #[must_use]
+    pub fn benutzungsdauer_h(&self) -> Option<Decimal> {
+        let peak = self.spitzenleistung_kw?;
+        if peak <= Decimal::ZERO {
+            return None;
+        }
+        Some((self.arbeitsmenge / peak).round_dp(BENUTZUNGSDAUER_DP))
+    }
+}
+
 impl DirectionalEnergy {
     /// `import − export` — the net flow across the point.
     ///
@@ -311,17 +399,12 @@ impl DirectionalEnergy {
 /// an allocation of that point's energy is only correct if both sides balance:
 ///
 /// ```rust
-/// use metering::{Direction, MeterInterval, QualityFlag, aggregation::sum_by_direction};
+/// use metering::{MeterInterval, aggregation::sum_by_direction};
 /// use rust_decimal::dec;
 /// use time::macros::datetime;
 ///
-/// let iv = |code: &str, kwh| MeterInterval {
-///     from: datetime!(2026-06-01 12:00 UTC),
-///     to:   datetime!(2026-06-01 12:15 UTC),
-///     value: kwh,
-///     quality: QualityFlag::Measured,
-///     obis_code: Some(code.parse().unwrap()),
-/// };
+/// let iv = |code: &str, kwh| MeterInterval::quarter_hour(datetime!(2026-06-01 12:00 UTC), kwh)
+///     .with_obis(code.parse().unwrap());
 ///
 /// let grid = [iv("1-0:1.8.0", dec!(9)), iv("1-0:2.8.0", dec!(4))];
 /// let allocated = [
@@ -367,6 +450,61 @@ mod tests {
     use rust_decimal::dec;
     use time::OffsetDateTime;
     use time::macros::datetime;
+
+    use time::Duration;
+
+    /// A series that mixes an hour with a quarter-hour has no single
+    /// Spitzenleistung, and the result says so instead of quietly reporting the
+    /// larger of two incomparable numbers.
+    #[test]
+    fn a_mixed_resolution_series_is_reported_as_mixed() {
+        let base = datetime!(2026-06-01 0:00 UTC);
+        let quarter = MeterInterval {
+            from: base,
+            to: base + Duration::minutes(15),
+            value: dec!(1),
+            quality: QualityFlag::Measured,
+            obis_code: None,
+        };
+        let hour = MeterInterval {
+            from: base + Duration::minutes(15),
+            to: base + Duration::minutes(75),
+            value: dec!(2),
+            quality: QualityFlag::Measured,
+            obis_code: None,
+        };
+
+        let uniform = aggregate(std::slice::from_ref(&quarter), &AggregationConfig::rlm());
+        assert!(uniform.uniform_resolution);
+
+        let mixed = aggregate(&[quarter, hour], &AggregationConfig::rlm());
+        assert!(!mixed.uniform_resolution);
+        // The peak is still reported — as an upper bound the caller now knows
+        // to qualify: 4 kW over a quarter-hour against 2 kW over an hour.
+        assert_eq!(mixed.spitzenleistung_kw, Some(dec!(4)));
+        assert_eq!(mixed.benutzungsdauer_h(), Some(dec!(0.75)));
+    }
+
+    /// Nothing billable means no peak, so no utilisation hours either — rather
+    /// than a division by zero or a plausible-looking zero.
+    #[test]
+    fn utilisation_hours_need_a_peak() {
+        let base = datetime!(2026-06-01 0:00 UTC);
+        let faulty = MeterInterval {
+            from: base,
+            to: base + Duration::minutes(15),
+            value: dec!(1),
+            quality: QualityFlag::Faulty,
+            obis_code: None,
+        };
+        let period = aggregate(&[faulty], &AggregationConfig::rlm());
+        assert_eq!(period.spitzenleistung_kw, None);
+        assert_eq!(period.benutzungsdauer_h(), None);
+        assert!(
+            period.uniform_resolution,
+            "vacuously, with nothing billable"
+        );
+    }
 
     fn iv(from: OffsetDateTime, kwh: Decimal) -> MeterInterval {
         MeterInterval {

@@ -1,7 +1,7 @@
 +++
 title = "Virtual meters"
 description = "§ 42b EnWG Gemeinschaftliche Gebäudeversorgung: constant and proportional PV allocation, and the two caps that apply."
-weight = 11
+weight = 12
 +++
 
 A virtual meter derives one series from others.
@@ -168,7 +168,10 @@ significant digits. `ALLOCATION_DP` cuts the derived share to **six** decimal
 places, toward zero, for two reasons.
 
 It makes the share a number somebody can write down: no invoice, no MSCONS field
-and no settlement system has a place for 0.333…3 kWh to twenty-seven places.
+and no settlement system has a place for 0.333…3 kWh to twenty-seven places. The
+share is formed as `consumption × generation ÷ total` — [multiplying before
+dividing](@/docs/design.md#multiply-before-you-divide), so the cut is the only
+rounding in it.
 
 And it is what makes `consumption = allocated + net_grid_draw` hold exactly.
 An uncut proportional share leaves `consumption − allocated` needing more

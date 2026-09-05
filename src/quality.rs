@@ -208,6 +208,25 @@ pub struct QualityConfig {
     ///
     /// Default: `99.0`.
     pub min_coverage_pct: f64,
+
+    /// Most blocking findings a `C` may carry — beyond it the grade is `F`.
+    ///
+    /// `C` means *"somebody has to look at this"* and `F` means *"do not put
+    /// this in front of somebody, it is not a data set"*. Where that line falls
+    /// is an operating decision: a Klärfall queue that can absorb three
+    /// corrections a day cannot absorb thirty. Default: `3`.
+    /// A literal in the grading expression would make the distinction between
+    /// "review" and "reject" a property of this crate rather than of the
+    /// operator running it.
+    pub max_review_findings: usize,
+
+    /// Coverage below which the grade is `F` however few findings there are.
+    ///
+    /// A series can carry one blocking finding and still be unusable, if what
+    /// it is missing is half the month. Default: `95.0`, and it must not be
+    /// above [`min_coverage_pct`](Self::min_coverage_pct) — a floor above the
+    /// `A`/`B` threshold would make `C` unreachable.
+    pub min_review_coverage_pct: f64,
 }
 
 impl Default for QualityConfig {
@@ -216,6 +235,8 @@ impl Default for QualityConfig {
             validation: ValidationConfig::default(),
             max_zero_run_allowed: 2,
             min_coverage_pct: 99.0,
+            max_review_findings: 3,
+            min_review_coverage_pct: 95.0,
         }
     }
 }
@@ -242,7 +263,7 @@ impl QualityConfig {
                     ..ValidationConfig::default()
                 },
                 max_zero_run_allowed: zero_run,
-                min_coverage_pct: 99.0,
+                ..Self::default()
             }
         };
         match sparte {
@@ -354,10 +375,15 @@ impl QualityReport {
 ///
 /// | Grade | Condition |
 /// |---|---|
-/// | `A` | no findings, coverage at or above the configured minimum |
+/// | `A` | no findings, coverage at or above [`min_coverage_pct`](QualityConfig::min_coverage_pct) |
 /// | `B` | findings, but none blocking and coverage still adequate |
-/// | `C` | at most three blocking findings |
-/// | `F` | more than three blocking findings, or an empty series |
+/// | `C` | at most [`max_review_findings`](QualityConfig::max_review_findings) blocking findings, and coverage at or above [`min_review_coverage_pct`](QualityConfig::min_review_coverage_pct) |
+/// | `F` | anything else, and any empty series |
+///
+/// Every threshold in that table is a field of [`QualityConfig`]. Where the
+/// line between "route this to review" and "reject it" falls is an operating
+/// decision — it depends on what a Klärfall queue can absorb — and a library
+/// that hard-codes it is answering a question it was not asked.
 ///
 /// The distinction that matters is `B` versus `C`: `B` is "bill it and note
 /// it", `C` is "somebody has to look". That maps onto validation severity —
@@ -442,7 +468,9 @@ pub fn score_intervals(samples: &[MeterInterval], cfg: &QualityConfig) -> Qualit
         QualityGrade::A
     } else if blocking_findings == 0 && coverage_ok && zero_run_ok {
         QualityGrade::B
-    } else if blocking_findings <= 3 && coverage_pct >= 95.0 {
+    } else if blocking_findings <= cfg.max_review_findings
+        && coverage_pct >= cfg.min_review_coverage_pct
+    {
         QualityGrade::C
     } else {
         QualityGrade::F

@@ -167,13 +167,7 @@ crate::codes::string_codes! {
 /// use rust_decimal::dec;
 /// use time::macros::datetime;
 ///
-/// let iv = MeterInterval {
-///     from: datetime!(2026-01-01 0:00 UTC),
-///     to:   datetime!(2026-01-01 0:15 UTC),
-///     value: dec!(2),
-///     quality: QualityFlag::Measured,
-///     obis_code: None,
-/// };
+/// let iv = MeterInterval::measured(datetime!(2026-01-01 0:00 UTC), datetime!(2026-01-01 0:15 UTC), dec!(2));
 ///
 /// // Quarter-hours with no gateway claim → RLM.
 /// assert_eq!(classify_messtyp(&[iv.clone()], None), Messtyp::Rlm);

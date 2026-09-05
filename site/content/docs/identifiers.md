@@ -1,7 +1,7 @@
 +++
 title = "Market identifiers"
 description = "Typed MaLo-ID and EIC with their check characters verified at the parse, the 33-character MeLo-ID and the BDEW Marktpartner-ID — why an identifier that is a String is validated nowhere."
-weight = 4
+weight = 5
 +++
 
 An identifier that is a `String` is validated nowhere. A transposed digit in a

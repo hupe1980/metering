@@ -286,11 +286,10 @@ pub fn resample(intervals: &[MeterInterval], config: &ResampleConfig) -> Vec<Res
         entry.total += iv.value;
         entry.interval_count += 1;
 
-        // Peak demand = energy / duration_h
-        let duration_secs = (iv.to - iv.from).whole_seconds().max(1);
-        let duration_h = Decimal::from(duration_secs) / Decimal::from(3_600u32);
-        if duration_h > Decimal::ZERO {
-            let kw = iv.value / duration_h;
+        // The average power over the interval, from the one implementation of
+        // it: a second copy here could disagree with `aggregate`'s
+        // Spitzenleistung about the same series.
+        if let Some(kw) = iv.demand_kw() {
             entry.peak_kw = Some(entry.peak_kw.map_or(kw, |prev| prev.max(kw)));
         }
 

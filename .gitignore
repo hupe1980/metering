@@ -31,6 +31,11 @@ site/public/
 # than committed. `just specs` rebuilds the folder from the index.
 /specs/
 
+# `scripts/verify_quotes.py` is run, not imported — its bytecode cache is a
+# build artefact of whichever Python happened to run it, and one was committed.
+__pycache__/
+*.pyc
+
 # Internal design notes (see concepts/README.md). Working documents: they quote
 # the regulatory sources by clause and page, and record what each design
 # decision cost. `site/` is the public narrative, `CHANGELOG.md` the history and

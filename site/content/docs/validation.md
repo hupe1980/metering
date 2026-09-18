@@ -45,25 +45,28 @@ second, wrong finding on top of it sends the reader to a slot that has data.
 
 ## A clean report is not a clean series
 
-Four of the eleven rules are **opt-in**. They need a number this library refuses
-to invent, and leaving the field `None` turns the rule off:
+Four of the eleven rules always run — V02, V07, V09 and V11 — because each
+reads only the series it was given. The other seven hang off six settings:
 
-| Field | Rules it disables when `None` |
-|---|---|
-| `expected_interval_secs` | V01 `GapDetected`, V06 `InconsistentIntervalLength` |
-| `outlier_sigma` | V04 `StatisticalOutlier` |
-| `now` | V08 `FutureTimestamp` |
-| `max_plant_power_kw` | V12 `ImplausiblePower` |
+| Field | Rules | Default | Off when |
+|---|---|---|---|
+| `expected_interval_secs` | V01 `GapDetected`, V06 `InconsistentIntervalLength` | `Some(900)` | `None` |
+| `outlier_sigma` | V04 `StatisticalOutlier` | `Some(6.0)` | `None` |
+| `zero_run_threshold` | V05 `SuspiciousZeroRun` | `4` | `0` |
+| `negative_energy_is_error` | V03 `NegativeEnergy` | `true` | `false` |
+| `now` | V08 `FutureTimestamp` | **`None`** | `None` |
+| `max_plant_power_kw` | V12 `ImplausiblePower` | **`None`** | `None` |
 
-Two more are **opt-out** — on by default, and switched off by a value rather
-than by a `None`:
+The two in bold are the ones the library will not pick for you, and they are not
+arbitrary: a reference instant and a nameplate capacity are facts about the
+caller's world rather than about a series, and there is no value that could
+stand in for either. The four above them carry the electricity conventions —
+which is why `ValidationConfig::default()` **is**
+`ValidationConfig::rlm_strom_15min()`, named for the series it describes rather
+than pretending to be commodity-neutral. A gas series takes `gas_hourly()`, and
+`QualityConfig::for_sparte` picks by `Sparte`.
 
-| Field | Rule it disables |
-|---|---|
-| `negative_energy_is_error = false` | V03 `NegativeEnergy` |
-| `zero_run_threshold = 0` | V05 `SuspiciousZeroRun` |
-
-`enabled_rules()` reports both kinds, so a `0` threshold cannot leave a clean
+`enabled_rules()` reports every kind, so a `0` threshold cannot leave a clean
 report claiming a stuck meter was looked for.
 
 This matters in practice: **`QualityConfig::for_sparte` — the per-commodity

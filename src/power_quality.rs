@@ -1,5 +1,11 @@
 //! Netzqualität — EN 50160 voltage characteristics.
 //!
+//! Limits and observation windows are those of **EN 50160:2022**, the current
+//! edition; the measurement methods it refers to are EN 61000-4-30. The
+//! standard itself is paywalled, so nothing here is quoted from it — the
+//! figures below are parameters with documented defaults, the same treatment
+//! every paywalled threshold in this crate gets.
+//!
 //! ## EN 50160 is a statistical standard, and that is the whole point
 //!
 //! It is tempting to write `voltage > 253 V → non-compliant`. EN 50160 says no
@@ -171,11 +177,18 @@ impl PowerQualityInterval {
     /// [module docs](self#en-50160-is-a-statistical-standard-and-that-is-the-whole-point).
     #[must_use]
     pub fn voltage_out_of_range(&self, nominal_v: Decimal, threshold_pct: Decimal) -> bool {
-        if nominal_v.is_zero() {
+        // A declared supply voltage is positive; anything else has no band to
+        // be outside of. The guard is `<= 0` rather than `is_zero` because a
+        // negative `Un` would also flip the comparison below.
+        if nominal_v <= Decimal::ZERO {
             return false;
         }
+        // `|v − Un| × 100 > threshold × Un` rather than the percentage itself:
+        // the same question with **no division at all**, so the comparison is
+        // exact instead of resting on a quotient rounded to 28 digits.
+        let limit = threshold_pct * nominal_v;
         self.phase_voltages()
-            .any(|v| ((v - nominal_v) / nominal_v * Decimal::ONE_HUNDRED).abs() > threshold_pct)
+            .any(|v| (v - nominal_v).abs() * Decimal::ONE_HUNDRED > limit)
     }
 
     /// `true` when the frequency deviates from 50 Hz by more than
@@ -297,9 +310,12 @@ impl LimitOutcome {
             within,
             share_pct,
             required_share_pct,
-            // A share is compared with a small tolerance: 95 % of 1 008 samples
-            // is 957.6, and 957 of them is 94.9404 % — which a strict `>=`
-            // would fail on a supply the standard accepts.
+            // The epsilon absorbs binary rounding, nothing more. `within /
+            // samples × 100` is a float division: 19 of 20 samples is 95 %
+            // exactly in decimal and can land a few ulps under it in binary,
+            // and a supply that meets the standard must not fail on that.
+            // It is **not** a tolerance on the standard's share — 957 of
+            // 1 008 samples is 94.94 %, which is below 95 % and is a breach.
             compliant: samples == 0 || share_pct + 1e-9 >= required_share_pct,
             worst,
         }
@@ -420,10 +436,16 @@ pub fn assess_en50160(intervals: &[PowerQualityInterval], limits: &En50160Limits
     let nominal_hz = Decimal::from(50u32);
     let freq_band = nominal_hz * limits.frequency_band_pct / Decimal::ONE_HUNDRED;
 
-    let mut band_tally = Tally::new(|v: Decimal| (v - un).abs());
-    let mut absolute_tally = Tally::new(|v: Decimal| (v - un).abs());
-    let mut freq_tally = Tally::new(|f: Decimal| (f - nominal_hz).abs());
-    let mut thd_tally = Tally::new(|t: Decimal| t);
+    // Each tally scores a sample by how far **outside its own limit** it sits,
+    // not by how far it sits from nominal. For the symmetric ±band the two
+    // agree; for the asymmetric absolute limit (+10 % / −15 %) they do not, and
+    // distance-from-nominal ranks a sample one volt under the lower bound above
+    // one seven volts over the upper. `worst` is documented as the sample
+    // furthest outside the limit, so that is what it measures.
+    let mut band_tally = Tally::new(move |v: Decimal| (v - un).abs() - band);
+    let mut absolute_tally = Tally::new(move |v: Decimal| (v - upper).max(lower - v));
+    let mut freq_tally = Tally::new(move |f: Decimal| (f - nominal_hz).abs() - freq_band);
+    let mut thd_tally = Tally::new(move |t: Decimal| t - limits.thd_max_pct);
 
     let mut covered_secs = 0i64;
     for iv in intervals {
@@ -501,12 +523,17 @@ pub fn exceedance_pct(outcome: &LimitOutcome) -> f64 {
     (100.0 - outcome.share_pct).max(0.0)
 }
 
-/// The 95th-percentile-style question EN 50160 asks, as a plain number.
+/// The value at `share` of the sorted phase-voltage magnitudes — the figure a
+/// power-quality report prints as **U95**.
 ///
-/// Returns the value at `share` of the sorted magnitudes — the figure a power
-/// quality report prints as "U95". `None` when nothing was measured.
+/// `None` when nothing was measured. `share` is a fraction in `0.0..=1.0`.
 ///
-/// `share` is a fraction in `0.0..=1.0`; EN 50160's voltage test is `0.95`.
+/// **This is a reporting convenience, not the conformance test.** EN 50160's
+/// voltage requirement is two-sided — 95 % of the means inside `Un ± 10 %` —
+/// and a one-sided percentile of the raw magnitudes sees only the upper tail: a
+/// supply that sags below `Un − 10 %` for a tenth of the week has a perfectly
+/// respectable U95 and fails the standard. [`assess_en50160`] answers the
+/// standard's question; this answers the report line's.
 #[must_use]
 pub fn voltage_percentile(intervals: &[PowerQualityInterval], share: f64) -> Option<Decimal> {
     let mut values: Vec<Decimal> = intervals
@@ -703,11 +730,14 @@ impl PhaseApparentPower {
     /// The most heavily loaded Außenleiter and its apparent power.
     #[must_use]
     pub fn worst_phase(&self) -> (Phase, Decimal) {
-        Phase::ALL
-            .into_iter()
-            .map(|p| (p, self.get(p)))
-            .reduce(|a, b| if b.1 > a.1 { b } else { a })
-            .unwrap_or((Phase::L1, Decimal::ZERO))
+        // Ties go to the earlier Außenleiter, so the answer does not depend on
+        // which of two equally loaded phases is looked at first.
+        Phase::ALL.map(|p| (p, self.get(p))).into_iter().fold(
+            (Phase::L1, self.l1_kva),
+            |best, next| {
+                if next.1 > best.1 { next } else { best }
+            },
+        )
     }
 
     /// `true` when the Unsymmetrieleistung is at or below the limit.
@@ -820,6 +850,26 @@ mod tests {
         assert!(report.voltage_band.compliant, "one in 1 008 is within 5 %");
         assert!(!report.voltage_absolute.compliant);
         assert!(!report.compliant());
+        assert_eq!(report.voltage_absolute.worst, Some(dec!(260)));
+    }
+
+    /// `worst` is the sample furthest **outside the limit**, and the absolute
+    /// band is asymmetric — +10 % / −15 % of 230 V is 253 V / 195,5 V. Scoring
+    /// by distance from nominal instead ranks 195,4 V (0,1 V under the floor,
+    /// but 34,6 V from nominal) above 260 V (7 V over the ceiling, 30 V from
+    /// nominal), and reports the wrong sample as the worst excursion.
+    #[test]
+    fn the_worst_absolute_sample_is_the_one_furthest_outside_its_own_bound() {
+        let at = |i: i64, v: Decimal| {
+            let from = datetime!(2026-06-01 0:00 UTC) + Duration::minutes(i * 10);
+            PowerQualityInterval {
+                voltage_l1_v: Some(v),
+                ..PowerQualityInterval::empty(from, from + Duration::minutes(10))
+            }
+        };
+        let series = [at(0, dec!(231)), at(1, dec!(195.4)), at(2, dec!(260))];
+        let report = assess_en50160(&series, &En50160Limits::LOW_VOLTAGE);
+        assert!(!report.voltage_absolute.compliant);
         assert_eq!(report.voltage_absolute.worst, Some(dec!(260)));
     }
 

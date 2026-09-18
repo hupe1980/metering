@@ -620,16 +620,16 @@ proptest! {
     #[test]
     fn an_imbalance_splits_one_signed_delta(
         actual in arb_signed_kwh(),
-        contracted in arb_signed_kwh(),
+        bilanziert in arb_signed_kwh(),
     ) {
-        let s = compute_imbalance(actual, contracted);
-        prop_assert_eq!(s.delta_kwh, actual - contracted);
+        let s = compute_imbalance(actual, bilanziert);
+        prop_assert_eq!(s.delta_kwh, actual - bilanziert);
         prop_assert_eq!(s.minder_kwh - s.mehr_kwh, s.delta_kwh);
         prop_assert!(s.mehr_kwh >= Decimal::ZERO && s.minder_kwh >= Decimal::ZERO);
         prop_assert!(!(s.is_mehr() && s.is_minder()), "both sides cannot be open");
         prop_assert_eq!(s.is_balanced(), s.delta_kwh.is_zero());
         prop_assert_eq!(s.magnitude_kwh(), s.delta_kwh.abs());
-        prop_assert_eq!(s.delta_pct().is_some(), !contracted.is_zero());
+        prop_assert_eq!(s.delta_pct().is_some(), !bilanziert.is_zero());
     }
 
     /// The loss balance is a difference, and the share is that difference over

@@ -69,6 +69,15 @@ and there is no other band for them to fall into.
 reconstruct the Arbeitsmenge, including across both DST transitions:
 
 ```rust
+# use metering::{AggregationConfig, MeterInterval, Zaehlzeitdefinition, aggregate};
+# use rust_decimal::{Decimal, dec};
+# use time::{Duration, macros::{date, datetime}};
+# const HT: &str = "HT";
+# let zzd = Zaehlzeitdefinition::ht_nt("NB-1", date!(2026 - 01 - 01), 6 * 60, 22 * 60);
+# let intervals: Vec<MeterInterval> = (0..96)
+#     .map(|i| MeterInterval::quarter_hour(
+#         datetime!(2026-06-01 0:00 UTC) + Duration::minutes(15 * i), dec!(1)))
+#     .collect();
 let period    = aggregate(&intervals, &AggregationConfig::rlm());
 let registers = zzd.split_energy(&intervals);
 assert_eq!(registers.values().sum::<Decimal>(), period.arbeitsmenge);
@@ -111,6 +120,10 @@ BDEW *Anwendungshilfe für die Umsetzung von Modul 3* v1.1 (07.02.2025) §2:
 
 ```rust
 use metering::zaehlzeit::{Modul3Conformance, Modul3Context, Quarter, assess_modul_3};
+# use metering::Zaehlzeitdefinition;
+# use time::macros::date;
+# let zzd = Zaehlzeitdefinition::modul_3(
+#     "NB-14A-3", date!(2026 - 01 - 01), (17 * 60, 20 * 60), (0, 6 * 60));
 
 let ctx = Modul3Context::default()
     .billed_in([Quarter::Q1, Quarter::Q4])   // need not be adjacent
@@ -155,7 +168,12 @@ price sheet: `HT/NT-1` from two Netzbetreiber are two different calendars under
 one name. `netzbetreiber` carries the Marktpartner-ID that published it.
 
 ```rust
+# use metering::Zaehlzeitdefinition;
+# use time::macros::date;
+# let zzd = Zaehlzeitdefinition::ht_nt("NB-1", date!(2026 - 01 - 01), 6 * 60, 22 * 60);
 let zzd = zzd.published_by("9900987654321".parse()?);
+# assert!(zzd.netzbetreiber.is_some());
+# Ok::<(), metering::ParseError>(())
 ```
 
 There is deliberately **no `year` field**: that is `valid_from` and `valid_to`,

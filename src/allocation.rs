@@ -226,23 +226,50 @@ pub struct AllocatedPart {
     /// [`ALLOCATION_DP`] places toward zero.
     #[cfg_attr(feature = "serde", serde(with = "crate::wire::decimal"))]
     pub share: Decimal,
-    /// What it actually received: `min(capacity, share)`, never below zero.
+    /// What it actually received. For [`allocate`] that is
+    /// `min(capacity, share)`; for [`allocate_cascading`] it is the sum over
+    /// every pass, and can exceed [`share`](Self::share).
     #[cfg_attr(feature = "serde", serde(with = "crate::wire::decimal"))]
     pub allocated: Decimal,
+    /// The ceiling the caller supplied, carried through so a row states its own
+    /// basis rather than leaving the reader to look it up.
+    ///
+    /// `None` for a part with no ceiling.
+    #[cfg_attr(feature = "serde", serde(with = "crate::wire::decimal_option"))]
+    pub capacity: Option<Decimal>,
 }
 
 impl AllocatedPart {
-    /// `true` when the ceiling bound the share, so the difference went to the
-    /// residual instead.
+    /// `true` when the part received less than its nominal share.
+    ///
+    /// For [`allocate`] that means the ceiling bound it and the difference went
+    /// to the residual. For [`allocate_cascading`] it means the same thing
+    /// about the **first** pass; a part can also end *above* its nominal share
+    /// there, having taken up what the ceilings left, and then this is `false`.
     #[must_use]
     pub fn capped(&self) -> bool {
-        self.share > self.allocated
+        self.allocated < self.share
     }
 
-    /// The part of the share the ceiling refused — `share − allocated`.
+    /// How much of the nominal share the ceiling refused — never below zero.
+    ///
+    /// Clamped because a cascading part can hold more than its nominal share,
+    /// and a negative "forgone" quantity is not a smaller number: it is a
+    /// different statement, made by accident.
     #[must_use]
     pub fn forgone(&self) -> Decimal {
-        self.share - self.allocated
+        (self.share - self.allocated).max(Decimal::ZERO)
+    }
+
+    /// `true` when the part ended at the ceiling it was given.
+    ///
+    /// The question [`allocate_cascading`] turns on — a part at its ceiling
+    /// takes no further pass — and the one a § 42b report means by *"capped"*:
+    /// the participant's own consumption bounded what they could be credited
+    /// [EnWG § 42b Abs. 5 Satz 4]. `false` for a part with no ceiling.
+    #[must_use]
+    pub fn at_capacity(&self) -> bool {
+        self.capacity.is_some_and(|c| self.allocated >= c)
     }
 }
 
@@ -403,8 +430,14 @@ pub fn allocate(
         .map(|part| {
             let share = allocation_share(match basis {
                 AllocationBasis::Fraction => part.weight * total,
+                // `weight × total ÷ Σ weight`, never `weight ÷ Σ weight × total`.
+                // The second form rounds the quotient to 28 significant digits
+                // and then scales that error up by `total`: three tenants of
+                // 4 kWh against 9 kWh of generation receive 2.999999 each and
+                // leave three millionths belonging to nobody, every
+                // quarter-hour, for every community. One rounding, at the end.
                 AllocationBasis::Proportional if weight_sum > Decimal::ZERO => {
-                    part.weight / weight_sum * total
+                    part.weight * total / weight_sum
                 }
                 AllocationBasis::Proportional => Decimal::ZERO,
             });
@@ -414,6 +447,7 @@ pub fn allocate(
                 weight: part.weight,
                 share,
                 allocated,
+                capacity: part.capacity,
             }
         })
         .collect();
@@ -423,6 +457,130 @@ pub fn allocate(
         total,
         parts: allocated_parts,
         residual: total - allocated,
+    })
+}
+
+/// Divide `total` across `parts`, re-offering what the ceilings refuse to
+/// whoever is still open, until nothing moves.
+///
+/// One pass of [`allocate`] leaves a refused share in the residual. A
+/// **cascading** key gives it back, in the proportions the key already states:
+///
+/// ```text
+/// pass 1   share_i = cut(weight_i × pool ÷ Σ weight)   over every part
+/// pass k   the same, over the parts not yet at their ceiling,
+///          with `pool` reduced by everything already allocated
+/// stop     when a pass moves nothing
+/// ```
+///
+/// Weights are **relative** and later passes renormalise the *original* ones
+/// over the parts still open — never the remaining headroom, which is a fact
+/// about a participant's consumption rather than a term of their agreement.
+/// There is no [`AllocationBasis`] and no pass limit; the guide explains why,
+/// and why a key whose weight *is* its ceiling gains nothing from cascading.
+///
+/// **No source states this.** [EnWG § 42c Abs. 3 Nr. 2] requires a contract to
+/// name *"einen Aufteilungsschlüssel, aus dem sich der Umfang des Rechts zur
+/// Nutzung der Elektrizität ergibt"* and says nothing about its shape. This is
+/// one shape an agreement may take, offered as arithmetic.
+///
+/// # Errors
+///
+/// The two [`validate_key`] runs for
+/// [`Proportional`](AllocationBasis::Proportional): a negative weight or a
+/// negative capacity.
+///
+/// ```rust
+/// use metering::allocation::{AllocationPart, allocate_cascading};
+/// use rust_decimal::dec;
+///
+/// // 9 kWh over three equal claims — but one of them can only take 1 kWh.
+/// let row = allocate_cascading(dec!(9), vec![
+///     AllocationPart::new("a", dec!(1)).capped_at(dec!(1)),
+///     AllocationPart::new("b", dec!(1)).capped_at(dec!(10)),
+///     AllocationPart::new("c", dec!(1)).capped_at(dec!(10)),
+/// ])?;
+///
+/// assert_eq!(row.part("a").unwrap().allocated, dec!(1));   // its ceiling
+/// assert_eq!(row.part("b").unwrap().allocated, dec!(4));   // 3 + a third of 2
+/// assert_eq!(row.residual, dec!(0));                       // the pool is gone
+/// assert!(row.part("a").unwrap().at_capacity());
+/// # Ok::<(), metering::allocation::AllocationError>(())
+/// ```
+pub fn allocate_cascading(
+    total: Decimal,
+    parts: Vec<AllocationPart>,
+) -> Result<AllocationRow, AllocationError> {
+    validate_key(&parts, AllocationBasis::Proportional)?;
+
+    let n = parts.len();
+    let mut allocated = vec![Decimal::ZERO; n];
+    let mut nominal = vec![Decimal::ZERO; n];
+    // A part leaves the cascade when its ceiling stops it taking a full share.
+    let mut open = vec![true; n];
+    let mut pool = total.max(Decimal::ZERO);
+    let mut first_pass = true;
+
+    loop {
+        let weight_sum: Decimal = parts
+            .iter()
+            .zip(&open)
+            .filter(|(_, o)| **o)
+            .map(|(p, _)| p.weight)
+            .sum();
+        if pool <= Decimal::ZERO || weight_sum <= Decimal::ZERO {
+            break;
+        }
+
+        let mut moved = Decimal::ZERO;
+        for i in 0..n {
+            // The nominal share is the key as written, so it is read off the
+            // first pass and over every part — including one whose ceiling is
+            // about to stop it. That is what `capped()` compares against.
+            if first_pass {
+                nominal[i] = allocation_share(parts[i].weight * pool / weight_sum);
+            }
+            if !open[i] {
+                continue;
+            }
+            // Multiply before dividing, as everywhere here.
+            let offered = allocation_share(parts[i].weight * pool / weight_sum);
+            let headroom = match parts[i].capacity {
+                Some(c) => (c - allocated[i]).max(Decimal::ZERO),
+                None => offered,
+            };
+            let give = offered.min(headroom);
+            if give < offered {
+                // The ceiling bound this part: it takes no further pass.
+                open[i] = false;
+            }
+            allocated[i] += give;
+            moved += give;
+        }
+
+        first_pass = false;
+        if moved <= Decimal::ZERO {
+            break;
+        }
+        pool -= moved;
+    }
+
+    let taken: Decimal = allocated.iter().copied().sum();
+    Ok(AllocationRow {
+        total,
+        parts: parts
+            .into_iter()
+            .zip(nominal)
+            .zip(allocated)
+            .map(|((part, share), allocated)| AllocatedPart {
+                key: part.key,
+                weight: part.weight,
+                share,
+                allocated,
+                capacity: part.capacity,
+            })
+            .collect(),
+        residual: total - taken,
     })
 }
 
@@ -454,6 +612,183 @@ mod tests {
                 capacity: *c,
             })
             .collect()
+    }
+
+    // ── allocate_cascading ───────────────────────────────────────────────
+
+    /// The cascade's reason to exist: a ceiling that binds in one pass becomes
+    /// somebody else's share in the next, and the pool is exhausted.
+    #[test]
+    fn a_refused_share_is_re_offered_until_nothing_moves() {
+        let row = allocate_cascading(
+            dec!(9),
+            parts(&[
+                ("a", dec!(1), Some(dec!(1))),
+                ("b", dec!(1), Some(dec!(10))),
+                ("c", dec!(1), Some(dec!(10))),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(row.part("a").unwrap().allocated, dec!(1));
+        assert_eq!(row.part("b").unwrap().allocated, dec!(4));
+        assert_eq!(row.part("c").unwrap().allocated, dec!(4));
+        assert_eq!(row.residual, Decimal::ZERO);
+        assert!(row.part("a").unwrap().at_capacity());
+        assert!(!row.part("b").unwrap().at_capacity());
+    }
+
+    /// Nothing can take more than the pool: when every ceiling together is
+    /// smaller than the total, the cascade stops at the ceilings and the rest
+    /// is residual — under § 42b, the generation that fed the grid.
+    #[test]
+    fn the_cascade_stops_at_the_ceilings_and_reports_the_rest() {
+        let row = allocate_cascading(
+            dec!(100),
+            parts(&[("a", dec!(1), Some(dec!(2))), ("b", dec!(1), Some(dec!(3)))]),
+        )
+        .unwrap();
+        assert_eq!(row.allocated(), dec!(5));
+        assert_eq!(row.residual, dec!(95));
+        assert!(row.parts.iter().all(AllocatedPart::at_capacity));
+    }
+
+    /// A part with no ceiling never leaves the cascade, so a single pass hands
+    /// it everything and the loop ends on the pass that moves nothing.
+    #[test]
+    fn an_uncapped_part_absorbs_the_pool_in_one_pass() {
+        let row = allocate_cascading(dec!(7), parts(&[("a", dec!(1), None)])).unwrap();
+        assert_eq!(row.part("a").unwrap().allocated, dec!(7));
+        assert_eq!(row.residual, Decimal::ZERO);
+        assert!(!row.part("a").unwrap().at_capacity());
+    }
+
+    /// `share` is the key **as written**, read off the first pass — including
+    /// for a part whose ceiling is about to stop it. Without that, `capped()`
+    /// would have nothing to compare against.
+    #[test]
+    fn the_nominal_share_is_the_first_pass_offer() {
+        let row = allocate_cascading(
+            dec!(9),
+            parts(&[
+                ("a", dec!(1), Some(dec!(1))),
+                ("b", dec!(1), Some(dec!(10))),
+                ("c", dec!(1), Some(dec!(10))),
+            ]),
+        )
+        .unwrap();
+        for part in &row.parts {
+            assert_eq!(part.share, dec!(3), "{} nominal", part.key);
+        }
+        // `a` got less than the key offered; `b` got more, and reports no
+        // forgone quantity rather than a negative one.
+        assert!(row.part("a").unwrap().capped());
+        assert_eq!(row.part("a").unwrap().forgone(), dec!(2));
+        assert!(!row.part("b").unwrap().capped());
+        assert_eq!(row.part("b").unwrap().forgone(), Decimal::ZERO);
+    }
+
+    /// Weights are re-normalised, not replaced by headroom. `b` has four times
+    /// `c`'s headroom and twice its weight, so it takes twice — not four
+    /// times — what `c` does out of the re-offered share.
+    #[test]
+    fn later_passes_use_the_agreed_weights_not_the_headroom() {
+        let row = allocate_cascading(
+            dec!(12),
+            parts(&[
+                ("a", dec!(1), Some(dec!(0))),
+                ("b", dec!(2), Some(dec!(40))),
+                ("c", dec!(1), Some(dec!(10))),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(row.part("a").unwrap().allocated, Decimal::ZERO);
+        assert_eq!(row.part("b").unwrap().allocated, dec!(8));
+        assert_eq!(row.part("c").unwrap().allocated, dec!(4));
+        assert_eq!(row.residual, Decimal::ZERO);
+    }
+
+    /// **The cascade needs the weight and the ceiling to be different facts.**
+    ///
+    /// Where a part's weight *is* its ceiling — consumption used as both, the
+    /// obvious reading of "proportional, capped at what they drew" — the
+    /// cascade is a no-op. Either the pool is small enough that nobody reaches
+    /// their ceiling and one pass hands it all out, or it is large enough that
+    /// everybody reaches theirs at once and there is no open part left to
+    /// re-offer to. A `ProportionalCascading` key would be a variant that never
+    /// does anything, which is why there is not one.
+    #[test]
+    fn a_cascade_over_consumption_weighted_consumption_caps_changes_nothing() {
+        for pool in [dec!(3), dec!(6), dec!(20)] {
+            let spec: &[(&str, Decimal, Option<Decimal>)] =
+                &[("a", dec!(2), Some(dec!(2))), ("b", dec!(4), Some(dec!(4)))];
+            let once = allocate(pool, parts(spec), AllocationBasis::Proportional).unwrap();
+            let cascaded = allocate_cascading(pool, parts(spec)).unwrap();
+            for (a, b) in once.parts.iter().zip(&cascaded.parts) {
+                assert_eq!(a.allocated, b.allocated, "pool {pool}, part {}", a.key);
+            }
+            assert_eq!(once.residual, cascaded.residual, "pool {pool}");
+        }
+    }
+
+    /// Every entry point that divides refuses the same inputs.
+    #[test]
+    fn the_cascade_refuses_what_a_proportional_key_refuses() {
+        assert!(matches!(
+            allocate_cascading(dec!(1), parts(&[("a", dec!(-1), None)])),
+            Err(AllocationError::NegativeWeight { .. })
+        ));
+        assert!(matches!(
+            allocate_cascading(dec!(1), parts(&[("a", dec!(1), Some(dec!(-1)))])),
+            Err(AllocationError::NegativeCapacity { .. })
+        ));
+    }
+
+    /// Degenerate pools answer rather than loop.
+    #[test]
+    fn a_pool_or_key_with_nothing_in_it_allocates_nothing() {
+        let zero_weights =
+            allocate_cascading(dec!(5), parts(&[("a", Decimal::ZERO, None)])).unwrap();
+        assert_eq!(zero_weights.allocated(), Decimal::ZERO);
+        assert_eq!(zero_weights.residual, dec!(5));
+
+        let empty = allocate_cascading(dec!(5), Vec::new()).unwrap();
+        assert_eq!(empty.residual, dec!(5));
+
+        let negative = allocate_cascading(dec!(-5), parts(&[("a", dec!(1), None)])).unwrap();
+        assert_eq!(negative.allocated(), Decimal::ZERO);
+        assert_eq!(negative.residual, dec!(-5));
+    }
+
+    /// The operation-order property, at the value that exposes it.
+    ///
+    /// `weight ÷ Σ weight × total` rounds the quotient to 28 significant
+    /// digits and then scales the error up by `total`; `weight × total ÷
+    /// Σ weight` rounds once, at the end. Three equal tenants against 9 kWh
+    /// exhaust it exactly one way and come three millionths short the other —
+    /// a shortfall that is an artefact of the operation order, not a property
+    /// of `Decimal`.
+    #[test]
+    fn three_equal_claims_exhaust_a_divisible_pool_exactly() {
+        let row = allocate(
+            dec!(9),
+            parts(&[
+                ("a", dec!(4), None),
+                ("b", dec!(4), None),
+                ("c", dec!(4), None),
+            ]),
+            AllocationBasis::Proportional,
+        )
+        .unwrap();
+        for part in &row.parts {
+            assert_eq!(
+                part.allocated,
+                dec!(3),
+                "{} took {}",
+                part.key,
+                part.allocated
+            );
+        }
+        assert_eq!(row.residual, Decimal::ZERO);
     }
 
     #[test]

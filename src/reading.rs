@@ -578,8 +578,13 @@ pub fn to_lastgang(readings: &[MeterReading], config: &LastgangConfig) -> Lastga
         }
 
         let straight = next.value - prev.value;
+        // `Some(capacity)` is the *evidence* the wrap was reconstructible, not a
+        // separate boolean beside it: a `wrapped` flag with no capacity to go
+        // with it is a state this branch cannot produce, and writing a zero
+        // capacity into the audit record to satisfy the type would say the
+        // register is zero digits wide.
         let (delta, wrapped) = if straight >= Decimal::ZERO {
-            (straight, false)
+            (straight, None)
         } else {
             // The register went backwards. A wrap is the only explanation this
             // module can reconstruct, and only when the width says how wide the
@@ -594,13 +599,13 @@ pub fn to_lastgang(readings: &[MeterReading], config: &LastgangConfig) -> Lastga
                 anomalies.push(anomaly(AnomalyKind::ImplausibleRollover));
                 continue;
             }
-            (reconstructed, true)
+            (reconstructed, Some(cap))
         };
 
         if let Some(max) = config.max_delta
             && delta > max
         {
-            anomalies.push(anomaly(if wrapped {
+            anomalies.push(anomaly(if wrapped.is_some() {
                 AnomalyKind::ImplausibleRollover
             } else {
                 AnomalyKind::ImplausibleDelta
@@ -608,13 +613,13 @@ pub fn to_lastgang(readings: &[MeterReading], config: &LastgangConfig) -> Lastga
             continue;
         }
 
-        if wrapped {
+        if let Some(register_capacity) = wrapped {
             rollovers.push(Rollover {
                 from: prev.at,
                 to: next.at,
                 previous: prev.value,
                 current: next.value,
-                register_capacity: capacity.unwrap_or(Decimal::ZERO),
+                register_capacity,
                 delta,
             });
         }

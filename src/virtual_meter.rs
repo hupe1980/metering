@@ -47,7 +47,8 @@ use time::OffsetDateTime;
 
 use crate::aggregation_rule::{AggregationRule, VirtualMeterKind};
 use crate::allocation::{
-    AllocationBasis, AllocationError, AllocationPart, allocate, allocation_share, validate_key,
+    AllocationBasis, AllocationError, AllocationPart, allocate, allocate_cascading,
+    allocation_share, validate_key,
 };
 use crate::interval::{MeterInterval, QualityFlag};
 
@@ -578,9 +579,17 @@ fn require<'a, S: BuildHasher>(
 
 /// How a community's generation is divided among its participants.
 ///
-/// The two keys the BDEW Anwendungshilfe publishes for § 42b, and the shape a
-/// § 42c *Aufteilungsschlüssel* takes as well — see
+/// Four shapes: the two the BDEW Anwendungshilfe publishes for § 42b, the
+/// statutory default the EnWG itself supplies for the doubt case, and one
+/// contractual shape that is arithmetic rather than a rule — see
 /// [`compute_community_allocation`].
+///
+/// | Variant | Where it comes from |
+/// |---|---|
+/// | [`Constant`](Self::Constant) | the agreed key, UTILTS `CCI+ZG6` / `CAV+Z28` |
+/// | [`Proportional`](Self::Proportional) | the agreed key, UTILTS `Z74` |
+/// | [`EqualShares`](Self::EqualShares) | **[EnWG § 42b Abs. 5 Satz 3]** — the statute's own answer when the contract has none |
+/// | [`Cascading`](Self::Cascading) | no source states it; a key a contract may take, offered as arithmetic |
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(
@@ -603,6 +612,46 @@ pub enum AllocationKey {
         /// Participant series ids. Order does not affect the result.
         participants: Vec<String>,
     },
+    /// Equal shares — the statute's own answer where the contract gives none.
+    ///
+    /// [EnWG § 42b Abs. 5 Satz 3]: *"Im Zweifel ist die durch die
+    /// Gebäudestromanlage erzeugte elektrische Energie zu gleichen Teilen auf
+    /// die teilnehmenden Letztverbraucher zu verteilen."*
+    ///
+    /// This is the one allocation key in this crate that a **source supplies**
+    /// rather than a contract. Everything else here takes the key as an
+    /// argument and refuses to guess, because § 42b Abs. 5 Satz 2 and § 42c
+    /// Abs. 3 Nr. 2 both leave it to the agreement — but Satz 3 names what
+    /// happens *im Zweifel*, and a library that makes the caller invent the
+    /// doubt case is making them invent a rule that exists.
+    ///
+    /// Satz 4's per-participant ceiling still applies: an equal share is capped
+    /// at what that participant actually consumed, and the remainder is
+    /// residual rather than passed on. For a key that passes it on, see
+    /// [`Cascading`](Self::Cascading).
+    EqualShares {
+        /// Participant series ids. Order does not affect the result.
+        participants: Vec<String>,
+    },
+    /// Relative weights, with what a ceiling refuses re-offered to whoever is
+    /// still open, until nothing moves — [`allocate_cascading`].
+    ///
+    /// **No source states this.** [EnWG § 42c Abs. 3 Nr. 2] requires a contract
+    /// to name *"einen Aufteilungsschlüssel, aus dem sich der Umfang des Rechts
+    /// zur Nutzung der Elektrizität ergibt"* and says nothing about its shape;
+    /// [§ 42b Abs. 5 Satz 2] likewise defers to the agreement. This is one
+    /// shape an agreement may take, and the crate supplies the arithmetic
+    /// without claiming the rule.
+    ///
+    /// The weights are **relative**, like [`Proportional`](Self::Proportional)
+    /// and unlike [`Constant`](Self::Constant): each pass renormalises them
+    /// over the participants still under their ceiling. Equal weights make this
+    /// [`EqualShares`](Self::EqualShares) with a rollover.
+    Cascading {
+        /// Participant series id → relative weight. Must not be negative.
+        #[cfg_attr(feature = "serde", serde(with = "crate::wire::decimal_map"))]
+        weights: std::collections::BTreeMap<String, Decimal>,
+    },
 }
 
 impl AllocationKey {
@@ -611,7 +660,8 @@ impl AllocationKey {
     pub fn participant_ids(&self) -> Vec<&str> {
         match self {
             Self::Constant { fractions } => fractions.keys().map(String::as_str).collect(),
-            Self::Proportional { participants } => {
+            Self::Cascading { weights } => weights.keys().map(String::as_str).collect(),
+            Self::Proportional { participants } | Self::EqualShares { participants } => {
                 let mut ids: Vec<&str> = participants.iter().map(String::as_str).collect();
                 ids.sort_unstable();
                 ids.dedup();
@@ -773,12 +823,22 @@ pub fn compute_community_allocation<S: BuildHasher>(
     // A constant key is fully known before any interval is read, so it is
     // checked once, here, rather than on whichever quarter-hour happens to be
     // first — and by the same function that checks it inside `allocate`.
-    if let AllocationKey::Constant { fractions } = key {
-        let parts: Vec<AllocationPart> = fractions
-            .iter()
-            .map(|(id, fraction)| AllocationPart::new(id.clone(), *fraction))
-            .collect();
-        validate_key(&parts, AllocationBasis::Fraction)?;
+    match key {
+        AllocationKey::Constant { fractions } => {
+            let parts: Vec<AllocationPart> = fractions
+                .iter()
+                .map(|(id, fraction)| AllocationPart::new(id.clone(), *fraction))
+                .collect();
+            validate_key(&parts, AllocationBasis::Fraction)?;
+        }
+        AllocationKey::Cascading { weights } => {
+            let parts: Vec<AllocationPart> = weights
+                .iter()
+                .map(|(id, weight)| AllocationPart::new(id.clone(), *weight))
+                .collect();
+            validate_key(&parts, AllocationBasis::Proportional)?;
+        }
+        AllocationKey::Proportional { .. } | AllocationKey::EqualShares { .. } => {}
     }
 
     let index = SourceIndex::build(sources);
@@ -808,29 +868,38 @@ pub fn compute_community_allocation<S: BuildHasher>(
         // The whole quarter-hour is one `allocate` call: the generation is the
         // pool, each participant's own draw is the ceiling the `Pos()` cap
         // reads, and the key decides only how a weight becomes a share.
-        let (basis, parts) = match key {
-            AllocationKey::Constant { fractions } => (
-                AllocationBasis::Fraction,
-                consumption
-                    .iter()
-                    .map(|(id, iv)| {
-                        AllocationPart::new(
-                            *id,
-                            fractions.get(*id).copied().unwrap_or(Decimal::ZERO),
-                        )
-                        .capped_at(iv.value)
-                    })
-                    .collect(),
-            ),
-            AllocationKey::Proportional { .. } => (
-                AllocationBasis::Proportional,
-                consumption
-                    .iter()
-                    .map(|(id, iv)| AllocationPart::new(*id, iv.value).capped_at(iv.value))
-                    .collect(),
-            ),
+        // Every key is a rule for turning a participant into a weight; the
+        // ceiling is always § 42b Abs. 5 Satz 4 — what they actually drew.
+        let weighted = |weight: &dyn Fn(&str, &MeterInterval) -> Decimal| {
+            consumption
+                .iter()
+                .map(|(id, iv)| AllocationPart::new(*id, weight(id, iv)).capped_at(iv.value))
+                .collect::<Vec<_>>()
         };
-        let row = allocate(generation, parts, basis)?;
+
+        let row = match key {
+            AllocationKey::Constant { fractions } => allocate(
+                generation,
+                weighted(&|id, _| fractions.get(id).copied().unwrap_or(Decimal::ZERO)),
+                AllocationBasis::Fraction,
+            )?,
+            AllocationKey::Proportional { .. } => allocate(
+                generation,
+                weighted(&|_, iv| iv.value),
+                AllocationBasis::Proportional,
+            )?,
+            // Equal shares: one weight each, normalised by `allocate` to
+            // `generation ÷ n` — § 42b Abs. 5 Satz 3, still under Satz 4's cap.
+            AllocationKey::EqualShares { .. } => allocate(
+                generation,
+                weighted(&|_, _| Decimal::ONE),
+                AllocationBasis::Proportional,
+            )?,
+            AllocationKey::Cascading { weights } => allocate_cascading(
+                generation,
+                weighted(&|id, _| weights.get(id).copied().unwrap_or(Decimal::ZERO)),
+            )?,
+        };
 
         let participants: Vec<ParticipantAllocation> = row
             .parts
@@ -1624,6 +1693,89 @@ mod community_tests {
         sources.insert("T1".to_owned(), series(&[dec!(1), dec!(4), dec!(2)]));
         sources.insert("T2".to_owned(), series(&[dec!(3), dec!(4), dec!(6)]));
         sources
+    }
+
+    /// § 42b Abs. 5 Satz 3 — the statute's own key for the doubt case.
+    ///
+    /// Interval 0: 10 kWh generated, T1 draws 1 and T2 draws 3. Equal shares
+    /// are 5 each; Satz 4 caps T1 at the 1 kWh it actually used and T2 at 3, so
+    /// 6 kWh feed the grid. The share a ceiling refuses is **not** passed on —
+    /// that is `Cascading`'s job, and a different agreement.
+    #[test]
+    fn equal_shares_is_the_statutory_doubt_case_under_the_satz_4_cap() {
+        let key = AllocationKey::EqualShares {
+            participants: vec!["T1".to_owned(), "T2".to_owned()],
+        };
+        let out = compute_community_allocation("PLANT", &key, &community()).unwrap();
+        let first = &out[0];
+
+        for p in &first.participants {
+            assert_eq!(p.share, dec!(5), "{} nominal share", p.id);
+        }
+        assert_eq!(first.participant("T1").unwrap().allocated, dec!(1));
+        assert_eq!(first.participant("T2").unwrap().allocated, dec!(3));
+        assert_eq!(first.total_allocated(), dec!(4));
+        assert_eq!(first.surplus_to_grid, dec!(6));
+    }
+
+    /// The same community under a cascading agreement: T1's unusable 4 kWh is
+    /// re-offered, and T2 takes what its own consumption allows. The pool cap
+    /// of Satz 1 — `min(generation, Σ consumption)` — becomes tight.
+    #[test]
+    fn a_cascading_key_re_offers_what_a_ceiling_refused() {
+        let key = AllocationKey::Cascading {
+            weights: BTreeMap::from([("T1".to_owned(), dec!(1)), ("T2".to_owned(), dec!(1))]),
+        };
+        let out = compute_community_allocation("PLANT", &key, &community()).unwrap();
+        let first = &out[0];
+
+        assert_eq!(first.participant("T1").unwrap().allocated, dec!(1));
+        assert_eq!(first.participant("T2").unwrap().allocated, dec!(3));
+        // Both are at their own consumption, so the pool cap binds, not the key.
+        assert_eq!(first.total_allocated(), first.pool_cap);
+        assert_eq!(first.total_allocated(), dec!(4));
+    }
+
+    /// Where the pool is the binding constraint rather than the ceilings, the
+    /// cascade exhausts it and equal shares do not.
+    #[test]
+    fn a_cascade_exhausts_a_pool_equal_shares_would_leave_behind() {
+        let mut sources: SourceMap = HashMap::new();
+        sources.insert("PLANT".to_owned(), series(&[dec!(6)]));
+        sources.insert("T1".to_owned(), series(&[dec!(1)]));
+        sources.insert("T2".to_owned(), series(&[dec!(9)]));
+
+        let equal = AllocationKey::EqualShares {
+            participants: vec!["T1".to_owned(), "T2".to_owned()],
+        };
+        let cascading = AllocationKey::Cascading {
+            weights: BTreeMap::from([("T1".to_owned(), dec!(1)), ("T2".to_owned(), dec!(1))]),
+        };
+
+        let flat = compute_community_allocation("PLANT", &equal, &sources).unwrap();
+        // 3 each; T1 can only take 1, and the other 2 kWh feed the grid.
+        assert_eq!(flat[0].total_allocated(), dec!(4));
+        assert_eq!(flat[0].surplus_to_grid, dec!(2));
+
+        let rolled = compute_community_allocation("PLANT", &cascading, &sources).unwrap();
+        // T2 has room for all of it, so nothing is left over.
+        assert_eq!(rolled[0].participant("T1").unwrap().allocated, dec!(1));
+        assert_eq!(rolled[0].participant("T2").unwrap().allocated, dec!(5));
+        assert_eq!(rolled[0].surplus_to_grid, Decimal::ZERO);
+    }
+
+    /// A cascading key is validated once, at the door, like a constant one.
+    #[test]
+    fn a_negative_cascading_weight_is_refused_before_any_interval() {
+        let key = AllocationKey::Cascading {
+            weights: BTreeMap::from([("T1".to_owned(), dec!(-1)), ("T2".to_owned(), dec!(1))]),
+        };
+        assert!(matches!(
+            compute_community_allocation("PLANT", &key, &community()),
+            Err(VirtualMeterError::Allocation(
+                AllocationError::NegativeWeight { .. }
+            ))
+        ));
     }
 
     fn proportional() -> AllocationKey {

@@ -33,7 +33,9 @@ pub struct NetworkLosses {
     /// side.
     #[cfg_attr(feature = "serde", serde(with = "crate::wire::decimal"))]
     pub verlust_kwh: Decimal,
-    /// Loss share of the infeed in percent, `None` when nothing was fed in.
+    /// Loss share of the infeed in percent to [`PERCENT_DP`](crate::PERCENT_DP)
+    /// places, `None` when nothing was fed in — a share of nothing is not zero
+    /// percent, it is undefined.
     #[cfg_attr(feature = "serde", serde(with = "crate::wire::decimal_option"))]
     pub verlust_prozent: Option<Decimal>,
 }
@@ -47,8 +49,11 @@ pub struct NetworkLosses {
 pub fn network_losses(einspeisung_kwh: Decimal, entnahme_kwh: Decimal) -> NetworkLosses {
     let verlust_kwh = einspeisung_kwh - entnahme_kwh;
     let verlust_prozent = (einspeisung_kwh > Decimal::ZERO).then(|| {
-        (verlust_kwh / einspeisung_kwh * Decimal::ONE_HUNDRED)
-            .round_dp_with_strategy(2, rust_decimal::RoundingStrategy::MidpointAwayFromZero)
+        // Multiply before dividing: one rounding, at the end.
+        (verlust_kwh * Decimal::ONE_HUNDRED / einspeisung_kwh).round_dp_with_strategy(
+            crate::PERCENT_DP,
+            rust_decimal::RoundingStrategy::MidpointAwayFromZero,
+        )
     });
     NetworkLosses {
         einspeisung_kwh,

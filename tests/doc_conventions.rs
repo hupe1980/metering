@@ -127,6 +127,24 @@ const HISTORICAL: &[&str] = &[
     "used to say",
     "used to return",
     "went unnoticed",
+    // Narration of the crate's own past, which reads as present-tense guidance
+    // until you notice the tense. Each of these reached `src/` or the site.
+    //
+    // Bare "there was one" is deliberately absent, for the reason bare "used to"
+    // is: *"the sample furthest outside the limit, when there was one"* is
+    // ordinary English about an `Option`, not a claim about a past release.
+    "this crate did",
+    "the crate did",
+    "went unchecked",
+    "had drifted",
+    "nobody had",
+    "this page used to",
+    "the earlier account",
+    "for two releases",
+    "for several releases",
+    "the day it was written",
+    "had called",
+    "turned out to be",
 ];
 
 /// Version numbers, which date a document that is meant to describe the present.

@@ -6,7 +6,8 @@ weight = 11
 
 It is tempting to write `voltage > 253 V → non-compliant`. EN 50160 says no such
 thing. Every one of its limits is a **share of 10-minute mean values over an
-observation window**:
+observation window** — the figures below are those of **EN 50160:2022**, the
+current edition:
 
 | Parameter | Limit | Share | Window |
 |---|---|---|---|
@@ -44,6 +45,24 @@ assert!(!report.voltage_absolute.compliant); // ...but +10 % admits no exception
 `compliant()` and `is_conclusive()` are separate questions. A verdict over three
 hours of data is not an EN 50160 statement, and the report says so rather than
 quietly claiming conformance.
+
+### `worst` is measured against the bound, not against nominal
+
+Each `LimitOutcome` carries the sample furthest **outside its own limit**. That
+distinction only bites on the absolute band, which is asymmetric: at
+`Un = 230 V` it runs 195,5 V to 253 V, so a sample 0,1 V under the floor is
+34,6 V from nominal while one 7 V over the ceiling is only 30 V from it. Scoring
+by distance from nominal is the obvious thing and reports the trivial excursion
+as the worst one, which sends the reader to the wrong sample.
+
+### U95 is a report line, not the test
+
+`voltage_percentile(&series, 0.95)` is the figure a power-quality report prints
+as U95, and it is **not** the conformance question. EN 50160's voltage
+requirement is two-sided; a one-sided percentile of the raw magnitudes sees only
+the upper tail, so a supply that sags below `Un − 10 %` for a tenth of the week
+has a perfectly respectable U95 and fails the standard. `assess_en50160`
+answers the standard's question.
 
 Each phase counts as its own sample — the limits apply per phase, so a
 three-phase week is 3 024 voltage samples. A parameter nobody measured is

@@ -395,11 +395,13 @@ impl QualityReport {
 ///
 /// ## The grade speaks only for the rules that ran
 ///
-/// [`QualityReport::evaluated`] carries them. Four rules are opt-in — they need
-/// a grid spacing, an outlier threshold, a reference instant or a plant
-/// capacity — and [`QualityConfig::for_sparte`] supplies the first two and not
-/// the last two, because a "now" and a nameplate capacity are not properties of
-/// a commodity. So an `A` from `for_sparte` means *"clean on nine rules"*, and
+/// [`QualityReport::evaluated`] carries them. Seven of the eleven rules hang off
+/// a setting, and two of those settings have no default this library is willing
+/// to pick: a reference instant (V08) and a plant capacity (V12) are facts
+/// about the caller's world rather than about a series.
+/// [`QualityConfig::for_sparte`] supplies the commodity's grid spacing and
+/// outlier threshold and leaves those two alone, so an `A` from `for_sparte`
+/// means *"clean on nine rules"* — and
 /// [`QualityReport::covers_every_rule`] says so without the caller having to
 /// know which nine.
 ///

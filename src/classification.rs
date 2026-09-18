@@ -19,6 +19,14 @@
 //! | source says SMGW / iMSys | `IMsys` |
 //! | 15, 30 or 60 minute intervals | `Rlm` |
 //! | anything coarser | `Slp` |
+//! | **nothing at all** | `None` |
+//!
+//! The last row is the one that matters. An empty series is not a coarse
+//! series: nothing was observed, so there is nothing to classify, and
+//! answering `Slp` would turn "no data arrived" into a statement about the
+//! delivery point — which is then stored, and read back as if somebody had
+//! looked. A gateway origin still classifies without a single interval,
+//! because that is a statement about the *source* rather than about the data.
 //!
 //! The **consumption thresholds do not appear here** — the SLP/RLM boundary at
 //! 100 000 kWh/a is a property of the Marktlokation's master data and annual
@@ -152,12 +160,18 @@ crate::codes::string_codes! {
 ///
 /// | Evidence | Messtyp |
 /// |---|---|
-/// | [`SeriesOrigin::SmartMeterGateway`] | `IMsys` |
-/// | intervals of 15, 30 or 60 minutes | `Rlm` |
-/// | anything coarser, or no usable series | `Slp` |
+/// | [`SeriesOrigin::SmartMeterGateway`] | `Some(IMsys)` |
+/// | intervals of 15, 30 or 60 minutes | `Some(Rlm)` |
+/// | anything coarser | `Some(Slp)` |
+/// | no intervals at all | **`None`** |
 ///
 /// The gateway wins over the interval length: an iMSys delivering hourly values
-/// is still an iMSys.
+/// is still an iMSys, and a gateway that has delivered nothing yet is still a
+/// gateway.
+///
+/// `None` is the answer for a series with nothing in it. An empty series is not
+/// a coarse one, and answering `Slp` would turn "no data arrived" into a stored
+/// statement about the delivery point that nobody made.
 ///
 /// # Example
 /// ```rust
@@ -170,27 +184,37 @@ crate::codes::string_codes! {
 /// let iv = MeterInterval::measured(datetime!(2026-01-01 0:00 UTC), datetime!(2026-01-01 0:15 UTC), dec!(2));
 ///
 /// // Quarter-hours with no gateway claim → RLM.
-/// assert_eq!(classify_messtyp(&[iv.clone()], None), Messtyp::Rlm);
+/// assert_eq!(classify_messtyp(&[iv.clone()], None), Some(Messtyp::Rlm));
 /// // ...the same series from a gateway → iMSys.
 /// assert_eq!(
 ///     classify_messtyp(&[iv], Some(SeriesOrigin::SmartMeterGateway)),
-///     Messtyp::IMsys,
+///     Some(Messtyp::IMsys),
 /// );
+/// // Nothing observed and nothing claimed → nothing to say.
+/// assert_eq!(classify_messtyp(&[], None), None);
 /// ```
 #[must_use]
-pub fn classify_messtyp(intervals: &[MeterInterval], origin: Option<SeriesOrigin>) -> Messtyp {
+pub fn classify_messtyp(
+    intervals: &[MeterInterval],
+    origin: Option<SeriesOrigin>,
+) -> Option<Messtyp> {
+    // A gateway says what the metering system is whether or not it has
+    // delivered anything yet.
     if origin == Some(SeriesOrigin::SmartMeterGateway) {
-        return Messtyp::IMsys;
+        return Some(Messtyp::IMsys);
+    }
+    if intervals.is_empty() {
+        return None;
     }
 
-    match detect_interval_length(intervals) {
+    Some(match detect_interval_length(intervals) {
         Some(
             IntervalResolution::QuarterHour
             | IntervalResolution::HalfHour
             | IntervalResolution::Hour,
         ) => Messtyp::Rlm,
         _ => Messtyp::Slp,
-    }
+    })
 }
 
 #[cfg(test)]
@@ -214,7 +238,7 @@ mod tests {
     #[test]
     fn classify_rlm_from_15min_intervals() {
         let intervals: Vec<_> = (0..4).map(iv_15min).collect();
-        assert_eq!(classify_messtyp(&intervals, None), Messtyp::Rlm);
+        assert_eq!(classify_messtyp(&intervals, None), Some(Messtyp::Rlm));
     }
 
     #[test]
@@ -222,11 +246,11 @@ mod tests {
         let intervals: Vec<_> = (0..4).map(iv_15min).collect();
         assert_eq!(
             classify_messtyp(&intervals, Some(SeriesOrigin::SmartMeterGateway)),
-            Messtyp::IMsys
+            Some(Messtyp::IMsys)
         );
         assert_eq!(
             classify_messtyp(&intervals, Some(SeriesOrigin::Other)),
-            Messtyp::Rlm
+            Some(Messtyp::Rlm)
         );
 
         // Even a daily series from a gateway is an iMSys.
@@ -240,9 +264,9 @@ mod tests {
         }];
         assert_eq!(
             classify_messtyp(&daily, Some(SeriesOrigin::SmartMeterGateway)),
-            Messtyp::IMsys
+            Some(Messtyp::IMsys)
         );
-        assert_eq!(classify_messtyp(&daily, None), Messtyp::Slp);
+        assert_eq!(classify_messtyp(&daily, None), Some(Messtyp::Slp));
     }
 
     #[test]
@@ -255,7 +279,19 @@ mod tests {
             quality: QualityFlag::Measured,
             obis_code: None,
         }];
-        assert_eq!(classify_messtyp(&intervals, None), Messtyp::Slp);
+        assert_eq!(classify_messtyp(&intervals, None), Some(Messtyp::Slp));
+    }
+
+    /// Nothing observed is not a coarse series. A gateway origin still
+    /// classifies, because that is a statement about the source.
+    #[test]
+    fn an_empty_series_classifies_as_nothing() {
+        assert_eq!(classify_messtyp(&[], None), None);
+        assert_eq!(classify_messtyp(&[], Some(SeriesOrigin::Other)), None);
+        assert_eq!(
+            classify_messtyp(&[], Some(SeriesOrigin::SmartMeterGateway)),
+            Some(Messtyp::IMsys)
+        );
     }
 
     #[test]

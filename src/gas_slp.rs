@@ -2,8 +2,11 @@
 //!
 //! ## Legal basis
 //!
-//! Unlike the 2025 electricity profiles, whose value tables are licensed, the
-//! gas SLP procedure is **published in full**: the BDEW/VKU/GEODE Leitfaden
+//! Both the gas SLP procedure and the 2025 electricity profiles are published
+//! in full; what differs is what is worth embedding. The gas procedure is a
+//! **formula with fifteen coefficient sets**, so one of them travels here as a
+//! worked reference; the electricity profiles are **value tables** an operator
+//! chooses between, so none of them does. The gas side: the BDEW/VKU/GEODE Leitfaden
 //! *"Abwicklung von Standardlastprofilen Gas"*, Anlage zur
 //! Kooperationsvereinbarung Gas — current edition **KoV XV, Stand
 //! 27.03.2026**, coefficients in Anlage 6 — prints the profile function, the

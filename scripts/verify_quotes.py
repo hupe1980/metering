@@ -48,9 +48,53 @@ GERMAN = re.compile(
 )
 
 
+def fold_math_alphanumerics(text: str) -> str:
+    """Map Unicode Mathematical Alphanumeric Symbols back to ASCII.
+
+    A Festlegung sets its variables in maths italic, so `pdftotext` returns
+    codepoints from U+1D400 where the prose means `Pplan`. Same letters, a
+    different Unicode block, introduced entirely by the typesetting — so
+    folding them is the same kind of normalisation as a soft hyphen rather
+    than a loosening of what counts as a match.
+
+    U+1D400..U+1D7CB holds fourteen 52-letter alphabets (A-Z then a-z);
+    U+1D7CE..U+1D7FF holds five runs of ten digits.
+    """
+    out: list[str] = []
+    for ch in text:
+        cp = ord(ch)
+        if 0x1D400 <= cp <= 0x1D7CB:
+            index = (cp - 0x1D400) % 52
+            out.append(chr(ord("A") + index) if index < 26 else chr(ord("a") + index - 26))
+        elif 0x1D7CE <= cp <= 0x1D7FF:
+            out.append(chr(ord("0") + (cp - 0x1D7CE) % 10))
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
 def normalise(text: str) -> str:
-    text = text.replace("­", "")            # soft hyphen
+    text = fold_math_alphanumerics(text)
+    # A soft hyphen *is* a hyphenation point. Where the typesetter used one,
+    # a line break follows it and the word continues with no space — so the
+    # break goes with the hyphen. Dropping the character alone left the
+    # newline behind, and the whitespace collapse below turned it into a
+    # space in the middle of a word.
+    text = re.sub("\u00ad\\s*\n\\s*", "", text)
+    text = text.replace("­", "")            # soft hyphen, mid-line
     text = text.replace(" ", " ")           # NBSP
+    # Strip the comment marker *before* joining hyphenation. A German
+    # compound broken across two doc-comment lines reads
+    # `...Duldungs-\n/// und ...`, and joining first swallows the marker
+    # into the word.
+    text = re.sub(r"^[ \t]*(///|//!|//)[ \t]?", "", text, flags=re.M)
+    # A line break *at* a hyphen is ambiguous: typesetting hyphenation drops
+    # it ("Korrekturenergie-\nmengen"), a real compound hyphen keeps it
+    # ("Redispatch-\nMaßnahme", "BK6-20-\n059"). The rule is the one applied
+    # to an intra-line hyphen below, at the one place the two differ: only a
+    # hyphen between two lower-case letters is typesetting, so a capital or a
+    # digit on the far side of the break means the hyphen is spelling.
+    text = re.sub(r"-\s*\n\s*(?=[\dA-ZÄÖÜ])", "-", text)
     text = re.sub(r"-\s*\n\s*", "", text)        # hyphenation across a line break
     # A hyphen between two lower-case letters is typesetting, not spelling:
     # `-layout` keeps "Korrekturenergie-mengen" on one line where the PDF broke
@@ -66,7 +110,6 @@ def normalise(text: str) -> str:
     # one marks, and both are split on below.
     text = re.sub(r"\[\s*(?:…|\.\.\.)\s*\]", "…", text)
     text = text.replace("...", "…")
-    text = re.sub(r"^\s*(///|//!|//)\s?", "", text, flags=re.M)
     # Case-folded: a passage quoted mid-sentence starts lower case where the
     # document starts a sentence, and that difference is never a misquote.
     return re.sub(r"\s+", " ", text).strip().lower()

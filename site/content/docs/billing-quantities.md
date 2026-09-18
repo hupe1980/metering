@@ -63,6 +63,38 @@ The crate does not guess which resolution was meant, and it does not drop the
 answer either. `uniform_resolution` is `false`, which makes the peak an upper
 bound the caller can qualify, refuse, or resample away.
 
+## Coverage reports both of its operands
+
+`coverage_pct` is `covered_secs ÷ period_secs`, clamped to 100 — and the clamp
+is why both operands are on the result. `covered_secs` is a **sum** of billable
+interval lengths, not a merge: `aggregate` makes a single unordered pass and
+merging overlaps would need a sort. A series that overlaps itself therefore
+reaches 100 % with a genuine hole in it, and only the raw seconds show that.
+
+```rust
+# use metering::{AggregationConfig, MeterInterval, aggregate};
+# use rust_decimal::dec;
+# use time::{Duration, macros::datetime};
+let from = datetime!(2026-06-01 0:00 UTC);
+// The same quarter-hour twice, against a declared half-hour.
+let doubled = [
+    MeterInterval::quarter_hour(from, dec!(1)),
+    MeterInterval::quarter_hour(from, dec!(1)),
+];
+let period = aggregate(
+    &doubled,
+    &AggregationConfig::rlm().over_period(from, from + Duration::minutes(30)),
+);
+
+assert_eq!(period.coverage_pct, 100.0);   // the clamp
+assert_eq!(period.covered_secs, 1800);    // ...over 900 real seconds
+assert_eq!(period.period_secs, 1800);
+assert!(!period.coverage_overcounts());   // equal here; V02 names the overlap
+```
+
+`coverage_overcounts()` is `true` once the sum exceeds the period. Either way
+the overlap itself is V02's finding — run `validate_intervals` and look there.
+
 ## Benutzungsstundenzahl
 
 § 17 Abs. 1 StromNEV makes the Netzentgelt depend on *"der jeweiligen

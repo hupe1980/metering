@@ -130,6 +130,32 @@ jobs:
       # Catches missing files / bad metadata before a release tag is cut.
       - run: cargo publish --dry-run --all-features
 
+  semver:
+    name: 🔒 semver
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@cargo-semver-checks
+      # The wire representation is declared semver-covered and pinned by a
+      # literal test; this is the API half of the same promise. It compares
+      # against the most recent crates.io release and names every break, which
+      # is the list a CHANGELOG entry needs.
+      #
+      # `--release-type patch` is load-bearing, not tidiness. Without it the
+      # tool infers the bump from Cargo.toml — and for a 0.x crate a minor bump
+      # already *declares* a major change, so every lint is skipped and the lane
+      # reports `0 checks: 0 pass, 254 skip` however much it broke. Asking
+      # "would this be a legal patch release?" is the question that lists
+      # everything not backwards-compatible, at any version.
+      #
+      # It does not fail the build while the crate is pre-1.0 and every release
+      # is a deliberate hard cut: `continue-on-error` makes the output a report
+      # rather than a gate. Flip it off at 1.0, when a break stops being cheap.
+      - run: cargo semver-checks check-release --all-features --release-type patch
+        continue-on-error: true
+
   audit:
     name: 🛡️ audit
     runs-on: ubuntu-latest

@@ -449,8 +449,15 @@ impl Dynamization {
     /// document, quoted, or verified against this one. They may well be the
     /// same quartic; this crate does not assert it either way.
     ///
+    /// That is checked rather than assumed, and from both places BDEW publishes
+    /// it. In the Anwendungshilfe the sentence *"ist die folgende
+    /// Dynamisierungsfunktion anzuwenden"* is followed by a gap no text
+    /// extractor fills. In the profile workbook the `Dynamisierung` sheet holds
+    /// two labels, **zero numeric cells**, and the workbook's only embedded
+    /// media is one PNG. Both are a picture of a formula.
+    ///
     /// So `Dynamization` is a parameter throughout. An operator loading the
-    /// licensed 2025 tables supplies the function that came with them —
+    /// 2025 tables supplies the function that came with them —
     /// [`DynamicSlpProfile::dynamization`] — rather than inheriting a guess.
     /// A wrong dynamization is a silent few-percent error on every SLP
     /// settlement in the balance group, which is precisely the kind of claim
@@ -492,18 +499,42 @@ impl Dynamization {
         // A supplied polynomial can overflow a `Decimal` where the published
         // one cannot. Refusing beats a fallback factor of 1, which would look
         // like "no dynamisation applies here" rather than "this did not work".
-        Some(Decimal::try_from(f).ok()?.round_dp(4))
+        Some(Decimal::try_from(f).ok()?.round_dp(DYNAMIZATION_DP))
     }
 
-    /// Apply the factor to a profile value; the result is rounded to 3
-    /// decimal places per the Anwendungshilfe.
+    /// Apply the factor to a profile value, cut to [`DYNAMIZED_VALUE_DP`].
     ///
     /// `None` for a `day_of_year` [`factor`](Self::factor) refuses.
     #[must_use]
     pub fn apply(&self, profile_value: Decimal, day_of_year: u16) -> Option<Decimal> {
-        Some((profile_value * self.factor(day_of_year)?).round_dp(3))
+        Some((profile_value * self.factor(day_of_year)?).round_dp(DYNAMIZED_VALUE_DP))
     }
 }
+
+/// Decimal places a dynamisation **factor** is cut to: **4**.
+///
+/// BDEW *Hinweise zu den aktualisierten Standardlastprofilen Strom*
+/// (17.03.2025) § 2.1: *"Eine Rundung der Dynamisierungsfaktoren auf vier
+/// Nachkommastellen wird empfohlen. Das Ergebnis wird auf drei
+/// Nachkommastellen gerundet."*
+///
+/// Note **"wird empfohlen"**: the four places are a recommendation rather than
+/// a requirement, and this crate follows it unconditionally. That is a
+/// deliberate difference from [`G685Rounding`](crate::conversion::G685Rounding),
+/// where published practice demonstrably disagrees with itself and the rounding
+/// is therefore a parameter. Here it does not — one document recommends one
+/// width — so a knob would be a choice offered where nobody is choosing.
+///
+/// The polynomial is evaluated in `f64` (it is a fitted curve, not a
+/// measurement); this is the crossing back.
+pub const DYNAMIZATION_DP: u32 = 4;
+
+/// Decimal places a **dynamised profile value** is cut to: **3**.
+///
+/// The second half of the same sentence — *"Das Ergebnis wird auf drei
+/// Nachkommastellen gerundet"* — and stated as a plain future, not as a
+/// recommendation like the factor's four places.
+pub const DYNAMIZED_VALUE_DP: u32 = 3;
 
 // ── 2025 dynamic profile tables ───────────────────────────────────────────────
 
@@ -567,9 +598,14 @@ pub type SlpValueTable = std::collections::BTreeMap<(u8, SlpDayType), Vec<Decima
 /// [`crate::slp_day_type`] does and why it takes a
 /// [`Bundesland`](crate::Bundesland).
 ///
-/// The value tables themselves are licensed BDEW data and are **not** embedded
-/// here; the operator loads them into this container. The library contributes
-/// the shape, the lookup and the Dynamisierung rules.
+/// The value tables are **not** embedded here, and not because they are
+/// unavailable: BDEW publishes all five as one free workbook alongside the
+/// Anwendungshilfe this module quotes. They are left out because they are the
+/// operator's choice rather than the library's — the Anwendungshilfe lets a
+/// Netzbetreiber bill on the 2025 profiles, the 1999 ones, its own, or a
+/// mixture — and because five profiles × twelve months × three day types × 96
+/// values is a table, not a constant. The operator loads the set it settles on;
+/// the library contributes the shape, the lookup and the Dynamisierung rules.
 #[derive(Debug, Clone, Default)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct DynamicSlpProfile {
@@ -1013,7 +1049,7 @@ mod parse_and_wire_tests {
     }
 
     /// A profile table has to survive a round trip through JSON, which is the
-    /// format an operator's licensed BDEW tables actually arrive in. The
+    /// format an operator's BDEW tables actually arrive in. The
     /// derived `BTreeMap<(u8, SlpDayType), _>` representation could not: a JSON
     /// object key must be a string, so `to_string` failed at run time on a type
     /// whose `serde` form this crate calls part of its public API.

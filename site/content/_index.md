@@ -1,6 +1,6 @@
 +++
 title = "metering — German energy metering for Rust"
-description = "Pure Rust domain library for German energy metering: DST-correct Europe/Berlin calendar arithmetic, Zählerstandsgang to Lastgang, gas m³→kWh_Hs, Ersatzwertbildung, EN 50160, §14a Modul 3 tariff registers and netzorientierte Steuerung, and §42b/§42c allocation."
+description = "Pure Rust domain library for German energy metering quantities: DST-correct Europe/Berlin and Gastag calendar arithmetic, exact decimal values, and the market's own code lists — with every regulatory citation checked against the published PDF."
 template = "index.html"
 +++
 

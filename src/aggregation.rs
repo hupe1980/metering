@@ -134,6 +134,9 @@ pub struct BillingPeriod {
 
     /// The interval the Spitzenleistung was **first** reached in.
     ///
+    /// (The basis this figure is billed on lapses with
+    /// [`STROMNEV_AUSSERKRAFT`]; the quantity does not.)
+    ///
     /// The Leistungspreis is the single most disputed line on an RLM invoice
     /// and "48 kW" is not an answer to "when?". `None` whenever
     /// [`spitzenleistung_kw`](Self::spitzenleistung_kw) is.
@@ -173,6 +176,22 @@ pub struct BillingPeriod {
     /// Vacuously `true` for a series with fewer than two billable intervals.
     pub uniform_resolution: bool,
 
+    /// Seconds of billable interval **summed**, not merged.
+    ///
+    /// Overlapping intervals are counted twice here, because merging them would
+    /// need a sort and [`aggregate`] makes a single unordered pass. That is
+    /// visible rather than hidden: `covered_secs > period_secs` says the series
+    /// overlaps itself or reaches outside the declared period, and V02 names
+    /// the intervals. Without this field the clamp on
+    /// [`coverage_pct`](Self::coverage_pct) reported a clean 100 % for a period
+    /// half of which never arrived.
+    pub covered_secs: i64,
+
+    /// Seconds in the period the coverage is measured against — the declared
+    /// [`AggregationConfig::period`], or the extent of the billable data when
+    /// none was declared.
+    pub period_secs: i64,
+
     /// Share of the period covered by billable intervals, 0–100.
     ///
     /// A **duration** ratio — covered seconds over period seconds — not a count
@@ -181,9 +200,12 @@ pub struct BillingPeriod {
     /// right at every resolution and across both DST transitions without being
     /// told which day it is.
     ///
-    /// Measured against [`AggregationConfig::period`] when set, and against the
-    /// extent of the data otherwise — in which case it can only detect interior
-    /// gaps. See that field.
+    /// `covered_secs ÷ period_secs`, clamped to 100. Measured against
+    /// [`AggregationConfig::period`] when set, and against the extent of the
+    /// data otherwise — in which case it can only detect interior gaps. The
+    /// clamp is why both operands are reported: a series that overlaps itself
+    /// reaches 100 % with a genuine hole in it, and only
+    /// [`covered_secs`](Self::covered_secs) shows that.
     ///
     /// Only **billable** intervals contribute, because this figure answers
     /// *"can this period be invoiced"*.
@@ -193,6 +215,35 @@ pub struct BillingPeriod {
     /// 0 % here, and that divergence is the point rather than a discrepancy.
     pub coverage_pct: f64,
 }
+
+/// The day StromNEV ceases to be in force: **31.12.2028**.
+///
+/// The consolidated ordinance carries the note itself — *"Die V tritt gem.
+/// Art. 15 Abs. 3 G v. 22.12.2023 I Nr. 405 mit Ablauf des 31.12.2028 außer
+/// Kraft"*. (Abs. 4 of the same Article is what repealed StromNZV and GasNZV
+/// with effect from the end of 2025.)
+///
+/// **Nothing here stops working on 1 January 2029.** A Jahreshöchstleistung is
+/// still the maximum average power over a billable interval and a
+/// Benutzungsstundenzahl is still `kWh ÷ kW`; both stay correct for every
+/// settlement year through 2028 and for retrospective corrections long after.
+/// What lapses is the **statutory basis for billing on them**: § 17 Abs. 1,
+/// § 17 Abs. 2 and Anlage 4 zu § 17 Abs. 2 go with the ordinance, and the
+/// BNetzA's *Allgemeine Netzentgeltsystematik Strom* takes over from
+/// 01.01.2029 — replacing the Leistungspreis on a measured peak with a
+/// capacity booked ex ante.
+///
+/// It is a constant rather than a sentence in a comment because a settlement
+/// run for 2029 that still bands on a Benutzungsstundenzahl is computing a
+/// number nobody may bill on, and the date is the only part of that this crate
+/// can state. No function gates on it: the successor quantities are not
+/// published yet, and a library that refused to answer would be asserting a
+/// rule it has not read.
+pub const STROMNEV_AUSSERKRAFT: time::Date =
+    match time::Date::from_calendar_date(2028, time::Month::December, 31) {
+        Ok(d) => d,
+        Err(_) => unreachable!(),
+    };
 
 /// Decimal places [`BillingPeriod::benutzungsdauer_h`] is cut to: **2**.
 ///
@@ -295,7 +346,22 @@ pub fn aggregate(intervals: &[MeterInterval], config: &AggregationConfig) -> Bil
         billable_count,
         excluded_count,
         uniform_resolution,
+        covered_secs,
+        period_secs,
         coverage_pct,
+    }
+}
+
+impl BillingPeriod {
+    /// `true` when more billable seconds were counted than the period holds.
+    ///
+    /// The series overlaps itself, or it reaches outside the declared period.
+    /// Either way [`coverage_pct`](Self::coverage_pct) is clamped and cannot be
+    /// read as completeness — run [`validate_intervals`](crate::validate_intervals)
+    /// and look at V02.
+    #[must_use]
+    pub const fn coverage_overcounts(&self) -> bool {
+        self.period_secs > 0 && self.covered_secs > self.period_secs
     }
 }
 
@@ -337,6 +403,11 @@ impl BillingPeriod {
     /// quantity, which is why it is here and its price is not.
     ///
     /// Cut to [`BENUTZUNGSDAUER_DP`] places.
+    ///
+    /// **Dated.** § 17 StromNEV and its Anlage 4 cease to be in force with
+    /// [`STROMNEV_AUSSERKRAFT`]. The quotient stays meaningful; the tariff band
+    /// it selects does not survive the ordinance, and a 2029 settlement needs
+    /// the successor basis rather than this one.
     ///
     /// `None` when there is no Spitzenleistung to divide by — the config
     /// switched it off, nothing billable arrived, or the peak is zero. A
@@ -456,6 +527,19 @@ mod tests {
     /// A series that mixes an hour with a quarter-hour has no single
     /// Spitzenleistung, and the result says so instead of quietly reporting the
     /// larger of two incomparable numbers.
+    /// The date § 17 StromNEV stops being the basis, from the ordinance's own
+    /// note: *"Die V tritt gem. Art. 15 Abs. 3 G v. 22.12.2023 I Nr. 405 mit
+    /// Ablauf des 31.12.2028 außer Kraft"*. Pinned so a settlement service can
+    /// assert on it rather than carrying its own copy of the date.
+    #[test]
+    fn the_stromnev_basis_has_a_stated_end_date() {
+        assert_eq!(
+            STROMNEV_AUSSERKRAFT,
+            time::macros::date!(2028 - 12 - 31),
+            "the Jahreshöchstleistung basis, not the quantity, lapses here"
+        );
+    }
+
     #[test]
     fn a_mixed_resolution_series_is_reported_as_mixed() {
         let base = datetime!(2026-06-01 0:00 UTC);

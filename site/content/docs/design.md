@@ -1,7 +1,7 @@
 +++
 title = "Design constraints"
 description = "Determinism, exact decimals, one canonical string per value, serde stability and exhaustive domain enums — the invariants the library holds to."
-weight = 15
+weight = 16
 +++
 
 ## Determinism
@@ -61,9 +61,16 @@ Two ways, and which one applies is a rule rather than a case-by-case decision:
 - **Cut to a documented number of places** when the quotient is a value someone
   stores, prints or settles on — or when an identity depends on it.
   `ALLOCATION_DP` (6), `SUBSTITUTE_DP` (6), `SigLinDe::H_VALUE_DP` (6),
-  `KUNDENWERT_DP` (4), `FORECAST_DP` (3), `BENUTZUNGSDAUER_DP` (2),
-  `IMBALANCE_PCT_DP` (2). A share carrying twenty-seven decimal places is not a
-  quantity, and it breaks the subtraction that follows it.
+  `KUNDENWERT_DP` (4), `DYNAMIZATION_DP` (4), `FORECAST_DP` (3),
+  `DYNAMIZED_VALUE_DP` (3), `BENUTZUNGSDAUER_DP` (2), `PERCENT_DP` (2). A share
+  carrying twenty-seven decimal places is not a quantity, and it breaks the
+  subtraction that follows it.
+
+  The width gets a **name**, not a literal: `round_dp(4)` in the middle of an
+  expression is a rule with nowhere to cite and nowhere to look it up.
+  `tests/arithmetic_conventions.rs` scans `src/` for one and fails the build,
+  with an exception list that carries a reason per entry — it found two the day
+  it was written.
 - **Leave it at full width** when it is an intermediate nothing downstream can
   distinguish. `allocation_temperature` feeds only `h_value`, which crosses into
   `f64` at once; cutting it would be a rule the Leitfaden does not state, bought
@@ -80,6 +87,12 @@ published Netzbetreiber practice demonstrably disagrees with itself.
 scales the error up by `c`. Every share in this crate multiplies first. Three
 equal tenants against 9 kWh of generation exhaust it exactly that way, and come
 three millionths short the other.
+
+This is a rule a reviewer cannot hold, so it is a scan:
+`tests/arithmetic_conventions.rs` rejects a division by a simple term followed
+by a multiplication, anywhere in `src/`. A division by a parenthesised product —
+`T_n × p ÷ (T_eff × p_n × K)` — is a single quotient with a composed
+denominator, which is what the rule asks for, and is not matched.
 
 The same reasoning gives an interval's average power as `kWh × 3600 ÷ s` rather
 than `kWh ÷ (s ÷ 3600)` — one rounding instead of two, and identical for every

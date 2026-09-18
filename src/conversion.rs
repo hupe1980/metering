@@ -269,12 +269,14 @@ pub const NORMDRUCK_MBAR: Decimal = dec!(1013.25);
 /// get to choose. `T_eff = 288,15 K`.
 pub const ABRECHNUNGSTEMPERATUR_C: Decimal = dec!(15);
 
-/// Highest gauge pressure at which `K = 1` may be assumed.
+/// The gauge pressure at which the `K = 1` assumption stops — **1 000 mbar**,
+/// one bar. The bound is **exclusive**: `K = 1` holds *below* it, not at it.
 ///
-/// Below 1 bar the Kompressibilitätszahl of natural gas is within the
+/// Below one bar the Kompressibilitätszahl of natural gas is within the
 /// rounding of the Zustandszahl, which is why every Netzbetreiber Merkblatt for
-/// household connections prints `K = 1`. Above it, K comes from G 685-6
-/// (formerly G 486) and is an input like any other.
+/// household connections prints `K = 1`. At or above it, K comes from G 685-6
+/// (formerly G 486) and is an input like any other —
+/// [`ZustandszahlParams::new`] takes it.
 pub const K_EINS_GRENZE_MBAR: Decimal = dec!(1000);
 
 /// What a [`zustandszahl`] is computed from.
@@ -283,7 +285,7 @@ pub const K_EINS_GRENZE_MBAR: Decimal = dec!(1000);
 /// quantity, so a wrong one is a percentage error on every invoice in the
 /// Höhenzone. Two of the four are fixed by G 685-3 rather than chosen
 /// ([`ABRECHNUNGSTEMPERATUR_C`], and `K = 1` below
-/// [`K_EINS_GRENZE_MBAR`]), which is what [`niederdruck`](Self::niederdruck)
+/// [`K_EINS_GRENZE_MBAR`]), which is what [`below_one_bar`](Self::below_one_bar)
 /// fills in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -309,14 +311,16 @@ pub struct ZustandszahlParams {
 }
 
 impl ZustandszahlParams {
-    /// The two pressures, with the values G 685-3 fixes for a Niederdruck
-    /// connection: `t = 15 °C` and `K = 1`.
+    /// The two pressures, with the two values G 685-3 fixes rather than
+    /// measures: `t = 15 °C` and `K = 1`.
     ///
-    /// `None` at or above [`K_EINS_GRENZE_MBAR`], where `K = 1` stops being a
-    /// safe assumption and G 685-6 has to be consulted — use [`new`](Self::new)
-    /// with the K-Zahl for that case.
+    /// Named for its **precondition**, which is what the caller has to check:
+    /// `K = 1` is admissible below [`K_EINS_GRENZE_MBAR`], and that covers the
+    /// Niederdruck *and* the Mitteldruck stage. `None` at or above it, where
+    /// G 685-6 has to be consulted — use [`new`](Self::new) with the K-Zahl
+    /// for that case.
     #[must_use]
-    pub fn niederdruck(luftdruck_mbar: Decimal, effektivdruck_mbar: Decimal) -> Option<Self> {
+    pub fn below_one_bar(luftdruck_mbar: Decimal, effektivdruck_mbar: Decimal) -> Option<Self> {
         (effektivdruck_mbar < K_EINS_GRENZE_MBAR).then_some(Self {
             luftdruck_mbar,
             effektivdruck_mbar,
@@ -398,7 +402,7 @@ pub fn hoehenzonen_luftdruck_mbar(hoehe_m: Decimal) -> Decimal {
 /// use rust_decimal::dec;
 ///
 /// // A household connection 253 m above sea level, 22 mbar Effektivdruck.
-/// let params = ZustandszahlParams::niederdruck(
+/// let params = ZustandszahlParams::below_one_bar(
 ///     hoehenzonen_luftdruck_mbar(dec!(253)),
 ///     dec!(22),
 /// ).expect("below one bar, so K = 1");
@@ -564,7 +568,7 @@ mod tests {
         let luftdruck = hoehenzonen_luftdruck_mbar(dec!(253));
         assert_eq!(luftdruck, dec!(985.64));
 
-        let params = ZustandszahlParams::niederdruck(luftdruck, dec!(22))
+        let params = ZustandszahlParams::below_one_bar(luftdruck, dec!(22))
             .expect("22 mbar is well below one bar");
         assert_eq!(params.absolutdruck_mbar(), dec!(1007.64));
         assert_eq!(params.abrechnungstemperatur_c, ABRECHNUNGSTEMPERATUR_C);
@@ -581,9 +585,9 @@ mod tests {
     /// makes it refuses to be used past that limit.
     #[test]
     fn the_k_equals_one_shortcut_stops_at_one_bar() {
-        assert!(ZustandszahlParams::niederdruck(dec!(1013.25), dec!(999.9)).is_some());
-        assert!(ZustandszahlParams::niederdruck(dec!(1013.25), K_EINS_GRENZE_MBAR).is_none());
-        assert!(ZustandszahlParams::niederdruck(dec!(1013.25), dec!(4000)).is_none());
+        assert!(ZustandszahlParams::below_one_bar(dec!(1013.25), dec!(999.9)).is_some());
+        assert!(ZustandszahlParams::below_one_bar(dec!(1013.25), K_EINS_GRENZE_MBAR).is_none());
+        assert!(ZustandszahlParams::below_one_bar(dec!(1013.25), dec!(4000)).is_none());
     }
 
     /// A gas state that cannot exist has no Zustandszahl, rather than a
@@ -612,8 +616,8 @@ mod tests {
     fn a_higher_hoehenzone_has_a_smaller_zustandszahl() {
         let z_at = |h| {
             zustandszahl(
-                &ZustandszahlParams::niederdruck(hoehenzonen_luftdruck_mbar(h), dec!(22))
-                    .expect("niederdruck"),
+                &ZustandszahlParams::below_one_bar(hoehenzonen_luftdruck_mbar(h), dec!(22))
+                    .expect("below one bar"),
             )
             .expect("a positive gas state")
         };
@@ -727,6 +731,8 @@ impl WarmWaterAdjustments {
 ///
 /// `mean_temp_c` is *"die gemessene oder geschätzte mittlere Temperatur"* — the
 /// regulation permits an estimate and prescribes neither a default nor a cap.
+/// `None` below the 10 °C cold-water reference, where the equation would return
+/// a negative heat quantity.
 ///
 /// # Example
 ///
@@ -740,15 +746,31 @@ impl WarmWaterAdjustments {
 ///     Decimal::from(60u32),
 ///     WarmWaterAdjustments::NONE,
 /// );
-/// assert_eq!(q, Decimal::from(5000u32)); // 2.5 × 40 × 50
+/// assert_eq!(q, Some(Decimal::from(5000u32))); // 2.5 × 40 × 50
+///
+/// // Below the 10 °C cold-water reference there is no heat to apportion, and
+/// // a negative one is not the answer.
+/// assert_eq!(
+///     warm_water_heat_kwh(Decimal::from(40u32), Decimal::from(5u32), WarmWaterAdjustments::NONE),
+///     None,
+/// );
 /// ```
 #[must_use]
 pub fn warm_water_heat_kwh(
     volume_m3: Decimal,
     mean_temp_c: Decimal,
     adjustments: WarmWaterAdjustments,
-) -> Decimal {
-    adjustments.apply(WARMWASSER_FAKTOR * volume_m3 * (mean_temp_c - KALTWASSER_TEMPERATUR_C))
+) -> Option<Decimal> {
+    // A mean warm-water temperature below the 10 °C cold-water reference makes
+    // `(t_w − 10)` negative, and the equation then returns a negative heat
+    // quantity — which is not a small answer but an impossible one, and it
+    // would be apportioned across a building like any other. The input is an
+    // estimate the regulation neither defaults nor caps, so getting it wrong is
+    // an ordinary data error; it is refused rather than propagated. Exactly
+    // 10 °C is a real answer: no apportionable heat.
+    (mean_temp_c >= KALTWASSER_TEMPERATUR_C).then(|| {
+        adjustments.apply(WARMWASSER_FAKTOR * volume_m3 * (mean_temp_c - KALTWASSER_TEMPERATUR_C))
+    })
 }
 
 /// Heat attributable to a central warm-water system from **floor area**, per
@@ -793,12 +815,14 @@ mod warm_water_tests {
                 Decimal::from(60u32),
                 WarmWaterAdjustments::NONE
             ),
-            Decimal::from(5000u32)
+            Some(Decimal::from(5000u32))
         );
     }
 
-    /// At the assumed cold-inlet temperature there is no apportionable heat.
-    /// Below it the result stays negative, signalling a bad temperature input.
+    /// At the assumed cold-inlet temperature there is no apportionable heat,
+    /// which is a real answer of zero. Below it the equation would return a
+    /// **negative** heat quantity — impossible, and apportionable across a
+    /// building all the same — so the input is refused instead.
     #[test]
     fn at_and_below_cold_inlet_temperature() {
         assert_eq!(
@@ -807,14 +831,15 @@ mod warm_water_tests {
                 Decimal::from(10u32),
                 WarmWaterAdjustments::NONE
             ),
-            Decimal::ZERO
+            Some(Decimal::ZERO)
         );
-        assert!(
+        assert_eq!(
             warm_water_heat_kwh(
                 Decimal::from(40u32),
                 Decimal::from(5u32),
                 WarmWaterAdjustments::NONE
-            ) < Decimal::ZERO
+            ),
+            None
         );
     }
 
@@ -828,20 +853,23 @@ mod warm_water_tests {
             brennwert_erdgas: true,
             ..WarmWaterAdjustments::NONE
         };
-        assert_eq!(warm_water_heat_kwh(v, t, brennwert), base * d("1.11"));
+        assert_eq!(warm_water_heat_kwh(v, t, brennwert), Some(base * d("1.11")));
 
         let wp = WarmWaterAdjustments {
             monovalente_waermepumpe: true,
             ..WarmWaterAdjustments::NONE
         };
-        assert_eq!(warm_water_heat_kwh(v, t, wp), base * d("0.30"));
+        assert_eq!(warm_water_heat_kwh(v, t, wp), Some(base * d("0.30")));
 
         // Eigenständige gewerbliche Wärmelieferung divides.
         let gewerblich = WarmWaterAdjustments {
             eigenstaendige_gewerbliche_waermelieferung: true,
             ..WarmWaterAdjustments::NONE
         };
-        assert_eq!(warm_water_heat_kwh(v, t, gewerblich), base / d("1.15"));
+        assert_eq!(
+            warm_water_heat_kwh(v, t, gewerblich),
+            Some(base / d("1.15"))
+        );
     }
 
     /// §9 Abs. 2 Satz 6 does not make the three grounds exclusive, so a
@@ -855,7 +883,7 @@ mod warm_water_tests {
             ..WarmWaterAdjustments::NONE
         };
         let q = warm_water_heat_kwh(Decimal::from(40u32), Decimal::from(60u32), both);
-        assert_eq!(q, Decimal::from(5000u32) / d("1.15") * d("0.30"));
+        assert_eq!(q, Some(Decimal::from(5000u32) / d("1.15") * d("0.30")));
     }
 
     /// The adjustments apply to the floor-area equation too ("Satz 2 oder 4").

@@ -4,6 +4,107 @@ All notable changes to `metering` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the crate follows
 semver, with the `serde` representation explicitly in scope (see the crate docs).
 
+## [0.24.0] — unreleased
+
+Two new modules, a wider set of source scans, and corrections to several claims
+the crate made about what it could not verify.
+
+### Added
+
+- **`ausfallarbeit`** — Redispatch 2.0 (BNetzA BK6-23-241, BilAReM Kap. 3). The
+  Wert der Leistungslimitierung for the Aufforderungs- and Duldungsfall and the
+  Referenzprofilverfahren; the Pauschal formulas for Wind, Solar and
+  nicht-fluktuierende Erzeugung; the Spitzabrechnung for the last of those; the
+  solar Anlagenfaktor table, which is in UTC+1; `p0_kw`, which requires
+  `Measured` rather than `is_billable()`; and `PAUSCHAL_BESTANDSSCHUTZ_ENDE`
+  (31.12.2028). The quantity is **signed**: a positive Redispatch yields
+  Mehrarbeit as a negative Ausfallarbeit.
+
+  The Spitz and vereinfachte Spitz variants for fluctuating plants need a power
+  curve and a site model, so their theoretical series is an argument.
+
+- **`allocation::allocate_cascading`** and **`AllocationKey::Cascading`** — a
+  key where a share its holder cannot use passes to whoever still has room.
+  Proportional by construction, with no pass limit and no
+  `ProportionalCascading`.
+- **`AllocationKey::EqualShares`** — [EnWG § 42b Abs. 5 Satz 3], equal division
+  where the agreement is silent.
+- **`aggregation::STROMNEV_AUSSERKRAFT`** (31.12.2028), referenced by
+  `spitzenleistung_at` and `benutzungsdauer_h`. Nothing gates on it: the
+  quantities stay correct, the basis for billing on them lapses.
+- `BillingPeriod::{covered_secs, period_secs, coverage_overcounts}`,
+  `AnnualForecast::{billable_count, excluded_count}`,
+  `AllocatedPart::{capacity, at_capacity}`, `PERCENT_DP`, `DYNAMIZATION_DP`,
+  `DYNAMIZED_VALUE_DP`.
+- **`tests/arithmetic_conventions.rs`** — scans rejecting a quotient used as a
+  factor, and a rounding width written as a literal.
+- A **`cargo-semver-checks`** CI lane and `just semver`, with
+  `--release-type patch`: without it a 0.x minor bump declares a major change
+  and every lint is skipped.
+- `specs/`: the BDEW Ausfallarbeit Leitfaden, the BK6-23-241 Beschluss and its
+  BilAReM annex, the GaBi Gas 2.1 Beschluss, and the BDEW 2025 SLP workbook —
+  all fetched by `just specs`.
+
+### Fixed
+
+- **`allocation::allocate` divided before multiplying** on the `Proportional`
+  branch. Three tenants of 4 kWh against 9 kWh received 2.999999 each, while the
+  per-tenant path beside it multiplied first.
+- **`assess_en50160` reported the wrong worst sample** for the asymmetric
+  absolute voltage limit, scoring by distance from nominal.
+- **The forecast interval was computed over partial boundary days**, and
+  **`seasonal_factor` halved itself** when the prior year reached only partway
+  into the shifted window.
+- **`validate_intervals` reported V01 as evaluated** over an empty series with
+  no declared period.
+- `to_lastgang` no longer writes a zero `register_capacity` into a `Rollover`.
+- `voltage_out_of_range` guards `Un <= 0` and performs no division.
+- Three further quotients used as factors: `delta_pct`, `network_losses`,
+  `voltage_out_of_range`.
+- Four quote-harness normalisation classes: a soft hyphen takes its line break
+  with it; Mathematical Alphanumeric Symbols fold to ASCII; the comment marker
+  is stripped before hyphenation is joined; a line break at a hyphen keeps it
+  before a capital or a digit.
+
+### Changed
+
+- **`classify_messtyp` returns `Option<Messtyp>`** — an empty series returned
+  `Slp`.
+- **`warm_water_heat_kwh` returns `Option<Decimal>`** — below the 10 °C
+  cold-water reference it returned a negative heat quantity.
+- **`ImbalanceSaldo::contracted_kwh` → `bilanziert_kwh`**; GPKE Kap. 8.4 and
+  GaBi Gas 2.1 Ziff. 3a both compare against what was *allocated*.
+- **`IMBALANCE_PCT_DP` → `PERCENT_DP`**, shared with `network_losses`.
+- **`ZustandszahlParams::niederdruck` → `::below_one_bar`**;
+  `K_EINS_GRENZE_MBAR` is exclusive.
+- `AllocatedPart::forgone()` is clamped at zero.
+- **Dependency floors** raised to the oldest versions the suite runs against:
+  `rust_decimal 1.37`, `time 0.3.47`.
+- The README and every `site/content/` page are `include_str!`'d into a
+  `#[cfg(doctest)]` module, so rustdoc runs every published block;
+  `tests/doc_samples.rs` is removed.
+
+### Removed
+
+- `tests/doc_samples.rs`, superseded by the doctested pages above.
+
+### Documentation
+
+- **The opt-in validation-rule account was wrong in four places.** Four rules
+  always run; seven hang off six settings; two of those have no default.
+  `ValidationConfig::default()` **is** `rlm_strom_15min()`.
+- **The 2025 SLP value tables are not licensed** — they are a free BDEW
+  workbook. They are not embedded because the Anwendungshilfe lets a
+  Netzbetreiber bill on the 2025 set, the 1999 set, its own, or a mixture.
+- **The 2025 Dynamisierungsfunktion is published only as an image**, verified in
+  both places BDEW publishes it.
+- The EN 50160 share tolerance absorbs binary rounding rather than conceding to
+  the standard; limits are cited as EN 50160:2022; `voltage_percentile` is a
+  report line, not the conformance test.
+- § 42c Abs. 3 Nr. 2 says nothing about a key's shape.
+- New site page **Redispatch and Ausfallarbeit**; the four allocation keys and
+  the cascade's design points documented.
+
 ## [0.23.0] — 2026-09-05
 
 A full audit — of the arithmetic, of the vocabulary, and of every passage the

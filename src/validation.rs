@@ -156,6 +156,9 @@ impl ValidationRuleId {
     /// way [`ValidationConfig::enabled_rules`] reports the outcome, so the
     /// distinction never has to be reasoned about at a call site.
     ///
+    /// `None` here is the answer for the four rules that always run — V02,
+    /// V07, V09 and V11 — each of which reads only the series it was given.
+    ///
     /// ```rust
     /// use metering::{ValidationConfig, ValidationRuleId};
     ///
@@ -223,11 +226,24 @@ crate::codes::string_codes! {
 /// A set of [`ValidationRuleId`]s — which rules a configuration arms, and which
 /// a run actually evaluated.
 ///
-/// Four of the eleven rules are **opt-in**: they need a number this library
-/// refuses to invent, and leaving the corresponding [`ValidationConfig`] field
-/// `None` turns the rule off. A clean [`ValidationResult`] therefore means *"the
-/// rules that ran found nothing"*, which is weaker than "nothing is wrong" —
-/// so [`ValidationConfig::disabled_rules`] answers before a run,
+/// Four rules always run. The other seven are switched by six
+/// [`ValidationConfig`] fields, and two of those six carry no default the
+/// library is willing to pick:
+///
+/// | Field | Rules | Default |
+/// |---|---|---|
+/// | `expected_interval_secs` | V01, V06 | `Some(900)` |
+/// | `outlier_sigma` | V04 | `Some(6.0)` |
+/// | `zero_run_threshold` | V05 | `4` (`0` is off) |
+/// | `negative_energy_is_error` | V03 | `true` |
+/// | `now` | V08 | **`None` — off** |
+/// | `max_plant_power_kw` | V12 | **`None` — off** |
+///
+/// A reference instant and a nameplate capacity are facts about the caller's
+/// world rather than about a series, so the last two stay off until they are
+/// supplied. A clean [`ValidationResult`] therefore means *"the rules that ran
+/// found nothing"*, which is weaker than "nothing is wrong" — so
+/// [`ValidationConfig::disabled_rules`] answers before a run,
 /// [`ValidationResult::evaluated`] after one, and the two differ exactly when
 /// the **data** rather than the config stopped a rule.
 ///
@@ -237,8 +253,10 @@ crate::codes::string_codes! {
 /// ```rust
 /// use metering::{RuleSet, ValidationConfig, ValidationRuleId as R};
 ///
-/// // Nothing is configured beyond the defaults, so three rules are inert.
+/// // Nothing is configured beyond the defaults, so exactly the two rules that
+/// // need a fact about the caller's world are inert.
 /// let cfg = ValidationConfig::default();
+/// assert_eq!(cfg.disabled_rules().to_string(), "V08, V12");
 /// assert!(cfg.disabled_rules().contains(R::ImplausiblePower));
 /// assert!(cfg.disabled_rules().contains(R::FutureTimestamp));
 /// assert!(cfg.enabled_rules().contains(R::GapDetected));
@@ -558,6 +576,14 @@ impl Default for ValidationConfig {
 
 impl ValidationConfig {
     /// Configuration for 15-minute RLM / iMSys electricity Bezug meters.
+    ///
+    /// This **is** [`Default`]: the quarter-hour grid, the loose Hampel
+    /// threshold and the one-hour zero run are the electricity conventions, and
+    /// the type's default is named after the series it describes rather than
+    /// pretending to be commodity-neutral. A gas series wants
+    /// [`gas_hourly`](Self::gas_hourly), and
+    /// [`QualityConfig::for_sparte`](crate::QualityConfig::for_sparte) picks
+    /// for a `Sparte`.
     #[must_use]
     pub fn rlm_strom_15min() -> Self {
         Self::default()
@@ -568,9 +594,10 @@ impl ValidationConfig {
     pub fn gas_hourly() -> Self {
         Self {
             expected_interval_secs: Some(3600),
-            // Three hours either side at hourly resolution would be a 7-point
-            // window; gas draw is smoother, so a day-wide median is stabler.
-            outlier_window: 12,
+            // The default half-window of 12 is three hours either side at
+            // quarter-hourly resolution and half a day either side at hourly —
+            // which is what a smoother gas draw wants, so it carries over
+            // unchanged rather than being restated here.
             ..Self::default()
         }
     }
@@ -804,19 +831,21 @@ pub fn validate_intervals(
 
     if intervals.is_empty() {
         // An empty series still fails a declared period: nothing arrived at all.
+        let mut evaluated = RuleSet::EMPTY;
         if let (Some((from, to)), Some(secs)) = (config.period, config.expected_interval_secs)
             && to > from
             && secs > 0
         {
             issues.push(gap_issue(from, to, secs, None));
+            evaluated = evaluated.with(ValidationRuleId::GapDetected);
         }
-        // Nothing else can have run: every other rule needs an interval to
-        // look at. Reporting `enabled` here would claim ten clean rules over
-        // an empty series.
-        return ValidationResult {
-            issues,
-            evaluated: enabled.intersection(RuleSet::EMPTY.with(ValidationRuleId::GapDetected)),
-        };
+        // Nothing else can have run: every other rule needs an interval to look
+        // at, and V01 needs a declared period — without one an empty series
+        // defines its own (empty) extent and there is nothing to be missing
+        // from. Reporting V01 as evaluated in that case would say "no gaps"
+        // about a month that never arrived, which is the exact difference
+        // between "found nothing" and "never looked".
+        return ValidationResult { issues, evaluated };
     }
 
     // Evaluate the adjacency rules in timestamp order while still reporting the
@@ -1947,6 +1976,30 @@ mod rule_set_tests {
 
 #[cfg(test)]
 mod zero_run_tests {
+
+    /// An empty series with no declared period has nothing to be missing from,
+    /// so V01 did not run — and saying it did would report "no gaps" about a
+    /// month that never arrived.
+    #[test]
+    fn an_empty_series_evaluates_nothing_without_a_period() {
+        let cfg = ValidationConfig::default();
+        let result = validate_intervals(&[], &cfg);
+        assert!(result.is_clean());
+        assert!(result.evaluated.is_empty(), "{}", result.evaluated);
+        assert!(result.skipped().contains(ValidationRuleId::GapDetected));
+    }
+
+    /// With a period, V01 both runs and fails: nothing arrived at all.
+    #[test]
+    fn an_empty_series_fails_a_declared_period() {
+        let cfg = ValidationConfig::default().over_period(
+            datetime!(2026-06-01 0:00 UTC),
+            datetime!(2026-06-02 0:00 UTC),
+        );
+        let result = validate_intervals(&[], &cfg);
+        assert!(result.has_errors());
+        assert_eq!(result.evaluated.to_string(), "V01");
+    }
     use super::*;
     use crate::interval::QualityFlag;
     use rust_decimal::dec;

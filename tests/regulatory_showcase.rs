@@ -181,7 +181,7 @@ fn fifteen_min_intervals_classify_as_rlm() {
             obis_code: None,
         })
         .collect();
-    assert_eq!(classify_messtyp(&intervals, None), Messtyp::Rlm);
+    assert_eq!(classify_messtyp(&intervals, None), Some(Messtyp::Rlm));
 }
 
 /// §41a EnWG: SMGW source → always iMSys, regardless of interval length.
@@ -199,11 +199,11 @@ fn smgw_source_forces_imsys() {
         .collect();
     assert_eq!(
         classify_messtyp(&intervals, Some(SeriesOrigin::SmartMeterGateway)),
-        Messtyp::IMsys
+        Some(Messtyp::IMsys)
     );
     assert_eq!(
         classify_messtyp(&intervals, Some(SeriesOrigin::Other)),
-        Messtyp::Rlm
+        Some(Messtyp::Rlm)
     );
 }
 
@@ -227,7 +227,7 @@ fn daily_intervals_classify_as_slp() {
             obis_code: None,
         },
     ];
-    assert_eq!(classify_messtyp(&intervals, None), Messtyp::Slp);
+    assert_eq!(classify_messtyp(&intervals, None), Some(Messtyp::Slp));
 }
 
 /// §41a EnWG: only iMSys supports dynamic tariff billing.
@@ -277,7 +277,7 @@ fn balanced_period_no_imbalance() {
 }
 
 /// § 13 StromNZV: imbalance percentage calculation.
-/// 50 kWh on 1000 contracted = 5%.
+/// 50 kWh on 1000 bilanziert = 5%.
 #[test]
 fn imbalance_delta_pct() {
     let saldo = compute_imbalance(dec!(1050), dec!(1000));
@@ -287,15 +287,15 @@ fn imbalance_delta_pct() {
 /// § 13 StromNZV: mehr and minder are mutually exclusive.
 #[test]
 fn mehr_and_minder_mutually_exclusive() {
-    for (actual, contracted) in [
+    for (actual, bilanziert) in [
         (dec!(900), dec!(1000)),
         (dec!(1100), dec!(1000)),
         (dec!(1000), dec!(1000)),
     ] {
-        let s = compute_imbalance(actual, contracted);
+        let s = compute_imbalance(actual, bilanziert);
         assert!(
             !(s.is_mehr() && s.is_minder()),
-            "mehr and minder cannot both be true for actual={actual}, contracted={contracted}"
+            "mehr and minder cannot both be true for actual={actual}, bilanziert={bilanziert}"
         );
     }
 }

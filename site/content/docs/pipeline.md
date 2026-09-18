@@ -1,7 +1,7 @@
 +++
 title = "The whole pipeline"
 description = "One Liefertag from the Zählerstandsgang the gateway delivered through to the §14a register split — a runnable, self-asserting example."
-weight = 16
+weight = 17
 +++
 
 The guides explain each stage on its own. This is all of them, on one day:
@@ -68,7 +68,7 @@ Read that as a chain of decisions:
 - The hole surfaces as an ordinary **V01 gap**, not as a special
   "reading anomaly" concept — so Ersatzwertbildung closes it with the same
   machinery it closes any gap, and the audit trail records
-  `PlausibilityCheckFailed` as the reason.
+  `SubstitutionReason::ImplausibleValue` — `ZA1` on the wire — as the reason.
 - Coverage reaches **100 %** only after filling, and is measured against the
   *declared* period rather than the extent of whatever arrived.
 - The register split **reconstructs the Arbeitsmenge exactly** — an invariant
@@ -76,13 +76,18 @@ Read that as a chain of decisions:
 
 ## The invariants it checks
 
-```rust
+```rust,ignore
 assert_eq!(intervals.len(), 100);                        // the 25-hour day, exactly
 assert!((period.coverage_pct - 100.0).abs() < 1e-9);     // nothing left unfilled
 assert_eq!(registers.values().sum::<Decimal>(), period.arbeitsmenge);
 assert!(!registers.contains_key(&None));                 // the fallback covers everything
 assert_eq!(nt_intervals, 36);                            // 8 h of NT plus the repeated hour
 ```
+
+These lines are an **excerpt** from `examples/pipeline.rs` rather than a
+standalone snippet, which is why they are not compiled here: they are compiled
+and *run* where they live, by the `example` CI lane, against the whole
+pipeline's state. Every other block on this site is a doctest.
 
 The last one is the crate's whole thesis in a line. A Niedertarif band of
 22:00–06:00 is eight hours, which on an ordinary day is 32 quarter-hours. On

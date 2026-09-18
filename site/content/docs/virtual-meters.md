@@ -132,6 +132,19 @@ and it is not the same computation run N times:
 
 ```rust
 use metering::{AllocationKey, compute_community_allocation};
+# use metering::{MeterInterval, QualityFlag};
+# use rust_decimal::dec;
+# use std::collections::HashMap;
+# use time::macros::datetime;
+# let iv = |kwh| vec![MeterInterval {
+#     from: datetime!(2026-06-01 12:00 UTC),
+#     to:   datetime!(2026-06-01 12:15 UTC),
+#     value: kwh, quality: QualityFlag::Measured, obis_code: None,
+# }];
+# let mut sources = HashMap::new();
+# sources.insert("PLANT".to_owned(), iv(dec!(10)));
+# sources.insert("T1".to_owned(),    iv(dec!(1)));
+# sources.insert("T2".to_owned(),    iv(dec!(3)));
 
 let key = AllocationKey::Proportional {
     participants: vec!["T1".to_owned(), "T2".to_owned()],
@@ -142,7 +155,68 @@ let interval = &out[0];
 assert_eq!(interval.pool_cap, interval.generation.min(interval.total_consumption));
 assert!(interval.total_allocated() <= interval.pool_cap);
 assert_eq!(interval.generation, interval.total_allocated() + interval.surplus_to_grid);
+# Ok::<(), metering::VirtualMeterError>(())
 ```
+
+### Four keys, and only one of them comes from a source
+
+| `AllocationKey` | Weight | Where it comes from |
+|---|---|---|
+| `Constant { fractions }` | an absolute fraction | the agreement (UTILTS `CCI+ZG6` / `CAV+Z28`) |
+| `Proportional { participants }` | the participant's own draw | the agreement (UTILTS `Z74`) |
+| **`EqualShares { participants }`** | one each | **[EnWG § 42b Abs. 5 Satz 3]** |
+| `Cascading { weights }` | relative, renormalised each pass | the agreement; no source states the shape |
+
+Every one of them is then capped at what the participant actually drew — § 42b
+Abs. 5 Satz 4 — so the key decides only how a weight becomes a share.
+
+`EqualShares` is the single allocation key in this crate that a **statute
+supplies** rather than a contract:
+
+> Im Zweifel ist die durch die Gebäudestromanlage erzeugte elektrische Energie
+> zu gleichen Teilen auf die teilnehmenden Letztverbraucher zu verteilen.
+
+Everything else here takes the key as an argument and refuses to guess, because
+Satz 2 and § 42c Abs. 3 Nr. 2 both defer to the agreement. But Satz 3 names what
+happens *im Zweifel* — and a library that makes the caller invent the doubt case
+is making them invent a rule that already exists.
+
+```rust
+use metering::{AllocationKey, compute_community_allocation};
+# use metering::{MeterInterval, QualityFlag};
+# use rust_decimal::dec;
+# use std::collections::{BTreeMap, HashMap};
+# use time::macros::datetime;
+# let iv = |kwh| vec![MeterInterval {
+#     from: datetime!(2026-06-01 12:00 UTC),
+#     to:   datetime!(2026-06-01 12:15 UTC),
+#     value: kwh, quality: QualityFlag::Measured, obis_code: None,
+# }];
+# let mut sources = HashMap::new();
+# sources.insert("PLANT".to_owned(), iv(dec!(6)));
+# sources.insert("T1".to_owned(),    iv(dec!(1)));
+# sources.insert("T2".to_owned(),    iv(dec!(9)));
+let participants = vec!["T1".to_owned(), "T2".to_owned()];
+
+// Equal shares: 3 each. T1 can only use 1, and the other 2 kWh feed the grid.
+let equal = AllocationKey::EqualShares { participants: participants.clone() };
+let flat = compute_community_allocation("PLANT", &equal, &sources)?;
+assert_eq!(flat[0].total_allocated(), dec!(4));
+assert_eq!(flat[0].surplus_to_grid, dec!(2));
+
+// The same community, agreed to roll unusable shares over: T2 has room.
+let rolled = AllocationKey::Cascading {
+    weights: BTreeMap::from([("T1".to_owned(), dec!(1)), ("T2".to_owned(), dec!(1))]),
+};
+let out = compute_community_allocation("PLANT", &rolled, &sources)?;
+assert_eq!(out[0].participant("T2").unwrap().allocated, dec!(5));
+assert_eq!(out[0].surplus_to_grid, dec!(0));
+# Ok::<(), metering::VirtualMeterError>(())
+```
+
+The cascade's design — why the weights rather than the headroom, why no pass
+limit, and why there is no `ProportionalCascading` — is in
+[Sessions and allocation](@/docs/sessions-and-allocation.md).
 
 ### The pool cap is a theorem, not a step
 

@@ -680,7 +680,44 @@ fn tags_added_in_0_21_are_pinned() {
     .unwrap();
     assert_eq!(
         json(&row),
-        r#"{"total":"10","parts":[{"key":"T1","weight":"1","share":"10","allocated":"2"}],"residual":"8"}"#
+        r#"{"total":"10","parts":[{"key":"T1","weight":"1","share":"10","allocated":"2","capacity":"2"}],"residual":"8"}"#
+    );
+
+    // A part with no ceiling still carries the field, as `null`: the absence of
+    // a ceiling is a fact about the key, and a reader that has to infer it from
+    // a missing key cannot tell it from an older writer.
+    let uncapped = metering::allocate(
+        dec!(10),
+        vec![metering::AllocationPart::new("T1", dec!(1))],
+        AllocationBasis::Proportional,
+    )
+    .unwrap();
+    assert_eq!(
+        json(&uncapped),
+        r#"{"total":"10","parts":[{"key":"T1","weight":"1","share":"10","allocated":"10","capacity":null}],"residual":"0"}"#
+    );
+}
+
+/// The allocation keys, tagged. `EqualShares` is the statutory doubt case of
+/// § 42b Abs. 5 Satz 3 and `Cascading` a contractual shape; both are stored by
+/// a consumer alongside the two that were already here, so both are a wire
+/// format from the day they exist.
+#[test]
+fn allocation_key_tags_are_stable() {
+    use metering::AllocationKey;
+    use std::collections::BTreeMap;
+
+    assert_eq!(
+        json(&AllocationKey::EqualShares {
+            participants: vec!["T1".to_owned()]
+        }),
+        r#"{"kind":"EQUAL_SHARES","participants":["T1"]}"#
+    );
+    assert_eq!(
+        json(&AllocationKey::Cascading {
+            weights: BTreeMap::from([("T1".to_owned(), dec!(1))]),
+        }),
+        r#"{"kind":"CASCADING","weights":{"T1":"1"}}"#
     );
 }
 

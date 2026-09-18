@@ -1,7 +1,7 @@
 +++
 title = "Regulatory basis"
 description = "Every provision this library implements, quoted from the published text and dated — including the ones it deliberately does not claim."
-weight = 14
+weight = 15
 +++
 
 Every citation below is checked against the current published text — most
@@ -109,7 +109,10 @@ That matters for two provisions commonly still quoted:
   as an **image**, so its coefficients cannot be read out of the document,
   quoted or verified. `Dynamization::vdew_1999()` is the 1999 VDEW quartic and
   is documented as exactly that; a `DynamicSlpProfile` carries whichever function
-  came with its licensed tables, and refuses to answer without one.
+  came with its tables, and refuses to answer without one. That the function is
+  an image is checked in both places BDEW publishes it: the Anwendungshilfe's
+  sentence is followed by a gap no extractor fills, and the profile workbook's
+  `Dynamisierung` sheet holds two labels, zero numeric cells and one PNG.
 - **G 685 final rounding.** Published Netzbetreiber Merkblätter demonstrably
   diverge between whole-kWh and two-decimal results, and the normative text is
   not freely citable. It is a setting.

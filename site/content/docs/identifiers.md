@@ -77,6 +77,7 @@ use metering::{BdewCode, CodeVergabestelle};
 
 let nb: BdewCode = "9900987654321".parse()?;
 assert_eq!(nb.vergabestelle(), CodeVergabestelle::BdewStrom);
+# Ok::<(), metering::ParseError>(())
 ```
 
 `MeasurementPoint::accountable_mp_id` and `MeasurementSource::Mscons`'s

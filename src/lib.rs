@@ -24,6 +24,7 @@
 //! | [`resolution`] | `IntervalResolution` — fixed vs calendar lengths |
 //! | [`conversion`] | Gas m³ → kWh_Hs and the G 685-3 Zustandszahl, unit normalisation, HeizkostenV warm water |
 //! | [`aggregation`] | Billing period: Arbeitsmenge, Spitzenleistung, coverage; the directional balance |
+//! | [`ausfallarbeit`] | Redispatch 2.0 — the Wert der Leistungslimitierung and the published Ausfallarbeit formulas (BilAReM Kap. 3) |
 //! | [`zaehlzeit`] | Tariff registers — HT/NT and § 14a Modul 3, with a conformance check |
 //! | [`para14a`] | § 14a netzorientierte Steuerung — `P_min,14a` and the netzwirksamer Leistungsbezug |
 //! | [`mod@resample`] | Down-sampling to Berlin calendar buckets |
@@ -89,7 +90,7 @@
 //! - **Cut to a documented number of places** when the quotient is a value a
 //!   consumer stores, prints or settles on, or when an identity depends on it:
 //!   [`ALLOCATION_DP`] (6), [`SUBSTITUTE_DP`] (6), [`FORECAST_DP`] (3),
-//!   [`IMBALANCE_PCT_DP`] (2),
+//!   [`PERCENT_DP`] (2),
 //!   [`SigLinDe::H_VALUE_DP`](gas_slp::SigLinDe::H_VALUE_DP) (6),
 //!   [`KUNDENWERT_DP`](gas_slp::KUNDENWERT_DP) (4). A share carrying
 //!   twenty-seven decimal places is not a quantity, and it breaks the
@@ -451,9 +452,23 @@
 mod codes;
 mod wire;
 
+/// Decimal places a **reported percentage** is cut to: **2**.
+///
+/// Shared by every percentage this crate hands back — the Mehr-/Mindermengen
+/// share and the Netzverlust share — because they are printed side by side on
+/// the same settlement report and a difference in width between them would be
+/// read as a difference in precision. One constant rather than one per module:
+/// two copies of a number are two numbers, and only one of them gets updated.
+///
+/// A hundredth of a percent is finer than any published threshold this crate
+/// knows of and coarse enough to be a figure on a page. The quotient behind it
+/// rarely terminates, so it is cut where it is formed.
+pub const PERCENT_DP: u32 = 2;
+
 pub mod aggregation;
 pub mod aggregation_rule;
 pub mod allocation;
+pub mod ausfallarbeit;
 pub mod calendar;
 pub mod classification;
 pub mod conversion;
@@ -488,13 +503,16 @@ pub mod zaehlzeit;
 // ── Re-exports ────────────────────────────────────────────────────────────────
 
 pub use aggregation::{
-    AggregationConfig, BENUTZUNGSDAUER_DP, BillingPeriod, DirectionalEnergy, aggregate,
-    sum_by_direction,
+    AggregationConfig, BENUTZUNGSDAUER_DP, BillingPeriod, DirectionalEnergy, STROMNEV_AUSSERKRAFT,
+    aggregate, sum_by_direction,
 };
 pub use aggregation_rule::{AggregationRule, VirtualMeterKind};
 pub use allocation::{
     ALLOCATION_DP, AllocatedPart, AllocationBasis, AllocationError, AllocationPart, AllocationRow,
-    allocate, allocation_share, validate_key,
+    allocate, allocate_cascading, allocation_share, validate_key,
+};
+pub use ausfallarbeit::{
+    Abrechnungsvariante, Redispatchfall, Redispatchrichtung, leistungslimitierung_kw,
 };
 pub use calendar::{
     DayBoundary, DayKind, day_length, day_start_utc, gas_day_start_utc, intervals_in_day,
@@ -513,7 +531,7 @@ pub use gas_slp::{
 };
 pub use holiday::{Bundesland, Holiday, slp_day_type};
 pub use ids::{BdewCode, CodeVergabestelle, Eic, EicType, MaloId, MaloIssuer, MeloId, Regelzone};
-pub use imbalance::{IMBALANCE_PCT_DP, ImbalanceSaldo, compute_imbalance};
+pub use imbalance::{ImbalanceSaldo, compute_imbalance};
 pub use interval::{Direction, MeasurementUnit, MeterInterval, QualityFlag, Sparte, UnitScale};
 pub use lifecycle::{
     MeterExchangeEvent, MeterLifecycleEvent, MeterLifecycleEventType, MeterStatus,
@@ -573,3 +591,79 @@ pub use zaehlzeit::{
     DayGroup, Modul3Conformance, Modul3Context, Modul3Finding, Quarter, ZaehlzeitFenster,
     Zaehlzeitdefinition, assess_modul_3,
 };
+
+// ── the published prose, compiled ─────────────────────────────────────────────
+
+/// Every Rust block in `README.md` and on the documentation site, compiled and
+/// run as a doctest.
+///
+/// Both make concrete numerical claims — 92, 100, 2 972, the UTC offsets, the
+/// G 685 worked example, the EN 50160 shares — and prose cannot be
+/// type-checked. Including the pages themselves covers every block; a
+/// hand-written mirror in `tests/` covers only the blocks somebody copied.
+///
+/// `#[cfg(doctest)]` keeps these modules out of the built documentation: they
+/// exist only while `cargo test --doc` is collecting. The blocks use rustdoc's
+/// `#` hidden-line convention, which the site's highlighter also hides.
+#[cfg(doctest)]
+mod published_prose {
+    #[doc = include_str!("../README.md")]
+    mod readme {}
+
+    #[doc = include_str!("../site/content/docs/_index.md")]
+    mod docs_index {}
+
+    #[doc = include_str!("../site/content/docs/billing-quantities.md")]
+    mod billing_quantities {}
+
+    #[doc = include_str!("../site/content/docs/design.md")]
+    mod design {}
+
+    #[doc = include_str!("../site/content/docs/gas-and-units.md")]
+    mod gas_and_units {}
+
+    #[doc = include_str!("../site/content/docs/getting-started.md")]
+    mod getting_started {}
+
+    #[doc = include_str!("../site/content/docs/identifiers.md")]
+    mod identifiers {}
+
+    #[doc = include_str!("../site/content/docs/paragraph-14a.md")]
+    mod paragraph_14a {}
+
+    #[doc = include_str!("../site/content/docs/pipeline.md")]
+    mod pipeline {}
+
+    #[doc = include_str!("../site/content/docs/power-quality.md")]
+    mod power_quality {}
+
+    #[doc = include_str!("../site/content/docs/redispatch.md")]
+    mod redispatch {}
+
+    #[doc = include_str!("../site/content/docs/readings.md")]
+    mod readings {}
+
+    #[doc = include_str!("../site/content/docs/regulatory-basis.md")]
+    mod regulatory_basis {}
+
+    #[doc = include_str!("../site/content/docs/sessions-and-allocation.md")]
+    mod sessions_and_allocation {}
+
+    #[doc = include_str!("../site/content/docs/substitute-values.md")]
+    mod substitute_values {}
+
+    #[doc = include_str!("../site/content/docs/tariff-registers.md")]
+    mod tariff_registers {}
+
+    #[doc = include_str!("../site/content/docs/time-and-calendar.md")]
+    mod time_and_calendar {}
+
+    #[doc = include_str!("../site/content/docs/validation.md")]
+    mod validation {}
+
+    #[doc = include_str!("../site/content/docs/virtual-meters.md")]
+    mod virtual_meters {}
+
+    #[doc = include_str!("../site/content/_index.md")]
+    mod site_index {}
+}

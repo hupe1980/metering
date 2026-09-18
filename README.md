@@ -12,7 +12,8 @@ sessions and device logs onto the settlement grid, gas m³→kWh_Hs and the
 SigLinDe gas SLP, Ersatzwertbildung in the market's own code list, a robust
 validation engine, EN 50160, §14a Modul 3 tariff registers, Benutzungsstundenzahl
 and Blindmehrarbeit, conservation-checked allocation (§42b EnWG),
-check-digit-validated MaLo-IDs and EICs, and Jahresprognose.
+Redispatch-2.0 Ausfallarbeit (BilAReM), check-digit-validated MaLo-IDs and EICs,
+and Jahresprognose.
 
 > 🧊 **Zero I/O** · ⏱️ **no async** · 🕰️ **no clock** · 🔢 **exact decimal quantities**
 
@@ -214,10 +215,12 @@ waiting on EU state-aid approval.
   database `CHECK` constraint from `CODES` and it cannot drift from what the
   crate writes; one test asserts all six properties for every one of them, and
   another reads the source so a new enum cannot skip that list.
-- **A clean validation report says which rules ran.** Four of the eleven are
-  opt-in and two more can be switched off, so `ValidationResult::evaluated` and
-  `ValidationConfig::disabled_rules()` make "found nothing" and "never looked"
-  distinguishable.
+- **A clean validation report says which rules ran.** Four of the eleven always
+  run; the other seven hang off six settings, and two of those — a reference
+  instant and a nameplate capacity — have no default, because they are facts
+  about the caller's world rather than about a series. So
+  `ValidationResult::evaluated` and `ValidationConfig::disabled_rules()` make
+  "found nothing" and "never looked" distinguishable.
 - **Order in, order out.** Every entry point that promises it gives the same
   answer for a shuffled input, held by proptest. Order dependence shows only on
   a **tie**, so the generator draws half its series from a coarse value grid
@@ -227,6 +230,15 @@ waiting on EU state-aid approval.
   `Σ allocated + residual = total`. Both identities are theorems rather than
   checks — the cut lands on the *cumulative*, so the slot differences telescope
   — and proptests hold them.
+- **A rule with an end date carries the date.** § 17 StromNEV lapses on
+  31.12.2028 and the Redispatch Pauschal-Abrechnung with it; both are constants
+  the affected functions point at, so a 2029 settlement run can assert rather
+  than remember.
+- **Where a source supplies a default, the crate has it; where it does not, the
+  crate takes an argument.** § 42b Abs. 5 Satz 3 divides *zu gleichen Teilen* in
+  case of doubt, so `AllocationKey::EqualShares` exists. § 42c Abs. 3 Nr. 2 says
+  nothing about a key's shape, so the other keys are offered as arithmetic and
+  say on the type that they cite nothing.
 - **No second copy of a fact.** A register's unit comes from its OBIS code, a
   meter exchange's date from its instant, an interval's direction from OBIS
   value group C. Where a fact genuinely *is* stated twice, the disagreement is
@@ -302,8 +314,12 @@ Beyond the unit tests:
   register split, the Jahresprognose, unit and gas conversion, the gas SLP,
   Mehr-/Mindermengen, §14a and EN 50160
 - `tests/regulatory_showcase.rs` — worked examples from the published sources
-- `tests/doc_samples.rs` — every code block in this README and on the
-  documentation site, compiled and run
+- **every code block in this README and on the documentation site**, compiled
+  and run as a doctest — the pages are `include_str!`'d into a `#[cfg(doctest)]`
+  module, so every published block is covered rather than only the ones somebody
+  copied into a mirror
+- `tests/arithmetic_conventions.rs` — source scans: no quotient is used as a
+  factor, and every rounding width is a named constant
 - `tests/doc_conventions.rs` — no item doc over 60 lines, and no changelog
   prose in a reference doc
 - `tests/scale.rs` — a settlement year and a minute-sampled day through the

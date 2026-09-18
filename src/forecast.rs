@@ -56,6 +56,17 @@ pub struct AnnualForecast {
     pub observed: Decimal,
     /// Berlin calendar days the window spans.
     pub observed_days: u32,
+    /// Intervals that contributed to [`observed`](Self::observed).
+    pub billable_count: usize,
+    /// Intervals supplied inside the window but excluded as non-billable.
+    ///
+    /// The projection divides the **billable** energy by the window's **whole**
+    /// span, so a window with a day of `Faulty` quarter-hours in it projects a
+    /// year short by a day's worth and says nothing about why. This count is
+    /// how a caller sees that: the module's advice is to
+    /// [fill](crate::substitute) first and project second, and this is the
+    /// number that shows whether it was followed.
+    pub excluded_count: usize,
     /// Days in the target year — 366 in a leap year.
     pub target_year_days: u16,
     /// Projected annual consumption (kWh), cut to [`FORECAST_DP`] places.
@@ -97,7 +108,7 @@ impl AnnualForecast {
     ///
     /// ```text
     /// Var(total) = Y² · σ²/n   (the daily mean is estimated from n days)
-    ///            + Y  · σ²     (the remaining days vary around it)
+    ///            + Y  · σ²     (a year of days varies around it)
     ///
     /// half-width  = t(0.975, n−1) · √Var(total) · seasonal factor
     /// ```
@@ -216,11 +227,12 @@ pub fn project_annual_consumption(
     }
     let observed_days = u32::try_from(observed_days_i64).ok()?;
 
-    let observed: Decimal = intervals
+    let (observed, billable_count) = intervals
         .iter()
         .filter(|iv| iv.quality.is_billable())
-        .map(|iv| iv.value)
-        .sum();
+        .fold((Decimal::ZERO, 0usize), |(sum, n), iv| {
+            (sum + iv.value, n + 1)
+        });
 
     let target_year = crate::calendar::local_year(last_to);
     let target_year_days = crate::calendar::days_in_year(target_year);
@@ -241,13 +253,20 @@ pub fn project_annual_consumption(
 
     let projected = daily_avg * Decimal::from(target_year_days) * seasonal_factor;
 
-    let half_width = prediction_half_width(intervals, seasonal_factor, target_year_days);
+    let half_width = prediction_half_width(
+        intervals,
+        (first_from, last_to),
+        seasonal_factor,
+        target_year_days,
+    );
 
     Some(AnnualForecast {
         observation_from: first_from,
         observation_to: last_to,
         observed,
         observed_days,
+        billable_count,
+        excluded_count: intervals.len() - billable_count,
         target_year_days,
         projected_annual: projected.round_dp(FORECAST_DP),
         seasonal_factor,
@@ -271,6 +290,7 @@ pub fn project_annual_consumption(
 /// observed days or when the statistics degenerate.
 fn prediction_half_width(
     intervals: &[MeterInterval],
+    window: (OffsetDateTime, OffsetDateTime),
     seasonal_factor: Decimal,
     year_days: u16,
 ) -> Option<Decimal> {
@@ -282,6 +302,21 @@ fn prediction_half_width(
     for iv in intervals.iter().filter(|iv| iv.quality.is_billable()) {
         *daily.entry(iv.berlin_day()).or_insert(Decimal::ZERO) += iv.value;
     }
+
+    // **Whole days only.** A window that opens at midday contributes two
+    // half-days, one at each end, and a half-day's consumption is not a draw
+    // from the distribution of daily sums — it is half of one. Left in, those
+    // two land far below every other day and inflate the variance the interval
+    // is built from, so a mid-day window reports a wider interval than the same
+    // data aligned to midnight. The day is kept only when the observation
+    // window covers it from its own start to its own end.
+    let (from, to) = window;
+    daily.retain(|day, _| {
+        let start = crate::calendar::day_start_utc(*day);
+        let end = day.next_day().map_or(start, crate::calendar::day_start_utc);
+        start >= from && end <= to
+    });
+
     if daily.len() < 2 {
         return None;
     }
@@ -373,24 +408,28 @@ fn seasonal_factor(
 
     let billable = |iv: &&MeterInterval| iv.quality.is_billable();
 
-    let prior_window_kwh: Decimal = prior_year
-        .iter()
-        .filter(billable)
-        .filter(|iv| iv.from >= prior_from && iv.to <= prior_to)
-        .map(|iv| iv.value)
-        .sum();
+    let in_window = |iv: &&MeterInterval| iv.from >= prior_from && iv.to <= prior_to;
+    let mut prior_window_kwh = Decimal::ZERO;
+    let mut window_first: Option<OffsetDateTime> = None;
+    let mut window_last: Option<OffsetDateTime> = None;
+    for iv in prior_year.iter().filter(billable).filter(in_window) {
+        prior_window_kwh += iv.value;
+        window_first = Some(window_first.map_or(iv.from, |f: OffsetDateTime| f.min(iv.from)));
+        window_last = Some(window_last.map_or(iv.to, |l: OffsetDateTime| l.max(iv.to)));
+    }
     let prior_total_kwh: Decimal = prior_year.iter().filter(billable).map(|iv| iv.value).sum();
 
     if prior_window_kwh.is_zero() || prior_total_kwh.is_zero() {
         return None;
     }
 
-    // Both rates are per Berlin calendar day: the window over its own span, the
-    // reference over the span the prior-year data actually covers. Dividing the
-    // total by a flat 365 would inflate the factor whenever the caller supplies
-    // less than a full year — the failure mode of assuming "prior year" means
-    // "a whole year".
-    let window_days = crate::calendar::days_between(prior_from, prior_to).max(1);
+    // **Both rates are measured over the days the data actually covers**, never
+    // over a nominal span. The reference side always was; the window side was
+    // not, and a prior year that reaches only halfway into the shifted window
+    // then divided a half-window's energy by a whole window's days and halved
+    // the factor — silently, on a projection somebody bills an Abschlag from.
+    // Dividing the total by a flat 365 is the same mistake at the other end.
+    let window_days = crate::calendar::days_between(window_first?, window_last?).max(1);
     let prior_first = prior_year.iter().map(|iv| iv.from).min()?;
     let prior_last = prior_year.iter().map(|iv| iv.to).max()?;
     let reference_days = crate::calendar::days_between(prior_first, prior_last).max(1);
@@ -686,6 +725,59 @@ mod tests {
     /// A caller passing six months of "prior year" data must not have it
     /// treated as a full year — that would double the reference daily rate and
     /// halve the factor.
+    /// The prior-year series may reach only partway into the shifted window.
+    /// Both sides of the factor are then rates over the days actually present,
+    /// so a half-covered window does not halve the correction.
+    #[test]
+    fn a_half_covered_prior_window_does_not_halve_the_factor() {
+        let observed = aligned_days(date!(2026 - 01 - 01), 14, dec!(1));
+
+        // A full prior year at a flat rate: every window rate equals the
+        // overall rate, so the factor is 1 whichever days are supplied.
+        let full: Vec<MeterInterval> = aligned_days(date!(2025 - 01 - 01), 28, dec!(1));
+        let both = project_annual_consumption(&observed, Some(&full)).unwrap();
+        assert!(both.seasonal_correction_applied);
+        assert_eq!(both.seasonal_factor, Decimal::ONE);
+
+        // The same rate, but the prior year stops halfway through the shifted
+        // window. The rate is unchanged, so the factor must still be 1.
+        let half: Vec<MeterInterval> = full
+            .iter()
+            .filter(|iv| iv.berlin_day() < date!(2025 - 01 - 08))
+            .cloned()
+            .collect();
+        let partial = project_annual_consumption(&observed, Some(&half)).unwrap();
+        assert!(partial.seasonal_correction_applied);
+        assert_eq!(partial.seasonal_factor, Decimal::ONE);
+    }
+
+    /// A window that opens at midday contributes a half-day at each end. Those
+    /// are not draws from the distribution of daily sums, and leaving them in
+    /// widens the interval for data that is no less certain.
+    #[test]
+    fn partial_boundary_days_do_not_inflate_the_interval() {
+        let aligned = aligned_days(date!(2026 - 01 - 01), 10, dec!(1));
+        let midday: Vec<MeterInterval> = aligned
+            .iter()
+            .filter(|iv| {
+                iv.from
+                    >= crate::calendar::day_start_utc(date!(2026 - 01 - 01)) + Duration::hours(12)
+            })
+            .cloned()
+            .collect();
+
+        let a = project_annual_consumption(&aligned, None).unwrap();
+        let m = project_annual_consumption(&midday, None).unwrap();
+
+        // Both are perfectly flat, so both intervals collapse onto the point.
+        assert_eq!(a.confidence_lower, Some(a.projected_annual));
+        assert_eq!(
+            m.confidence_lower,
+            Some(m.projected_annual),
+            "a half-day at each end is not a low day"
+        );
+    }
+
     #[test]
     fn a_partial_prior_year_is_measured_over_its_own_span() {
         // Six months of perfectly flat prior data. A flat reference means the

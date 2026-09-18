@@ -134,6 +134,12 @@ fn every_coded_enum_holds_the_contract() {
     assert_contract!(QualityFlag);
     assert_contract!(Direction);
 
+    // Redispatch — BilAReM Kap. 3
+    use metering::ausfallarbeit::{Abrechnungsvariante, Redispatchfall, Redispatchrichtung};
+    assert_contract!(Redispatchrichtung);
+    assert_contract!(Redispatchfall);
+    assert_contract!(Abrechnungsvariante);
+
     // identifiers and channels
     assert_contract!(MaloIssuer);
     assert_contract!(CodeVergabestelle);

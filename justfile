@@ -88,6 +88,18 @@ package:
 audit:
     cargo audit
 
+# 🔒 What would break for a consumer on the last published version
+#    (needs `cargo install cargo-semver-checks`). CI runs it as a report, not a
+#    gate, while the crate is pre-1.0; its output is the list a CHANGELOG entry
+#    needs.
+#
+#    `--release-type patch` asks "would this be a legal patch release?", which
+#    is the only phrasing that lists every break. Left off, the tool infers the
+#    bump from Cargo.toml, and a 0.x minor bump already declares a major change
+#    — so it skips every lint and reports a clean run over a hard cut.
+semver:
+    cargo semver-checks check-release --all-features --release-type patch
+
 # ⬆️ Show outdated dependencies (needs `cargo install cargo-outdated`)
 outdated:
     cargo outdated --root-deps-only
@@ -171,6 +183,12 @@ specs:
     fetch law bgbl-2025-i-347-enwg-novelle-20251222.pdf \
         'https://www.recht.bund.de/bgbl/1/2025/347/regelungstext.pdf?__blob=publicationFile&v=2'
     # bnetza/ — the Festlegungen the repealed ordinances left behind
+    fetch bnetza bk6-23-241-beschluss-20260507.pdf \
+        'https://www.bundesnetzagentur.de/DE/Beschlusskammern/1_GZ/BK6-GZ/2023/BK6-23-241/BK6-23-241_beschluss_vom_07.05.26.pdf?__blob=publicationFile&v=1'
+    fetch bnetza bk6-23-241-anlage-bilarem.pdf \
+        'https://www.bundesnetzagentur.de/DE/Beschlusskammern/1_GZ/BK6-GZ/2023/BK6-23-241/BK6-23-241_bilarem.pdf?__blob=publicationFile&v=1'
+    fetch bnetza bk7-24-01-008-gabi-gas-2-1-beschluss.pdf \
+        'https://www.bundesnetzagentur.de/DE/Beschlusskammern/1_GZ/BK7-GZ/2024/BK7-24-0008/Anlagen/BK7-24-01-0008_Beschluss_DL_BF.pdf?__blob=publicationFile&v=5'
     fetch bnetza bk6-22-300-beschluss-20231127.pdf \
         'https://www.bundesnetzagentur.de/DE/Beschlusskammern/1_GZ/BK6-GZ/2022/BK6-22-300/Beschluss/BK6-22-300_Beschluss_20231127.pdf?__blob=publicationFile&v=1'
     fetch bnetza bk6-22-300-anlage1-20231127.pdf \
@@ -195,6 +213,10 @@ specs:
     fetch edi-energy mscons-mig-2.5.pdf \
         'https://www.bdew-mako.de/api/downloadFile/12175'
     # bdew/ — Anwendungshilfen and the gas-SLP Leitfaden
+    fetch bdew bdew-slp-strom-2025-profile-h25-g25-l25-p25-s25.xlsx \
+        'https://www.bdew.de/media/documents/Kopie_von_Repr%C3%A4sentative_Profile_BDEW_H25_G25_L25_P25_S25_Ver%C3%B6ffentlichung.xlsx'
+    fetch bdew bdew-lf-ausfallarbeit-redispatch-2-0-202005.pdf \
+        'https://www.bdew.de/media/documents/Awh_2020-05_RD_2.0_LF_Ausfallarbeit.pdf'
     fetch bdew bdew-lf-slp-gas-kov-xv-20260327.pdf \
         'https://www.bdew.de/media/documents/260327_LF_SLP_Gas_KoV_XV_CO4f7Rb.pdf'
     fetch bdew bdew-lf-slp-gas-anlage2-pruefroutine-siglinde.xlsm \

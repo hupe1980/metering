@@ -211,10 +211,67 @@ consumption. Under § 42c the *Aufteilungsschlüssel* is a contractual input
 
 ### The residual is a quantity, not a rounding error
 
-Nothing redistributes it: no largest-remainder pass, no "give the rest to the
-biggest". Under § 42b the residual is the generation that fed the public grid.
-Turning it into a correction on somebody's invoice would credit them energy they
-did not receive.
+`allocate` redistributes nothing: no largest-remainder pass, no "give the rest
+to the biggest". Under § 42b the residual is the generation that fed the public
+grid. Turning it into a correction on somebody's invoice would credit them
+energy they did not receive.
+
+### …unless the agreement says it is re-offered
+
+A community may agree that a share its holder cannot use passes to whoever still
+has room. That is `allocate_cascading`, and it is a **second key**, not a change
+to the one above: nothing about `allocate` moves.
+
+```rust
+use metering::allocation::{AllocationPart, allocate_cascading};
+use rust_decimal::dec;
+
+// 9 kWh over three equal claims — one of which can only take 1 kWh.
+let row = allocate_cascading(dec!(9), vec![
+    AllocationPart::new("a", dec!(1)).capped_at(dec!(1)),
+    AllocationPart::new("b", dec!(1)).capped_at(dec!(10)),
+    AllocationPart::new("c", dec!(1)).capped_at(dec!(10)),
+])?;
+
+assert_eq!(row.part("a").unwrap().allocated, dec!(1));  // its ceiling
+assert_eq!(row.part("b").unwrap().allocated, dec!(4));  // 3, plus half of a's 2
+assert_eq!(row.residual, dec!(0));
+assert!(row.part("a").unwrap().at_capacity());
+# Ok::<(), metering::allocation::AllocationError>(())
+```
+
+Four design points, because each was a fork in the road:
+
+**The weights, never the headroom.** Later passes renormalise the *original*
+weights over the participants still open. Redistributing by remaining headroom
+instead would be a different key — headroom is a fact about what somebody
+consumed, not a term of their agreement — and it would silently replace the key
+a community wrote down with a consumption-proportional one.
+
+**No basis parameter.** Cascading a `Fraction` key would contradict what that
+basis means: its weights are *absolute* shares, and what they do not claim is
+deliberately unclaimed generation. Re-offering it would change the key rather
+than complete it. So the cascade is proportional by construction and the invalid
+combination cannot be written.
+
+**No pass limit.** Termination is a property of the loop, not a knob. Each pass
+either takes at least one part to its ceiling — of which there can be at most
+`parts.len()` — or caps nobody; and a pass that caps nobody has handed out the
+whole remaining pool bar the truncation slack, after which shares only shrink,
+so no later pass can cap anyone either. A pass that moves nothing ends it.
+
+**A key whose weight *is* its ceiling gains nothing.** "Proportional to
+consumption, capped at consumption" cascades to exactly what one pass already
+gives: either the pool is small enough that nobody reaches a ceiling, or it is
+large enough that everybody reaches theirs at once and there is no open
+participant to re-offer to. There is no `ProportionalCascading` for that reason,
+and a test pins it.
+
+**None of this is a rule any source states.** § 42c Abs. 3 Nr. 2 requires a
+contract to name *"einen Aufteilungsschlüssel, aus dem sich der Umfang des
+Rechts zur Nutzung der Elektrizität ergibt"* — and says nothing about its shape,
+static, dynamic or cascading. § 42b Abs. 5 Satz 2 likewise defers to the
+agreement. The crate supplies the arithmetic and takes the key.
 
 ### A negative weight is refused
 
@@ -285,6 +342,25 @@ other answer for a fact stated twice — make the disagreement **reportable**.
 
 ```rust
 use metering::{Direction, EnergyFlow, ObisCode};
+# use metering::{MarktRolle, MeasurementPoint, Sparte};
+# use rust_decimal::Decimal;
+# use time::macros::date;
+# let mut mp = MeasurementPoint {
+#     malo_id: "51238696781".parse()?,
+#     melo_id: None,
+#     meter_serial: None,
+#     obis_code: ObisCode::STROM_BEZUG_TOTAL,
+#     sparte: Sparte::Strom,
+#     energy_flow: EnergyFlow::Consumption,
+#     accountable_role: MarktRolle::Lf,
+#     accountable_mp_id: "9900987654321".parse()?,
+#     bilanzkreis: None,
+#     bilanzierungsgebiet: None,
+#     is_virtual: false,
+#     wandler_factor: Decimal::ONE,
+#     valid_from: date!(2026 - 01 - 01),
+#     valid_to: None,
+# };
 
 // A point whose OBIS code counts Bezug while its master data says Generation.
 mp.obis_code = ObisCode::STROM_BEZUG_TOTAL;
@@ -297,6 +373,7 @@ assert_eq!(mp.direction_conflict(), Some((Direction::Import, Direction::Export))
 
 mp.energy_flow = EnergyFlow::Consumption;
 assert_eq!(mp.direction_conflict(), None);
+# Ok::<(), metering::ParseError>(())
 ```
 
 Where the code carries no direction — a gas volume, a Zustandszahl — the master

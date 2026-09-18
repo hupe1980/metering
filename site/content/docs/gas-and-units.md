@@ -63,7 +63,7 @@ use metering::{
 use rust_decimal::dec;
 
 // A household connection 253 m up, 22 mbar Effektivdruck.
-let params = ZustandszahlParams::niederdruck(
+let params = ZustandszahlParams::below_one_bar(
     hoehenzonen_luftdruck_mbar(dec!(253)), // 985.64 mbar
     dec!(22),
 ).expect("below one bar, so K = 1");
@@ -81,9 +81,12 @@ to are the market's rounding, and `gas_m3_to_kwh_hs_rounded` applies them at the
 point of use. Rounding here as well would round the same number twice, in the
 same direction, on every invoice.
 
-`niederdruck` fills in the two inputs the rule fixes rather than leaves open,
+`below_one_bar` fills in the two inputs the rule fixes rather than leaves open,
 and returns `None` at or above one bar — an assumption with a stated limit
-should refuse to be used past it.
+should refuse to be used past it. It is named for that precondition rather than
+for a pressure stage: `K = 1` is admissible across Nieder- **and** Mitteldruck,
+and only the one-bar bound decides. Above it, `ZustandszahlParams::new` takes
+the K-Zahl from G 685-6.
 
 ## Pass a Betriebsvolumen, not a Normvolumen
 
@@ -163,7 +166,9 @@ dividing rounds once, at the end, instead of once per reading.
 
 ## The gas SLP — SigLinDe, published in full
 
-Unlike the 2025 electricity profiles, whose value tables are licensed, the gas
+Both the gas SLP procedure and the 2025 electricity profiles are published in
+full; what differs is what is worth embedding — a formula with coefficient sets
+against value tables an operator chooses between. The gas
 SLP procedure is published in full: the BDEW/VKU/GEODE Leitfaden *"Abwicklung
 von Standardlastprofilen Gas"* — current edition **KoV XV, Stand 27.03.2026**,
 coefficients in Anlage 6 — prints the profile function, the temperature

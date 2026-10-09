@@ -81,7 +81,7 @@ th { color: var(--muted); font-weight: 600; }
 }
 @media (max-width: 56rem) { .layout { grid-template-columns: 1fr; } .sidebar { position: static; } }
 .sidebar { font-size: .93rem; align-self: start; position: sticky; top: 4.5rem; }
-.sidebar-title { color: var(--muted); text-transform: uppercase; letter-spacing: .06em; font-size: .72rem; margin: 0 0 .5rem; }
+.sidebar-title { color: var(--muted); text-transform: uppercase; letter-spacing: .06em; font-size: .72rem; margin: 1rem 0 .4rem; }
 .sidebar ul { list-style: none; margin: 0; padding: 0; }
 .sidebar li { margin: 0; }
 .sidebar a {

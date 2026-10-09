@@ -4,33 +4,24 @@
 
 set shell := ["bash", "-uc"]
 
-# MSRV — keep in sync with `rust-version` in Cargo.toml and rust-toolchain.toml.
-msrv := "1.94"
+# MSRV — read from `rust-version` in Cargo.toml, its one source.
+msrv := `sed -n 's/^rust-version *= *"\(.*\)"/\1/p' Cargo.toml`
+
+# Tests read fixture files and time themselves; the purity bans in clippy.toml
+# hold for the library alone, which `purity` checks.
+impure_ok := "-A clippy::disallowed_methods -A clippy::disallowed_types"
 
 # 📋 List all recipes
 default:
     @just --list
 
-# ✅ Everything CI runs, in CI order
-ci: fmt-check lint purity test example doc package
+# ✅ The CI gate, exactly — the `gate` job in .github/workflows/ci.yml runs `just ci`
+ci: fmt-check lint purity test doc example package deny
     @echo "✅ all checks passed"
 
-# 🧊 Enforce the "zero I/O, no clock" guarantee over non-comment source lines
+# 🧊 No clock, no env, no I/O in the library: clippy.toml's disallowed methods/types
 purity:
-    #!/usr/bin/env bash
-    set -uo pipefail
-    hits="$(grep -rn --include='*.rs' -E \
-        'now_utc|SystemTime::now|Instant::now|std::(fs|env|net|process)|\bunsafe\b' \
-        src/ | grep -vE ':[[:space:]]*(///|//!|//)' || true)"
-    if [ -n "$hits" ]; then
-        echo "❌ ambient state or unsafe reached the source:" >&2
-        echo "$hits" >&2
-        echo "" >&2
-        echo "This crate promises equal inputs give equal outputs. Take the" >&2
-        echo "timestamp as a parameter instead — see the Determinism section." >&2
-        exit 1
-    fi
-    echo "🧊 pure: no clock, no I/O, no unsafe"
+    cargo clippy --lib --all-features -- -D warnings
 
 # 🎨 Format the workspace
 fmt:
@@ -42,34 +33,25 @@ fmt-check:
 
 # 📎 Clippy with warnings denied (default + all features)
 lint:
-    cargo clippy --all-targets -- -D warnings
-    cargo clippy --all-targets --all-features -- -D warnings
+    cargo clippy --all-targets -- -D warnings {{ impure_ok }}
+    cargo clippy --all-targets --all-features -- -D warnings {{ impure_ok }}
 
 # 🔎 Fast type-check, all features
 check:
     cargo check --all-targets --all-features
 
-# 🧪 Full test suite (all features, incl. doctests)
+# 🧪 Test suite with default (= no) features and with all features, incl. doctests
 test:
+    cargo test
     cargo test --all-features
 
-# ▶️  Run the end-to-end pipeline example
+# ▶️  Run the end-to-end pipeline example (it asserts its own invariants)
 example:
     cargo run --all-features --example pipeline
 
 # 🧪 Run tests matching a filter, e.g. `just test-one gas_m3`
 test-one filter:
     cargo test --all-features {{ filter }} -- --nocapture
-
-# 🎛️ Build every feature combination
-features:
-    cargo build --no-default-features
-    cargo build --no-default-features --features serde
-    cargo build --all-features
-
-# 🦀 Compile on the pinned MSRV
-msrv:
-    RUSTUP_TOOLCHAIN={{ msrv }} cargo check --all-features --all-targets
 
 # 📚 Build the docs with warnings denied
 doc:
@@ -79,24 +61,38 @@ doc:
 doc-open:
     RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features --open
 
+# `--allow-dirty` matters only locally; CI checks out clean.
+#
 # 📦 Dry-run the crates.io package (catches bad metadata before tagging)
-# `--allow-dirty` is local-only convenience; CI runs this on a clean checkout.
 package:
     cargo publish --dry-run --all-features --allow-dirty
 
-# 🛡️ Audit dependencies for advisories (needs `cargo install cargo-audit`)
-audit:
-    cargo audit
+# 🛡️ Advisories, licenses, duplicate crates, sources (needs `cargo install cargo-deny`)
+deny:
+    cargo deny check
 
-# 🔒 What would break for a consumer on the last published version
-#    (needs `cargo install cargo-semver-checks`). CI runs it as a report, not a
-#    gate, while the crate is pre-1.0; its output is the list a CHANGELOG entry
-#    needs.
+# 🦀 Run the whole test suite on the MSRV (`rust-version` in Cargo.toml)
+msrv:
+    RUSTUP_TOOLCHAIN={{ msrv }} cargo test --all-features
+
+# 📉 Test against the lowest versions Cargo.toml admits (needs a nightly toolchain)
+minimal-versions:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    mkdir -p target && cp Cargo.lock target/Cargo.lock.keep
+    trap 'mv target/Cargo.lock.keep Cargo.lock' EXIT
+    cargo +nightly update -Z direct-minimal-versions
+    cargo test --all-features
+
+# 🧬 Mutation-test the code changed since `base` (needs `cargo install cargo-mutants`)
+mutants base="main":
+    mkdir -p target && git diff {{ base }}... > target/mutants.diff
+    cargo mutants --all-features --in-diff target/mutants.diff
+
+# Needs `cargo install cargo-semver-checks`. `--release-type patch` makes it
+# list every break; inferred from a 0.x minor bump, it skips every lint.
 #
-#    `--release-type patch` asks "would this be a legal patch release?", which
-#    is the only phrasing that lists every break. Left off, the tool infers the
-#    bump from Cargo.toml, and a 0.x minor bump already declares a major change
-#    — so it skips every lint and reports a clean run over a hard cut.
+# 🔒 What would break for a consumer on the last published version
 semver:
     cargo semver-checks check-release --all-features --release-type patch
 
@@ -118,18 +114,19 @@ tag:
     git tag -a "v${version}" -m "v${version}"
     echo "🏷️  tagged v${version} — push with: git push origin v${version}"
 
-# Verify every passage the crate presents as verbatim source text.
-#
-# Needs `specs/` (run `just specs`) and `pdftotext` (poppler). Extra corpora can
-# be passed as arguments — the sibling workspaces hold documents this crate
-# cites but does not mirror.
-#
-# Not a CI lane: the corpus is gitignored, so a fresh checkout has nothing to
-# check against. Run it every audit round, and after touching a quote.
+# Needs `just references` and `pdftotext` (poppler); extra corpora can be
+# passed as arguments. Not a CI job: the corpus is gitignored.
 #
 # 📚 Check every German quote in src/, site/ and README.md against the PDFs
 quotes *dirs:
     python3 scripts/verify_quotes.py {{ dirs }}
+
+# Cross-checks `concepts/` and `specs/` (rules in the script's docstring).
+# Not a CI job: both folders are gitignored.
+#
+# 🗺️ Check the design notes and the specifications against each other
+_concepts-check:
+    python3 scripts/check-concepts.py
 
 # 🌐 Serve the documentation site locally (needs `zola`)
 site:
@@ -145,29 +142,28 @@ clean:
     cargo clean
     rm -rf site/public
 
-# Third-party publications: gitignored, never committed. Keeps whatever is
-# already on disk, so a partial run is safe to repeat. What cannot be fetched
-# is reported at the end and indexed in `specs/README.md` with its source.
+# Gitignored third-party publications. Keeps files already on disk, so a rerun
+# is safe; what cannot be fetched is listed at the end.
 #
-# 📚 Rebuild `specs/` — the primary sources every citation is checked against
-specs:
+# 📚 Rebuild `concepts/reference/` — the primary sources every citation is checked against
+references:
     #!/usr/bin/env bash
     set -uo pipefail
     ua='Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36'
     missing=""
     # fetch DIR FILE URL [ALT_URL]
     fetch() {
-        mkdir -p "specs/$1"
-        if [ -s "specs/$1/$2" ]; then echo "kept     $1/$2"; return 0; fi
+        mkdir -p "concepts/reference/$1"
+        if [ -s "concepts/reference/$1/$2" ]; then echo "kept     $1/$2"; return 0; fi
         for url in "$3" "${4:-}"; do
             [ -n "$url" ] || continue
             if curl -fsSL -A "$ua" --retry 3 --retry-delay 5 --max-time 900 \
-                    -o "specs/$1/$2.part" "$url" \
-                    && [ -s "specs/$1/$2.part" ] \
-                    && [ "$(file -b --mime-type "specs/$1/$2.part")" != "text/html" ]; then
-                mv "specs/$1/$2.part" "specs/$1/$2"; echo "fetched  $1/$2"; return 0
+                    -o "concepts/reference/$1/$2.part" "$url" \
+                    && [ -s "concepts/reference/$1/$2.part" ] \
+                    && [ "$(file -b --mime-type "concepts/reference/$1/$2.part")" != "text/html" ]; then
+                mv "concepts/reference/$1/$2.part" "concepts/reference/$1/$2"; echo "fetched  $1/$2"; return 0
             fi
-            rm -f "specs/$1/$2.part"
+            rm -f "concepts/reference/$1/$2.part"
         done
         echo "MISSING  $1/$2  <- $3" >&2
         missing="$missing  $1/$2  <- $3"$'\n'
@@ -180,6 +176,8 @@ specs:
     fetch law messev.pdf 'https://www.gesetze-im-internet.de/messev/MessEV.pdf'
     fetch law stromnev.pdf 'https://www.gesetze-im-internet.de/stromnev/StromNEV.pdf'
     fetch law heizkostenv.pdf 'https://www.gesetze-im-internet.de/heizkostenv/HeizkostenV.pdf'
+    fetch law eeg.pdf 'https://www.gesetze-im-internet.de/eeg_2014/EEG_2023.pdf'
+    fetch law enfg.pdf 'https://www.gesetze-im-internet.de/enfg/EnFG.pdf'
     fetch law bgbl-2025-i-347-enwg-novelle-20251222.pdf \
         'https://www.recht.bund.de/bgbl/1/2025/347/regelungstext.pdf?__blob=publicationFile&v=2'
     # bnetza/ — the Festlegungen the repealed ordinances left behind
@@ -212,9 +210,22 @@ specs:
         'https://www.bdew-mako.de/api/downloadFile/9645'
     fetch edi-energy mscons-mig-2.5.pdf \
         'https://www.bdew-mako.de/api/downloadFile/12175'
+    fetch edi-energy utilts-ahb-1.1.pdf \
+        'https://www.bdew-mako.de/api/downloadFile/12230'
+    fetch edi-energy utilts-mig-1.1e.pdf \
+        'https://www.bdew-mako.de/api/downloadFile/10706'
+    # MiSpeL (Az. 618-25-02), adopted 01.10.2026: Tenor and both Anlagen
+    mispel='https://www.bundesnetzagentur.de/DE/Fachthemen/ElektrizitaetundGas/ErneuerbareEnergien/EEG_Aufsicht/MiSpeL/DL'
+    fetch bnetza mispel-tenor-20261001.pdf "$mispel/MiSpeL_TenorMitBegruendung.html?nn=1067830"
+    fetch bnetza mispel-anlage1-abgrenzungsoption-20261001.pdf "$mispel/MiSpeL_Abgrenzungsoptionen.html?nn=1067830"
+    fetch bnetza mispel-anlage2-pauschaloption-20261001.pdf "$mispel/MiSpeL_Pauschaloptionen.html?nn=1067830"
     # bdew/ — Anwendungshilfen and the gas-SLP Leitfaden
     fetch bdew bdew-slp-strom-2025-profile-h25-g25-l25-p25-s25.xlsx \
         'https://www.bdew.de/media/documents/Kopie_von_Repr%C3%A4sentative_Profile_BDEW_H25_G25_L25_P25_S25_Ver%C3%B6ffentlichung.xlsx'
+    fetch bdew vdew-repraesentative-lastprofile-1999.pdf \
+        'https://www.bdew.de/media/documents/1999_Repraesentative-VDEW-Lastprofile.pdf'
+    fetch bdew vdew-lastprofile-step-by-step-2000.pdf \
+        'https://www.bdew.de/media/documents/2000131_Anwendung-repraesentativen_Lastprofile-Step-by-step.pdf'
     fetch bdew bdew-lf-ausfallarbeit-redispatch-2-0-202005.pdf \
         'https://www.bdew.de/media/documents/Awh_2020-05_RD_2.0_LF_Ausfallarbeit.pdf'
     fetch bdew bdew-lf-slp-gas-kov-xv-20260327.pdf \
@@ -232,8 +243,7 @@ specs:
         'https://www.bundesnetzagentur.de/DE/Beschlusskammern/_SharedDocs/Mitteilungen_zu_BK6_16_200_BK7_16_142_/Mitteilung_Nr_2/Anlage_1_Anwendungshilfe_MaLo_ID.pdf?__blob=publicationFile&v=1'
     fetch bdew bdew-awh-eic-vergabe-v1.0-20171218.pdf \
         'https://bdew-codes.de/Content/Files/EIC/Awh_20171218_EIC-Vergabe_V1-0.pdf'
-    # The EDI@Energy Anwendungshilfe carries the worked § 42b formulas; the BDEW
-    # Anwendungshilfe zum Solarpaket I is no longer served as a PDF.
+    # The EDI@Energy Anwendungshilfe carries the worked § 42b formulas.
     fetch edi-energy awh-berechnungsformeln-solarpaket-1-v1.1.pdf \
         'https://www.bdew-mako.de/api/downloadFile/11113'
     # vde-fnn/ — what the paywalled Anwendungsregeln are cited through
@@ -246,7 +256,7 @@ specs:
         'https://eur-lex.europa.eu/legal-content/DE/TXT/PDF/?uri=CELEX:32014R0312'
     if [ -n "$missing" ]; then
         echo "" >&2
-        echo "⚠️  not fetched (see specs/README.md for the source):" >&2
+        echo "⚠️  not fetched (see concepts/REFERENCES.md for the source):" >&2
         printf '%s' "$missing" >&2
     fi
-    echo "📚 specs/ rebuilt"
+    echo "📚 concepts/reference/ rebuilt"

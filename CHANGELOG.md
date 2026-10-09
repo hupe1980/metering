@@ -4,7 +4,84 @@ All notable changes to `metering` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the crate follows
 semver, with the `serde` representation explicitly in scope (see the crate docs).
 
-## [0.24.0] — unreleased
+## [0.25.0] — 2026-10-09
+
+A hard cut: the crate is rebuilt around a validated `Series`, every rounding
+names its strategy, and wrong results found by an audit are fixed. Nothing is
+kept for compatibility.
+
+### Fixed — wrong results
+
+- **Forecast** multiplied by the seasonal factor instead of dividing; missing intervals now lower the observed days, not the rate.
+- **§ 14a** `mindestleistung_ems` now groups Fallgruppe b and c devices per BK6-22-300 Anlage 1 Ziff. 2.4.2 (three 5 kW heat pumps → one 15 kW device → 6,0 kW).
+- **Modul 3**: restricting to billed quarters (permitted by the BDEW AWH) was reported as a violation; HT energy was booked in unbilled quarters.
+- **EN 50160** pooled phases and weeks; an empty series was compliant.
+- **Validation**: grade C without a finding; coverage above 100 %; zero runs ignoring gaps; rule V07 could never fire alone.
+- **Substitution**: duplicates resolved by input order; coarser intervals double-counted; rejected values never replaced; long gaps carried a substitute forward as measured; `ZeroFill` interpolated.
+- **Allocation**: a proportional § 42b share could exceed the generation; single-tenant and community paths disagreed; one negative value aborted a year.
+- **§ 42c**: a non-operational gateway qualified; missing coverage counted as delivery.
+- **Readings**: `consumption_between` ignored argument order and register.
+- **OBIS**: power registers reported kWh; Zustandszahl and Brennwert reported m³; a Brennwert's period code was read as a tariff register.
+- **Holidays** carry years of validity (no Frauentag before 2019, nationwide Reformationstag 2017 only); SLP-Strom day typing gives 24.12 and 31.12 the Saturday profile unless on a Sunday.
+- **Calendar**: panics and inverted months at the edge of the date range; sub-daily buckets anchored to the Unix epoch instead of the local day.
+- A non-ASCII resolution string panicked (reachable through serde).
+- Resample and aggregation summed import and export together.
+- SLP-Gas allocation-temperature weights use the Leitfaden's four decimals (−0,2399 °C in its worked example); h-values are not rounded.
+
+### Changed — breaking
+
+- **Modules** grouped: `series`, `time`, `ids`, `vee`, `billing`, `slp`, `gas`, `heat`, `grid`, `allocation`, `eeg`, `precision`, `prelude`; the root re-exports only the core nouns.
+- **`Series`** is the pipeline input: sorted, unique, aligned to its `Resolution`, one channel. `MeterInterval` has private fields and a fallible constructor.
+- **Calendar**: `Resolution` is a closed set; `DayBoundary`/`Period` is the only calendar API.
+- **Validation**: `vee::validation::validate(&Series, &Rules) -> Report` (grade, findings, coverage).
+- **Substitution**: `vee::substitute::substitute(&Series, &Report, &Policy) -> Filled` — gaps ≤ 2 h interpolated (Z92), longer gaps from comparable days (ZJ2 electricity, Z95 gas), rejected values replaced with the original kept, optional register anchor; carry-forward (Z93) gas-only and opt-in.
+- **Aggregation**: `aggregate(&Series, Period)`, `resample(&Series, Resolution)`.
+- **Allocation**: `allocation::formula::Formula` evaluates the UTILTS AHB 1.1 Berechnungsformel; one § 42b engine, `allocation::community::allocate`.
+- **Rounding** names its strategy (`precision`): kaufmännisch where no source states a mode, half-to-even where the SLP-Gas Leitfaden says *mathematisch*, truncation for the § 42b share and the formula quotient.
+  - Values change at ties: `SUBSTITUTE_DP`, `BENUTZUNGSDAUER_DP`, `FORECAST_DP`, `DYNAMIZATION_DP`, `DYNAMIZED_VALUE_DP`, the seasonal factor (were half-to-even).
+  - Unchanged: `KUNDENWERT_DP`, `PERCENT_DP`, `ALLOCATION_DP`, G 685.
+  - The dynamisation polynomial is exact `Decimal`; the SigLinDe sigmoid is the only float crossing.
+- **Errors**: `ParseError` carries a kind; serde of every coded enum accepts what `FromStr` accepts.
+- **`#[non_exhaustive]`** on errors, code lists, findings, configs and results.
+- **Citations** move to EDI@Energy Allgemeine Festlegungen 6.1d and MSCONS MIG 2.5 / AHB 3.2 (binding 01.10.2026); no cited clause changed, no behaviour moved.
+- **MSRV** 1.88; dependency floors as the minimal-versions job proves (`serde` 1.0.220).
+- **Docs**: published statements corrected to match the code; a test refuses internal paths in published files.
+
+- The published package holds only the crate, its tests, the example and the guide
+  prose its doctests compile — no repository tooling.
+### Migration
+
+| Old | New |
+|---|---|
+| `validate_intervals`, `ValidationConfig` | `vee::validation::validate`, `Rules` |
+| `fill_gaps`, `FillGapsConfig` | `vee::substitute::substitute`, `Policy` |
+| `AggregationConfig` | `aggregate(&Series, Period)` |
+| `IntervalResolution` | `time::resolution::Resolution` |
+| `calendar::day_start_utc` and the `*_start_utc`/`*_end_utc`/`*_range_utc` family | `DayBoundary::{day, month, year}` → `Period` |
+| `AggregationRule`, `compute_virtual_meter` | `allocation::formula::Formula` |
+| `compute_ggv_allocation`, `compute_community_allocation` | `allocation::community::allocate` |
+| `compute_imbalance`, `network_losses`, `blindmehrarbeit` | `ImbalanceSaldo::new`, `NetworkLosses::new`, `ReactiveBalance::new` |
+| `MeterInterval { … }` literals | `MeterInterval::new` (or `quarter_hour`) |
+| `measurement_series`, `measurement_point`, `lifecycle` | removed |
+
+### Added
+
+- `eeg::mispel` — MiSpeL (BNetzA 618-25-02, adopted 01.10.2026): Abgrenzungsoption (Anlage 1, A1–A11) and Pauschaloption (Anlage 2, P1–P5, Rumpfjahr).
+- `eeg::negative_prices` — EEG § 51/§ 51a: zero-value quarter-hours, Vergütungszeitraum extension, Volllastviertelstunden, § 51 Abs. 3 energy.
+- `eeg::zeitgleichheit` — EnFG § 46: per-interval Zeitgleichheit and the statutory worst-case estimate.
+- `heat::heizkosten` — HeizkostenV § 6a monthly information, § 9 Abs. 3 fuel quantity, § 9a estimation.
+- Validation rules: stale values, seasonal outlier, Längsvergleich (load curve against register advance).
+- Forecast accuracy: `wape`, `mase`, `annual_energy_error`; an SLP-weighted projection.
+- `grid::ausfallarbeit::spitz_fluktuierend_kwh` (BilAReM 3.2.2.1 / 3.2.4.1).
+- CI: cargo-deny, minimal-versions, MSRV tests, PR mutation testing, trusted publishing with provenance and SBOM, OpenSSF Scorecard.
+
+### Removed
+
+- `lifecycle`, `measurement_point`, `measurement_series` and the provenance types — master-data and process state, not quantities.
+- The forecast's Student-t prediction interval, which understated the spread.
+- `virtual_meter`, `aggregation_rule`, the public Hampel functions, the calendar free functions, and duplicate parse/format helpers.
+
+## [0.24.0] — 2026-09-18
 
 Two new modules, a wider set of source scans, and corrections to several claims
 the crate made about what it could not verify.

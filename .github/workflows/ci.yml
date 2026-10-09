@@ -5,167 +5,108 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  # Weekly: `deny` (in the gate) picks up new RustSec advisories.
+  schedule:
+    - cron: "17 5 * * 1"
   workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
-  # `rust-toolchain.toml` pins the MSRV. RUSTUP_TOOLCHAIN takes precedence over
-  # that file, so each job below selects its own toolchain explicitly.
-  RUSTUP_TOOLCHAIN: stable
 
+# Actions are pinned by commit SHA; the comment names the release it resolves to.
 jobs:
-  fmt:
-    name: 🎨 rustfmt
+  gate:
+    name: ✅ gate (just ci)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          components: rustfmt
-      - run: cargo fmt --all -- --check
-
-  clippy:
-    name: 📎 clippy
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
         with:
-          components: clippy
-      - uses: Swatinem/rust-cache@v2
-      - name: clippy (default features)
-        run: cargo clippy --all-targets -- -D warnings
-      - name: clippy (all features)
-        run: cargo clippy --all-targets --all-features -- -D warnings
+          toolchain: stable
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
+        with:
+          tool: just,cargo-deny
+      # fmt-check, lint, purity, test, doc, example, package, deny.
+      - run: just ci
 
-  purity:
-    name: 🧊 purity
-    runs-on: ubuntu-latest
+  windows:
+    # Line endings: the tests read the repository's own text files.
+    name: 🪟 test (windows)
+    runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
-      # The crate guarantees equal inputs give equal outputs: no clock read, no
-      # I/O, no unsafe outside comments. Cheap to check, easy to regress.
-      - name: no ambient state in src/
-        run: |
-          hits="$(grep -rn --include='*.rs' -E \
-            'now_utc|SystemTime::now|Instant::now|std::(fs|env|net|process)|\bunsafe\b' \
-            src/ | grep -vE ':[[:space:]]*(///|//!|//)' || true)"
-          if [ -n "$hits" ]; then
-            echo "::error::ambient state or unsafe reached the source"
-            echo "$hits"
-            exit 1
-          fi
-          echo "pure: no clock, no I/O, no unsafe"
-
-  test:
-    name: 🧪 test (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: test (default features)
-        run: cargo test --all-targets
-      - name: test (all features)
-        run: cargo test --all-features --all-targets
-      - name: doctests (all features)
-        run: cargo test --all-features --doc
-      # The example asserts its own invariants, so running it is a test.
-      - name: examples
-        run: cargo run --all-features --example pipeline
-
-  features:
-    name: 🎛️ feature matrix
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: build (no default features)
-        run: cargo build --no-default-features
-      - name: build (serde)
-        run: cargo build --no-default-features --features serde
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - run: cargo test --all-features
 
   msrv:
-    name: 🦀 MSRV 1.94
+    name: 🦀 MSRV
     runs-on: ubuntu-latest
-    env:
-      RUSTUP_TOOLCHAIN: "1.94"
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          toolchain: "1.94"
-      - uses: Swatinem/rust-cache@v2
-      # Keep in sync with `rust-version` in Cargo.toml and `rust-toolchain.toml`.
-      - run: cargo check --all-features --all-targets
+          persist-credentials: false
+      # `rust-version` in Cargo.toml is the one source of the MSRV.
+      - id: msrv
+        run: echo "version=$(sed -n 's/^rust-version *= *"\(.*\)"/\1/p' Cargo.toml)" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      # RUSTUP_TOOLCHAIN overrides rust-toolchain.toml (which tracks stable).
+      - run: cargo test --all-features --locked
+        env:
+          RUSTUP_TOOLCHAIN: ${{ steps.msrv.outputs.version }}
 
-  docs:
-    name: 📚 rustdoc
-    runs-on: ubuntu-latest
-    env:
-      RUSTDOCFLAGS: -D warnings
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo doc --no-deps --all-features
-
-  package:
-    name: 📦 package
+  minimal-versions:
+    # Tests Cargo.toml's lower bounds: direct dependencies at their floors.
+    name: 📉 minimal versions
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      # Catches missing files / bad metadata before a release tag is cut.
-      - run: cargo publish --dry-run --all-features
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
+        with:
+          toolchain: nightly
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
+        with:
+          toolchain: stable
+      - run: cargo +nightly update -Z direct-minimal-versions
+      - run: cargo test --all-features
 
   semver:
-    name: 🔒 semver
+    name: 🔒 semver (report)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - uses: taiki-e/install-action@cargo-semver-checks
-      # The wire representation is declared semver-covered and pinned by a
-      # literal test; this is the API half of the same promise. It compares
-      # against the most recent crates.io release and names every break, which
-      # is the list a CHANGELOG entry needs.
-      #
-      # `--release-type patch` is load-bearing, not tidiness. Without it the
-      # tool infers the bump from Cargo.toml — and for a 0.x crate a minor bump
-      # already *declares* a major change, so every lint is skipped and the lane
-      # reports `0 checks: 0 pass, 254 skip` however much it broke. Asking
-      # "would this be a legal patch release?" is the question that lists
-      # everything not backwards-compatible, at any version.
-      #
-      # It does not fail the build while the crate is pre-1.0 and every release
-      # is a deliberate hard cut: `continue-on-error` makes the output a report
-      # rather than a gate. Flip it off at 1.0, when a break stops being cheap.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
+        with:
+          tool: cargo-semver-checks
+      # Lists every break against the last crates.io release. `--release-type
+      # patch` is required: inferred from a 0.x minor bump, every lint is
+      # skipped. A report, not a gate, while pre-1.0 releases may break.
       - run: cargo semver-checks check-release --all-features --release-type patch
         continue-on-error: true
-
-  audit:
-    name: 🛡️ audit
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - uses: taiki-e/install-action@cargo-audit
-      # Run cargo-audit directly rather than via rustsec/audit-check: that action
-      # reports through the Checks API, which needs `checks: write` and is
-      # read-only for pull requests from forks, so it fails the job on the
-      # permission rather than on any finding. The exit code is the signal.
-      - run: cargo audit --deny warnings

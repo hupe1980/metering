@@ -1,0 +1,31 @@
+# Purity: no clock, environment, file, socket or process in the library; a
+# caller passes the instant in. `just purity` (clippy over `--lib`, part of
+# `just ci`) denies these; `just lint` allows them in tests, which read fixtures.
+# `now_local` needs time's `local-offset` feature, off here.
+disallowed-methods = [
+    { path = "time::OffsetDateTime::now_utc", reason = "take the instant as a parameter" },
+    { path = "time::OffsetDateTime::now_local", reason = "take the instant as a parameter", allow-invalid = true },
+    { path = "time::UtcDateTime::now", reason = "take the instant as a parameter" },
+    { path = "std::time::SystemTime::now", reason = "take the instant as a parameter" },
+    { path = "std::time::Instant::now", reason = "no clock in a pure crate" },
+    { path = "std::env::var", reason = "no ambient configuration" },
+    { path = "std::env::var_os", reason = "no ambient configuration" },
+    { path = "std::env::vars", reason = "no ambient configuration" },
+    { path = "std::env::args", reason = "no ambient configuration" },
+    { path = "std::env::current_dir", reason = "no file system" },
+    { path = "std::fs::read", reason = "no file system" },
+    { path = "std::fs::read_to_string", reason = "no file system" },
+    { path = "std::fs::read_dir", reason = "no file system" },
+    { path = "std::fs::write", reason = "no file system" },
+    { path = "std::fs::metadata", reason = "no file system" },
+    { path = "std::fs::create_dir_all", reason = "no file system" },
+    { path = "std::fs::remove_file", reason = "no file system" },
+]
+disallowed-types = [
+    { path = "std::fs::File", reason = "no file system" },
+    { path = "std::fs::OpenOptions", reason = "no file system" },
+    { path = "std::net::TcpStream", reason = "no network" },
+    { path = "std::net::TcpListener", reason = "no network" },
+    { path = "std::net::UdpSocket", reason = "no network" },
+    { path = "std::process::Command", reason = "no subprocess" },
+]

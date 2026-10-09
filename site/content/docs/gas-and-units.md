@@ -1,296 +1,136 @@
 +++
-title = "Gas conversion and units"
-description = "m³ to kWh_Hs under MessEG and DVGW G 685, the SigLinDe gas SLP arithmetic, the 06:00 Gastag, and unit normalisation that refuses to guess."
-weight = 10
+title = "Gas, units and load profiles"
+description = "m³ to kWh_Hs per DVGW G 685, the Zustandszahl, unit normalisation that refuses to guess, and the standard load profiles: BDEW SLP Strom and SigLinDe SLP Gas."
+weight = 8
+[extra]
+group = "Tasks"
 +++
 
-## The formula and why it is lawful
+## m³ → kWh_Hs
 
-```text
-kWh_Hs = V_m3 × Hs_kWh_per_m3 × Zustandszahl
-```
-
-A gas meter registers m³. The kWh billed is **derived, never measured**, so the
-conversion rests on the Eichrecht exceptions to § 33 MessEG:
-
-- **§ 33 Abs. 1 MessEG** — a value for a Messgröße may only be used if it was
-  determined with a Messgerät.
-- **§ 25 Nr. 4 MessEV** — permits Brennwert values *"wenn sie nach den
-  anerkannten Regeln der Technik ermittelt worden sind"*.
-- **§ 25 Nr. 7 MessEV** — permits a value formed as a *"Summe, Differenz,
-  Produkt oder Quotient"* of measured values, which `V × Z × Hs` is. See
-  [almost nothing here is a measured value](@/docs/regulatory-basis.md#almost-nothing-here-is-a-measured-value)
-  for what that exception costs in exchange.
-- **DVGW G 685** — the anerkannte Regel der Technik § 25 Nr. 4 refers to,
-  restructured in 2020 into parts. Teil 2 is the Brennwert, **Teil 3** the
-  Volumen im Normzustand, **Teil 6** the Kompressibilitätszahl (formerly the
-  separate G 486).
-
-## Where the Zustandszahl comes from
-
-The Brennwert is operator data and this library will not invent one. The
-Zustandszahl is different: it is **computable**, from four inputs G 685-3 names
-and two constants DIN 1343 fixes.
-
-```text
-       T_n        p_amb + p_eff       1
-z =  ───────  ×  ───────────────  ×  ───
-      T_eff            p_n            K
-```
-
-`T_n` = 273,15 K and `p_n` = 1013,25 mbar are the Normzustand. `T_eff` is a
-**Festwert of 15 °C** — the meter is not required to measure a gas temperature,
-so the rule fixes one rather than letting each Netzbetreiber choose. `p_eff` is
-the gauge pressure at the meter, and `K` is 1 below one bar, where the
-compressibility of natural gas is smaller than the rounding of `z` itself.
-
-`p_amb` is where the Höhenzone comes in. G 685-3 has the Netzbetreiber cut the
-network into height zones and bill each on one mean air pressure, so that
-neighbours are not settled on different constants:
-
-```text
-p_amb [mbar] = 1016 − 0,12 × H [m]
-```
-
-A zone's stated mean height may not be more than 50 m from its outermost
-boundary, which is what bounds the error of that straight line.
+`kWh_Hs = V_Betrieb [m³] × Hs [kWh/m³] × Zustandszahl` (DVGW G 685). Billing a
+derived value rests on § 25 Nr. 4 and Nr. 7 MessEV — see the [regulatory
+basis](@/docs/regulatory-basis.md#almost-nothing-here-is-a-measured-value).
 
 ```rust
-use metering::{
-    G685Rounding, ZustandszahlParams, gas_m3_to_kwh_hs_rounded,
-    hoehenzonen_luftdruck_mbar, zustandszahl,
+use metering::gas::conversion::{GasConversionParams, gas_m3_to_kwh_hs, normalize_to_kwh};
+use rust_decimal::dec;
+
+// 100 m³ × 10.55 kWh/m³ × 0.9764, exactly.
+assert_eq!(gas_m3_to_kwh_hs(dec!(100), dec!(10.55), dec!(0.9764)), Some(dec!(1030.102000)));
+
+// Through the unit-aware path: a volume needs both parameters, and has no default.
+let params = GasConversionParams::new(dec!(10.55), dec!(0.98));
+assert_eq!(normalize_to_kwh(dec!(100), "m3", Some(&params), None).unwrap(), dec!(1033.900));
+assert!(normalize_to_kwh(dec!(100), "m3", None, None).is_err());
+```
+
+**Pass a Betriebsvolumen** (OBIS `7-0:3.0.0`). A Normvolumen (`7-0:13.2.0`) is
+already state-converted; use `GasConversionParams::already_converted(hs)`,
+which fixes the Zustandszahl at 1. `GasConversionParams` has no `Default`.
+
+### The Zustandszahl
+
+From the Netzbetreiber's Höhenzonen table, or computed from the DVGW G 685-3
+inputs: air pressure (`p_amb = 1016 − 0,12 × H`), Effektivdruck,
+Abrechnungstemperatur (15 °C) and Kompressibilitätszahl (1 below one bar).
+Normzustand per DIN 1343: 273,15 K, 1013,25 mbar.
+
+```rust
+use metering::gas::conversion::{
+    G685Rounding, ZustandszahlParams, gas_m3_to_kwh_hs_rounded, hoehenzonen_luftdruck_mbar, zustandszahl,
 };
+use metering::precision::G685_STRATEGY;
 use rust_decimal::dec;
 
-// A household connection 253 m up, 22 mbar Effektivdruck.
-let params = ZustandszahlParams::below_one_bar(
-    hoehenzonen_luftdruck_mbar(dec!(253)), // 985.64 mbar
-    dec!(22),
-).expect("below one bar, so K = 1");
+// A household connection 253 m above sea level, 22 mbar Effektivdruck.
+let params = ZustandszahlParams::below_one_bar(hoehenzonen_luftdruck_mbar(dec!(253)).unwrap(), dec!(22)).unwrap();
+let z = zustandszahl(&params).unwrap();
+assert_eq!(z.round_dp_with_strategy(4, G685_STRATEGY), dec!(0.9427));
 
-let z = zustandszahl(&params).expect("a positive gas state");
-assert_eq!(z.round_dp(4), dec!(0.9427));
-
-// 1 874 m³ over the year at an Abrechnungsbrennwert of 11,316 kWh/m³.
-let kwh = gas_m3_to_kwh_hs_rounded(dec!(1874), dec!(11.316), z, G685Rounding::default());
-assert_eq!(kwh.round_dp(2), dec!(19991.07));
+let kwh = gas_m3_to_kwh_hs_rounded(dec!(1874), dec!(11.316), z, G685Rounding::PUBLISHED_PRACTICE).unwrap();
+assert_eq!(kwh.round_dp_with_strategy(2, G685_STRATEGY), dec!(19991.07));
 ```
 
-`zustandszahl` returns the quotient **unrounded**: the four places `z` is quoted
-to are the market's rounding, and `gas_m3_to_kwh_hs_rounded` applies them at the
-point of use. Rounding here as well would round the same number twice, in the
-same direction, on every invoice.
+**The final rounding is a setting**: Merkblätter diverge between whole kWh and
+two decimals. `G685Rounding::PUBLISHED_PRACTICE` rounds the Zustandszahl to four
+and the Brennwert to three places and leaves the result unrounded.
 
-`below_one_bar` fills in the two inputs the rule fixes rather than leaves open,
-and returns `None` at or above one bar — an assumption with a stated limit
-should refuse to be used past it. It is named for that precondition rather than
-for a pressure stage: `K = 1` is admissible across Nieder- **and** Mitteldruck,
-and only the one-bar bound decides. Above it, `ZustandszahlParams::new` takes
-the K-Zahl from G 685-6.
+## Unit normalisation
 
-## Pass a Betriebsvolumen, not a Normvolumen
-
-`7-0:13.2.0` (Normvolumen umgewertet) and `7-0:3.2.0` (Normvolumen gemessen)
-have **already** been state-converted by the Mengenumwerter. Feeding one in
-applies the Zustandszahl a second time and overstates the energy by the
-Zustandszahl's deviation from 1 — a few percent, silently, on a billed quantity.
-
-For an already-converted volume, pass `Decimal::ONE` as the Zustandszahl.
-
-## G 685 rounding is a configuration choice
+`normalize_to_kwh(value, unit, gas, interval_secs)`: an energy unit is
+rescaled exactly, a power needs its averaging interval, a volume the gas
+parameters; an unknown unit is an error.
 
 ```rust
-use metering::{G685FinalRounding, G685Rounding, gas_m3_to_kwh_hs_rounded};
+use metering::gas::conversion::normalize_to_kwh;
 use rust_decimal::dec;
 
-// The published eneregio worked example: 895 m³ × 11.369 × 0.9543 → 9 710 kWh.
-let kwh = gas_m3_to_kwh_hs_rounded(
-    dec!(895), dec!(11.369), dec!(0.9543),
-    G685Rounding { final_rounding: G685FinalRounding::WholeKwh, ..G685Rounding::default() },
-);
-assert_eq!(kwh, dec!(9710));
-```
-
-Input rounding is consistent across published Netzbetreiber Merkblätter —
-Zustandszahl to four decimal places, Abrechnungsbrennwert to three. The **final**
-rounding demonstrably diverges (both whole-kWh and two-decimal results appear in
-published Merkblätter) and the normative text is not freely citable, so it is a
-setting rather than a hard-coded claim.
-
-## Unit normalisation refuses to guess
-
-```rust
-use metering::{GasConversionParams, normalize_to_kwh};
-use rust_decimal::dec;
-
-let gas = GasConversionParams::new(dec!(10.55), dec!(0.98));
-assert_eq!(normalize_to_kwh(dec!(100), "m3", Some(&gas), None)?, dec!(1033.900));
-assert_eq!(normalize_to_kwh(dec!(3.6), "GJ", None, None)?, dec!(1000)); // exactly
-assert_eq!(normalize_to_kwh(dec!(48), "kW", None, Some(900))?, dec!(12));
-
-// An unknown unit is an error, not a silent pass-through as kWh.
+assert_eq!(normalize_to_kwh(dec!(3.6), "GJ", None, None).unwrap(), dec!(1000));
+assert_eq!(normalize_to_kwh(dec!(48), "kW", None, Some(900)).unwrap(), dec!(12));
 assert!(normalize_to_kwh(dec!(1), "furlong", None, None).is_err());
-# Ok::<(), metering::ConversionError>(())
 ```
 
-### Pass a Betriebsvolumen, or say you are not
+## SLP Strom
 
-`GasConversionParams` has **no `Default`**, and no "typical Erdgas H" preset.
-Both fields are operator data published per supply area and billing period, and
-a stand-in Brennwert is a direct multiplier on a billed quantity: 10.55 against
-a real 11.20 understates every gas invoice in the portfolio by 6 %, with nothing
-in the output to show for it.
+The BDEW profiles are **value tables** the operator loads — the 2025 revision
+(H25, G25, L25, P25, S25) or the 1999 VDEW profiles; the crate ships none. BDEW
+*Hinweise zu den aktualisierten Standardlastprofilen Strom* (17.03.2025):
+*"Jedem Netzbetreiber steht es weiterhin frei, bei der Bilanzierung auf die
+aktualisierten Profile aus dem Jahr 2025, die alten Profile aus dem Jahr 1999,
+eigene Profile oder eine Mischung der verschiedenen Optionen zurückzugreifen."*
 
-For a volume the Mengenumwerter has already state-converted — `7-0:13.2.0`
-Normvolumen umgewertet, or `7-0:3.2.0` Normvolumen gemessen — the Zustandszahl
-has already been applied, and applying it again overstates the energy by its
-deviation from unity:
+`DynamicSlpProfile::value_at(instant, &calendar)` resolves the Berlin
+quarter-hour, month, day type in the Land and Dynamisierung, and answers `None`
+when a table is missing.
+
+- **Day type** from `SlpCalendar`: 24 and 31 December take the Saturday
+  profile unless a Sunday (VDEW definition; `eves_as_saturday(false)`).
+- **Dynamisierung**: `Dynamization::BDEW`, the H0/H25 quartic in exact
+  `Decimal`, refused outside day 1..=366.
 
 ```rust
-use metering::{GasConversionParams, normalize_to_kwh};
+use metering::slp::strom::{DynamicSlpProfile, Dynamization, LoadProfile, SlpDayType};
+use metering::time::holiday::{Bundesland, SlpCalendar};
 use rust_decimal::dec;
+use time::macros::datetime;
 
-let normvolumen = GasConversionParams::already_converted(dec!(11.2));
-assert_eq!(normalize_to_kwh(dec!(100), "m3", Some(&normvolumen), None)?, dec!(1120.0));
-# Ok::<(), metering::ConversionError>(())
+let mut h25 = DynamicSlpProfile::new(LoadProfile::H25).dynamization(Dynamization::BDEW);
+h25.insert(6, SlpDayType::SonnFeiertag, vec![dec!(100); 96]).unwrap();
+
+// Fronleichnam 2026 is a holiday in Bavaria, a Werktag in Berlin.
+let noon = datetime!(2026-06-04 10:00 UTC);
+assert!(h25.value_at(noon, &SlpCalendar::new(Bundesland::By)).is_some());
+assert!(h25.value_at(noon, &SlpCalendar::new(Bundesland::Be)).is_none()); // Werktag table not loaded
 ```
 
-`MeasurementUnit::parse_scaled` accepts device symbols (kWh, Wh, MWh, GJ, MJ,
-m³, litres) and the UN/ECE Rec 20 codes UTILMD and EN 16931 use — where the
-codes are *not* the symbols: gigajoule is `GV`, megajoule is `3B`, cubic metre
-is `MTQ`.
+## SLP Gas — SigLinDe
 
-Each factor is kept as an exact rational rather than a decimal. 1 GJ is
-2500/9 kWh, so 3.6 GJ is exactly 1000 kWh with no residue — multiplying before
-dividing rounds once, at the end, instead of once per reading.
-
-## The gas SLP — SigLinDe, published in full
-
-Both the gas SLP procedure and the 2025 electricity profiles are published in
-full; what differs is what is worth embedding — a formula with coefficient sets
-against value tables an operator chooses between. The gas
-SLP procedure is published in full: the BDEW/VKU/GEODE Leitfaden *"Abwicklung
-von Standardlastprofilen Gas"* — current edition **KoV XV, Stand 27.03.2026**,
-coefficients in Anlage 6 — prints the profile function, the temperature
-weighting, the weekday factors and every coefficient set. `metering::gas_slp`
-implements that arithmetic:
+One value per Gastag from temperature — Leitfaden *Abwicklung von
+Standardlastprofilen Gas* (KoV XV, Stand 27.03.2026, Anlage 6):
 
 ```text
-f_sigmoid(ϑ) = A / (1 + (B / (ϑ − ϑ₀))^C) + D          ϑ₀ = 40 °C
-f_linear(ϑ)  = max{ mH·ϑ + bH ;  mW·ϑ + bW }
-h(ϑ)         = f_sigmoid(ϑ) + f_linear(ϑ)
-
-Q(D) = KW · h(ϑ_D) · F_WT
+h(ϑ)  = A / (1 + (B / (ϑ − ϑ₀))^C) + D  +  max{ mH·ϑ + bH ; mW·ϑ + bW }
+Q(D)  = Kundenwert · h(ϑ_allok) · F_WT
+ϑ_allok = (ϑ_D + 0,5·ϑ_D−1 + 0,25·ϑ_D−2 + 0,125·ϑ_D−3) / 1,875
 ```
 
 ```rust
-use metering::gas_slp::{SigLinDe, allocation_temperature};
-use metering::{gas_daily_quantity, kundenwert};
+use metering::slp::gas::{SigLinDe, allocation_temperature, gas_daily_quantity};
 use rust_decimal::dec;
 
-// The temperature entering h is a geometric series over four days — the
-// heat stored in buildings — and the division is exact (weights are eighths).
-let theta = allocation_temperature(dec!(5.0), dec!(2.5), dec!(2.5), dec!(5.0));
-assert_eq!(theta, dec!(4));
+// The Leitfaden's worked example: −0,2399 °C.
+let theta = allocation_temperature(dec!(-2.0), dec!(0.5), dec!(3.4), dec!(3.6)).unwrap();
+assert_eq!(theta, dec!(-0.23991));
 
-// DE_HEF34 is the published single-family-home reference set, normalised so
-// h(8 °C) = 1.00000 — which the test suite reproduces from the printed row.
-let h = SigLinDe::DE_HEF34.h_value(theta);
-let q = gas_daily_quantity(dec!(60.3423), h, dec!(1));
+let h = SigLinDe::DE_HEF34.h_value(dec!(4)).unwrap();
+let q = gas_daily_quantity(dec!(60.3423), h, dec!(1)).unwrap();
 assert!(q > dec!(90));
-# let _ = kundenwert(dec!(1), dec!(1));
 ```
 
-The **Kundenwert** — the customer's consumption on a day where `h = 1` — comes
-from a metered reference period as `KW = Q / Σ(h·F)`, weekday factors must sum
-to exactly 7.0000 for the standard week, and a gesetzlicher Feiertag takes the
-Sunday factor, nationwide by default and per-Land on request — all as the
-Leitfaden specifies. The pure-sigmoid form — zero linear parts — is both the
-pre-2015 TUM generation and how HKO, the Kochgasprofil, is published today.
-
-### The fifteen profile types
-
-The Leitfaden publishes **fifteen** gas profile types in two variants each
-(`33` and `34`, differing in how much of the demand the linear part carries):
-`HEF`, `HMF`, `HKO` for households, eleven Gewerbe sector types, and `GHD`.
-
-`GHD` is the *Summenlastprofil Gewerbe, Handel, Dienstleistung* — the EDI@Energy
-*Codeliste TUM- und BDEW-SLP Gas* v1.1 §6.3 lists it under the TUM codes `HD3`
-and `HD4`, and `GHD` is its BDEW/SigLinDe short code, formed as `G` + the TUM
-stem like `GMF` from `MF`. Its coefficients and weekday factors are a weighted
-mean across the sector types, and a delivery point takes it when it fits none of
-them.
-
-```rust
-use metering::LoadProfile;
-
-let ghd = LoadProfile::parse("GHD").expect("a real profile");
-assert!(ghd.is_gas() && ghd.is_commercial());
-assert!(ghd.is_gas_aggregate(), "the only aggregate of the fifteen");
-assert_eq!(LoadProfile::ALL.iter().filter(|p| p.is_gas()).count(), 15);
-```
-
-## The Gastag runs 06:00 to 06:00
-
-Gas is balanced on **gas days**, not calendar days: a Gastag runs from 06:00
-local to 06:00 the next morning. Summing a gas Lastgang over the calendar day
-books the 00:00–06:00 draw into the wrong Bilanzierungstag — six hours, every
-day. `calendar::gas_day_start_utc`, `gas_day_end_utc` and `local_gas_day` own
-the boundary.
-
-One consequence worth knowing: the clocks change at 02:00/03:00 local, *before*
-the 06:00 boundary — so the 23- or 25-hour Gastag is the one named after the
-**Saturday**, not the transition Sunday.
-
-The boundary is not something you have to re-derive at each call site.
-`DayBoundary::Gastag` moves a whole daily, monthly or yearly grid onto it:
-
-```rust
-use metering::{MeterInterval, QualityFlag, ResampleConfig, calendar};
-use rust_decimal::dec;
-use time::{Duration, macros::date};
-
-// Two whole Gastage of hourly gas intervals.
-let start = calendar::gas_day_start_utc(date!(2026 - 01 - 15));
-let series: Vec<MeterInterval> = (0..48).map(|i| MeterInterval {
-    from:  start + Duration::hours(i),
-    to:    start + Duration::hours(i + 1),
-    value: dec!(1),
-    quality: QualityFlag::Measured,
-    obis_code: None,
-}).collect();
-
-let gas_days = metering::resample(&series, &ResampleConfig::to_gas_daily());
-assert_eq!(gas_days.len(), 2);
-assert_eq!(gas_days[0].total, dec!(24));
-assert_eq!(gas_days[0].is_complete(), Some(true));
-
-// The same data on calendar days is three partial buckets, the first holding
-// only 18:00–24:00.
-let calendar_days = metering::resample(
-    &series,
-    &ResampleConfig::new(metering::IntervalResolution::Hour, metering::IntervalResolution::Day),
-);
-assert_eq!(calendar_days.len(), 3);
-assert!(calendar_days[0].has_missing_data());
-```
-
-`FillGapsConfig::on` takes the same boundary, so Ersatzwertbildung on a gas SLP
-walks Gastage rather than Liefertage.
-
-## Warm water under HeizkostenV § 9 Abs. 2
-
-```text
-Q [kWh/a] = 2.5 × V [m³] × (t_w [°C] − 10)
-```
-
-A *Zahlenwertgleichung* — not dimensionally consistent, so 2.5 carries no unit.
-§ 9 Abs. 2 Satz 3 Nr. 1 defines it as covering the Erzeugeraufwandszahl, the
-specific heat capacity of water, storage and circulation losses, and metering
-effort. Because the Erzeugeraufwandszahl is inside the constant, **Q is
-generator-input heat, not delivered useful heat**.
-
-This equation is the fallback admitted only where measuring with a Wärmezähler
-would take *"unzumutbar hohen Aufwand"*. The floor-area variant
-(`32 × A_Wohn`) is narrower still: it needs neither the heat quantity nor the
-volume to be measurable, and its constant covers a *different* bundle of losses.
+`h_value` evaluates the sigmoid in `f64` (the [one float
+crossing](@/docs/design.md#exactness)) and returns an unrounded `Decimal`, as
+Anlage 5 requires. `SigLinDe::DE_HEF34` is embedded to verify against the
+printed numbers; operators load the sets they balance with. The
+allocation-temperature weights use four decimals, rounded *mathematisch* (half
+to even).

@@ -6,12 +6,14 @@
     <h1>{{ section.title }}</h1>
     {{ section.content | safe }}
     <nav class="toc-list" aria-label="Pages in this section">
-      <h2>Pages</h2>
+      {% for group in ["Start", "Concepts", "Tasks", "Specialised", "Reference"] %}
+      <h2>{{ group }}</h2>
       <ul>
-      {% for p in section.pages %}
+      {% for p in section.pages %}{% if p.extra.group == group %}
         <li><a href="{{ p.permalink }}">{{ p.title }}</a>{% if p.description %} — {{ p.description }}{% endif %}</li>
-      {% endfor %}
+      {% endif %}{% endfor %}
       </ul>
+      {% endfor %}
     </nav>
   </article>
 </div>

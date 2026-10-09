@@ -25,11 +25,13 @@ target
 site/public/
 /public/
 
-# Primary sources (see specs/README.md). Third-party publications — BNetzA
-# Festlegungen, BDEW/VKU/GEODE Leitfäden, EDI@Energy Codelisten, VDE FNN
-# Hinweise — redistributed under their own terms, so they are staged rather
-# than committed. `just specs` rebuilds the folder from the index.
+# Spec Kit: the feature specifications under `specs/`, the scaffolding that
+# produces them (`/speckit-*` skills, templates) and the constitution under
+# `.specify/memory/`. Same rule as `concepts/`: internal working documents, and
+# nothing published may cite a path its reader does not have.
 /specs/
+/.specify/
+/.claude/
 
 # `scripts/verify_quotes.py` is run, not imported — its bytecode cache is a
 # build artefact of whichever Python happened to run it, and one was committed.
@@ -41,4 +43,10 @@ __pycache__/
 # decision cost. `site/` is the public narrative, `CHANGELOG.md` the history and
 # the rustdoc the API contract; `concepts/` is none of the three, and nothing in
 # the build reads it.
+#
+# The primary sources — BNetzA Festlegungen, BDEW/VKU/GEODE Leitfäden,
+# EDI@Energy Codelisten, VDE FNN Hinweise, redistributed under their own terms —
+# live at `concepts/reference/` and are covered by the same line: one ignored
+# tree, one answer to "where does the evidence live". `concepts/REFERENCES.md`
+# indexes them and `just references` rebuilds the folder from the index.
 /concepts/

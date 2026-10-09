@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Check every passage the crate presents as verbatim source text against the PDFs.
 
-Reads `src/**/*.rs`, `site/content/docs/*.md` and `README.md`, pulls out every
-`*"…"*` passage, and searches a corpus built with `pdftotext -layout` over
-`specs/` (plus any extra directories given on the command line).
+Reads `src/**/*.rs`, `tests/**/*.rs`, `site/content/**/*.md` and `README.md`,
+pulls out every `*"…"*` passage, and searches a corpus built with `pdftotext -layout` over
+`concepts/reference/` (plus any extra directories given on the command line).
 
 A quote is verified when every fragment of it — the passage split on `…`, since
 the crate elides — appears in the corpus after normalisation. Normalisation
@@ -131,16 +131,17 @@ def corpus(dirs: list[Path]) -> str:
 
 def sources() -> list[Path]:
     files = sorted((ROOT / "src").rglob("*.rs"))
-    files += sorted((ROOT / "site" / "content" / "docs").glob("*.md"))
+    files += sorted((ROOT / "tests").rglob("*.rs"))
+    files += sorted((ROOT / "site" / "content").rglob("*.md"))
     files.append(ROOT / "README.md")
     return [f for f in files if f.exists()]
 
 
 def main() -> int:
-    dirs = [ROOT / "specs"] + [Path(a).expanduser() for a in sys.argv[1:]]
+    dirs = [ROOT / "concepts" / "reference"] + [Path(a).expanduser() for a in sys.argv[1:]]
     dirs = [d for d in dirs if d.is_dir()]
     if not dirs:
-        print("no PDF directory found — run `just specs` first", file=sys.stderr)
+        print("no PDF directory found — run `just references` first", file=sys.stderr)
         return 1
 
     haystack = corpus(dirs)
@@ -153,7 +154,9 @@ def main() -> int:
 
     for path in sources():
         text = path.read_text(encoding="utf-8")
-        for raw in QUOTE.findall(text):
+        for match in QUOTE.finditer(text):
+            raw = match.group(1)
+            line = text.count("\n", 0, match.start()) + 1
             quote = normalise(raw)
             # German only: the crate quotes its sources in their own language,
             # and an English *"…"* is emphasis, not a citation. The marker list
@@ -174,7 +177,7 @@ def main() -> int:
                 verified += 1
             else:
                 missing = next((f for f in fragments if f not in haystack), quote)
-                failures.append((str(path.relative_to(ROOT)), missing))
+                failures.append((f"{path.relative_to(ROOT)}:{line}", missing))
 
     print(f"{checked} German passages: {verified} verified, {skipped} known-unverifiable, "
           f"{len(failures)} unmatched")

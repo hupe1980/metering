@@ -1,0 +1,29 @@
+# cargo-deny — advisories, licenses, duplicate crates, sources.
+# `just deny` runs it; it is part of `just ci`, which CI's `gate` job runs.
+
+[graph]
+all-features = true
+
+[advisories]
+# Every RustSec advisory is an error; `ignore` records a reviewed exception.
+unmaintained = "all"
+yanked       = "deny"
+ignore       = []
+
+[licenses]
+# Exactly what the graph (dev-dependencies included) needs; a new license is
+# added deliberately, never by wildcard.
+allow = ["MIT", "Apache-2.0", "Unicode-3.0"]
+confidence-threshold = 0.93
+# The one non-MIT/Apache license in the graph, scoped to the crate carrying it.
+exceptions = [{ crate = "time-tz", allow = ["BSD-3-Clause"] }]
+
+[bans]
+# Duplicates are a build-time cost, not a defect: report, don't fail.
+multiple-versions = "warn"
+wildcards         = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git      = "deny"
+allow-registry   = ["https://github.com/rust-lang/crates.io-index"]

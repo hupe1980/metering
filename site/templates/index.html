@@ -3,11 +3,11 @@
 <section class="hero">
   <h1>German energy metering, <em>correct by construction</em></h1>
   <p class="lede">
-    A pure Rust domain library for the quantity calculations German metering
-    requires — Europe/Berlin calendar arithmetic that knows a day is sometimes
-    23 hours and a Gastag starts at 06:00, Zählerstandsgang to Lastgang, gas
-    m³→kWh_Hs and the SigLinDe gas SLP, Ersatzwertbildung in the market's own
-    code list, check-digit-validated MaLo-IDs, and §14a Modul 3 tariff registers.
+    The open, checkable reference for German energy-metering quantities: every
+    number traces to a published clause, every quoted passage is checked against
+    the PDF. Validation and Ersatzwertbildung, billing quantities and § 14a
+    Modul 3 registers, gas, heat, grid, allocation and EEG — on a calendar where
+    a day has 23, 24 or 25 hours and a Gastag starts at 06:00.
   </p>
   <p class="badges">
     <span class="chip">Zero I/O</span>
@@ -28,10 +28,9 @@
     <article>
       <h3>A German day is not 24 hours</h3>
       <p>
-        23 hours each spring, 25 each autumn. A completeness check built on a
+        23 hours each spring, 25 each autumn. A completeness check on a
         hard-coded 96 quarter-hours raises a false alarm every March and
-        <strong>hides a real four-interval gap every October</strong>, because 96
-        of an expected 100 looks complete.
+        <strong>hides a four-interval gap every October</strong>.
       </p>
       <p><a href="{{ get_url(path='@/docs/time-and-calendar.md') }}">Time and the calendar →</a></p>
     </article>
@@ -42,15 +41,14 @@
         Messstellenbetreiber differences it into the Lastgang. Register wraps,
         implausible jumps and meter exchanges all live at that boundary.
       </p>
-      <p><a href="{{ get_url(path='@/docs/readings.md') }}">Readings and intervals →</a></p>
+      <p><a href="{{ get_url(path='@/docs/series-and-readings.md') }}">Series and readings →</a></p>
     </article>
     <article>
       <h3>Every citation is checked</h3>
       <p>
-        Every German passage is matched against the published PDF, character
-        for character, by a harness in the repository. Where a claim cannot be
-        verified — the 2025 SLP dynamisation is printed as an image — the
-        library says so instead of asserting it.
+        Every quoted German passage is matched against the published PDF. Where
+        a source is paywalled or leaves a choice open — G 685's final rounding,
+        the Blindarbeit Freigrenze — the value is a parameter, not an assertion.
       </p>
       <p><a href="{{ get_url(path='@/docs/regulatory-basis.md') }}">Regulatory basis →</a></p>
     </article>
@@ -67,11 +65,10 @@
   <table>
     <thead><tr><th>Not here</th><th>Why</th><th>Where instead</th></tr></thead>
     <tbody>
-      <tr><td>Money — prices, tariffs, invoices</td><td>the output is kWh, m³ and kW</td><td>your billing layer</td></tr>
+      <tr><td>Money — prices, Netzentgelte, Umlagen, invoices</td><td>the output is kWh, m³ and kW</td><td>your billing layer</td></tr>
       <tr><td>EDIFACT / XML market messages</td><td>parsing a MSCONS is not arithmetic</td><td><a href="https://github.com/hupe1980/mako">mako</a></td></tr>
       <tr><td>Fristen — counting Werktage to a deadline</td><td>a process-engine concern</td><td>your process engine</td></tr>
       <tr><td>SMGW certificates and device inventory</td><td>PKI and asset tracking, not quantities</td><td>your device management</td></tr>
-      <tr><td>Levy and subsidy apportionment (MiSpeL, §&nbsp;21 EnFG, §&nbsp;19 EEG)</td><td>the quantities exist to size a payment, and the rule is still a bracketed draft</td><td>your grid/settlement layer</td></tr>
     </tbody>
   </table>
 </section>

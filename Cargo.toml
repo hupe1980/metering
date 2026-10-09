@@ -1,65 +1,49 @@
 [package]
 name         = "metering"
 description  = "German energy metering quantities: DST-correct Europe/Berlin and 06:00-Gastag calendar arithmetic, exact decimal values, and the market's own code lists. Zero I/O, no async, no clock."
-version      = "0.24.0"
+version      = "0.25.0"
 authors      = ["hupe1980"]
 edition      = "2024"
 license      = "MIT OR Apache-2.0"
 repository   = "https://github.com/hupe1980/metering"
-rust-version = "1.94"
+# MSRV: the oldest rustc the whole suite passes on (CI `msrv` job; the justfile
+# and CI read this line). Floor: `let_chains` and `time` 0.3.47 both need 1.88.
+rust-version = "1.88"
 readme       = "README.md"
 keywords     = ["energy", "metering", "bdew", "mako", "msbg"]
 categories   = ["science", "data-structures"]
+homepage     = "https://hupe1980.github.io/metering"
+# The crate, its tests and the prose its doctests compile — no repo tooling.
+include      = ["/src/**", "/tests/**", "/examples/**", "/site/content/**", "/README.md", "/CHANGELOG.md", "/LICENSE-*"]
 
-# Lower bounds are the **oldest versions the whole test suite has been run
-# against**, not the oldest that happen to parse. A floor nothing checks is a
-# claim nothing checks: `rust_decimal = "1"` admitted 1.36, which has no
-# `macros` feature at all, and `time = "0.3"` admitted 0.3.0 while
-# `rust-toolchain.toml` stated in its own comment that the crate needs 0.3.47.
-# A consumer resolving minimal versions got a compile error naming a missing
-# item rather than a version requirement.
+# Lower bounds are the oldest versions the suite passes on; CI's
+# `minimal-versions` job checks them.
 [dependencies]
 rust_decimal = { version = "1.37", features = ["macros"] }
-# `serde` keeps its open `"1"`: a dev-dependency (`serde_json`) pins it above
-# anything this crate could pretend to have tested in isolation, so a narrower
-# floor here would be exactly the unverified claim the comment above objects to.
-serde        = { version = "1", features = ["derive"], optional = true }
+# `serde` 1.0.220: the first with `serde_core`, which `time/serde` needs.
+serde        = { version = "1.0.220", features = ["derive"], optional = true }
 thiserror    = "2"
 time         = { version = "0.3.47", features = ["std", "macros", "parsing", "formatting"] }
 time-tz      = { version = "2", features = ["db"] }
 
 [features]
 default = []
-# Enable no `rust_decimal` feature here. Cargo features are additive and global
-# to a build graph: `serde-str` would change how every `Decimal` in the
-# consumer's workspace deserialises, in crates that never named `metering`, and
-# `serde-float` set by anyone else would decide how this crate's quantities
-# serialise. `src/wire.rs` states the representation per field instead.
-#
-# `time/serde` sits here rather than in `[dependencies]`, so a build that did
-# not ask for serde does not compile `time`'s either.
+# No `rust_decimal` serde feature: features unify across the consumer's graph,
+# so `src/wire.rs` fixes the representation per field instead.
 serde   = ["dep:serde", "time/serde"]
 
-# Default features would hide every `serde` impl on docs.rs, including the wire
-# representation this crate covers by semver. The labels on gated items come
-# from `doc_auto_cfg`, automatic since Rust 1.92, so no rustdoc flag is needed.
+# All features, so docs.rs shows the `serde` impls (in semver scope).
 [package.metadata.docs.rs]
 all-features = true
 targets      = ["x86_64-unknown-linux-gnu"]
 
 [dev-dependencies]
-# `postcard` exercises `src/wire.rs` against a format that is neither
-# self-describing nor human-readable. A split on `is_human_readable` that
-# nothing tests is a split that rots.
-#
-# `default-features = false`: the default `heapless-cas` pulls `heapless` 0.7
-# and `atomic-polyfill`, unmaintained (RUSTSEC-2023-0089) and rejected by
-# `cargo audit --deny warnings`. `use-std` supplies `to_allocvec`/`from_bytes`.
+# `postcard` tests `src/wire.rs` on a non-self-describing, binary format.
+# No default features: `heapless-cas` pulls `atomic-polyfill` (RUSTSEC-2023-0089).
 postcard   = { version = "1", default-features = false, features = ["use-std"] }
-proptest   = "1"
-serde_json = "1"
-time       = { version = "0.3", features = ["macros"] }
+proptest   = "1.6"
+serde_json = "1.0.100"
+time       = { version = "0.3.47", features = ["macros"] }
 
-# Standalone crate — its own workspace root so `cargo` does not walk up to a
-# parent workspace when built in place.
+# Own workspace root, so cargo does not walk up to a parent workspace.
 [workspace]

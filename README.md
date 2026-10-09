@@ -1,343 +1,120 @@
-# ⚡ metering
+# metering
 
 [![Crates.io](https://img.shields.io/crates/v/metering.svg)](https://crates.io/crates/metering)
 [![Docs.rs](https://docs.rs/metering/badge.svg)](https://docs.rs/metering)
 [![CI](https://github.com/hupe1980/metering/actions/workflows/ci.yml/badge.svg)](https://github.com/hupe1980/metering/actions/workflows/ci.yml)
-[![MSRV](https://img.shields.io/badge/MSRV-1.94-blue.svg)](https://blog.rust-lang.org/)
-[![License](https://img.shields.io/crates/l/metering.svg)](#-license)
+[![MSRV](https://img.shields.io/badge/MSRV-1.88-blue.svg)](#install)
+[![License](https://img.shields.io/crates/l/metering.svg)](#contributing-and-license)
 
-**German energy metering domain library for Rust.** Europe/Berlin calendar
-arithmetic — Liefertag *and* Gastag — Zählerstandsgang → Lastgang, charging
-sessions and device logs onto the settlement grid, gas m³→kWh_Hs and the
-SigLinDe gas SLP, Ersatzwertbildung in the market's own code list, a robust
-validation engine, EN 50160, §14a Modul 3 tariff registers, Benutzungsstundenzahl
-and Blindmehrarbeit, conservation-checked allocation (§42b EnWG),
-Redispatch-2.0 Ausfallarbeit (BilAReM), check-digit-validated MaLo-IDs and EICs,
-and Jahresprognose.
+**The open, checkable reference for German energy-metering quantities, in Rust.**
+Every number traces to a published clause — MsbG, EnWG, EEG, HeizkostenV, the
+BNetzA Festlegungen, the EDI@Energy documents — and every quoted passage is
+checked against the PDF it comes from.
 
-> 🧊 **Zero I/O** · ⏱️ **no async** · 🕰️ **no clock** · 🔢 **exact decimal quantities**
+A pure library — no I/O, no async, no clock. Quantities are exact `Decimal`s,
+every rounding names its places and mode, and time is Europe/Berlin: a day of
+23, 24 or 25 hours, a Gastag from 06:00. It computes kWh, m³ and kW, not money.
 
-Four runtime dependencies — `rust_decimal`, `thiserror`, `time` and `time-tz`,
-whose `db` feature embeds the IANA tz database rather than reading one from
-disk — plus `serde` behind an optional feature. Nothing in the tree opens a
-file, a socket or a system entropy source. `time` *can* read the clock; this
-crate never calls it, and a CI lane greps to keep it that way.
+[Guides](https://hupe1980.github.io/metering) · [API reference](https://docs.rs/metering) · [Changelog](CHANGELOG.md)
 
-It computes **quantities, not money**: what leaves this crate is kWh, m³ and kW,
-which a billing layer then prices.
-
-📖 **[Documentation & guides](https://hupe1980.github.io/metering)** ·
-🦀 **[API reference](https://docs.rs/metering)**
-
----
-
-## 📦 Installation
+## Install
 
 ```bash
 cargo add metering
-
-# ...or with serde for every public type:
-cargo add metering --features serde
+cargo add metering --features serde   # wire formats for the inputs, codes and results
 ```
 
-**MSRV:** Rust `1.94` (edition 2024), pinned in
-[`rust-toolchain.toml`](rust-toolchain.toml) and verified by a CI lane.
+The `serde` feature enables `serde` and `time/serde`; see
+[Design](https://hupe1980.github.io/metering/docs/design/#serde) for the
+representation. **MSRV 1.88** (edition 2024), tested in CI; raising it is a
+minor-version bump while 0.x.
 
----
+## Quick start
 
-## 🚀 Quick start
+A day of quarter-hours with one value missing: validate, substitute, aggregate.
 
 ```rust
-use metering::{AggregationConfig, MeterInterval, ObisCode, aggregate};
-use rust_decimal::dec;
-use time::macros::datetime;
+use metering::prelude::*;
+use metering::time::holiday::Bundesland;
+use metering::vee::substitute::SubstitutionReason;
+use metering::vee::validation::Grade;
+use time::{Duration, macros::{date, datetime}};
 
-// One quarter-hour, measured, on the Bezug channel.
-let intervals = vec![
-    MeterInterval::quarter_hour(datetime!(2026-06-01 0:00 UTC), dec!(2.345))
-        .with_obis(ObisCode::STROM_BEZUG_TOTAL),
-];
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // The Liefertag 1 June 2026, 00:00 to 00:00 Europe/Berlin, as a UTC period.
+    let day = DayBoundary::Strom.day(date!(2026 - 06 - 01)).unwrap();
 
-let period = aggregate(&intervals, &AggregationConfig::rlm());
-println!("Arbeitsmenge:    {} kWh", period.arbeitsmenge);
-println!("Spitzenleistung: {:?} kW", period.spitzenleistung_kw);
-println!("...reached at:   {:?}", period.spitzenleistung_at);
-println!("Coverage:        {:.1} %", period.coverage_pct);
+    // 96 quarter-hours of 0.5 kWh, except slot 50, which never arrived.
+    let slots = (0..96)
+        .filter(|i| *i != 50)
+        .map(|i| {
+            let from = day.start() + Duration::minutes(15 * i);
+            MeterInterval::quarter_hour(from, dec!(0.5), QualityFlag::Measured)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let series = Series::new(Resolution::QUARTER_HOUR, DayBoundary::Strom, slots)?;
+
+    // Validate: the gap is an error finding, so the grade is C.
+    let rules = Rules::strom(day, datetime!(2026-07-01 0:00 UTC), None);
+    let report = validate(&series, &rules);
+    assert_eq!(report.grade(), Grade::C);
+
+    // Substitute: a gap up to 2 h is interpolated (STS+Z32 code Z92).
+    let policy = Policy::strom(Bundesland::Be, SubstitutionReason::CommunicationFailure);
+    let filled = substitute(&series, &report, &policy)?;
+    assert_eq!(filled.substitutes[0].code, Some("Z92"));
+
+    // Aggregate: Arbeitsmenge and Spitzenleistung of the billed day.
+    let period = aggregate(&filled.series, day)?;
+    assert_eq!(period.arbeitsmenge, dec!(48));
+    assert_eq!(period.spitzenleistung_kw, Some(dec!(2)));
+    Ok(())
+}
 ```
 
----
+[`examples/pipeline.rs`](examples/pipeline.rs) runs the whole chain — readings,
+validation, substitution, aggregation, tariff registers — on the 25-hour autumn
+day: `cargo run --example pipeline`.
 
-## 🗓️ Why this exists: a German day is not 24 hours
+## What's in it
 
-The single most consequential thing the crate gets right.
-
-| Day | Length | Quarter-hours |
+| Group | Modules | Guide |
 |---|---|---|
-| ordinary | 24 h | 96 |
-| last Sunday in March (spring forward) | **23 h** | **92** |
-| last Sunday in October (fall back) | **25 h** | **100** |
+| Series, time, IDs | `series` (intervals, `Series`, readings, resampling), `time` (`DayBoundary`, `Period`, holidays), `ids` (MaLo, MeLo, EIC, BDEW codes, OBIS) | [Time](https://hupe1980.github.io/metering/docs/time-and-calendar/) · [Series and readings](https://hupe1980.github.io/metering/docs/series-and-readings/) · [Identifiers](https://hupe1980.github.io/metering/docs/identifiers/) |
+| VEE | `vee` — validation, grading, Ersatzwertbildung with MSCONS codes | [Validation and substitution](https://hupe1980.github.io/metering/docs/validation-and-substitution/) |
+| Billing | `billing` — Arbeitsmenge, Spitzenleistung, tariff registers and § 14a Modul 3, Blindmehrarbeit, Mehr-/Mindermengen, losses, forecast | [Billing quantities](https://hupe1980.github.io/metering/docs/billing-quantities/) |
+| SLP | `slp` — BDEW SLP Strom, SigLinDe SLP Gas | [Gas and units](https://hupe1980.github.io/metering/docs/gas-and-units/) |
+| Gas | `gas` — m³ → kWh_Hs, Zustandszahl (DVGW G 685) | [Gas and units](https://hupe1980.github.io/metering/docs/gas-and-units/) |
+| Heat | `heat` — HeizkostenV § 6a, § 9, § 9a | [Heat](https://hupe1980.github.io/metering/docs/heat/) |
+| Grid | `grid` — § 14a EnWG, Redispatch Ausfallarbeit, EN 50160, rollout | [Grid](https://hupe1980.github.io/metering/docs/grid/) · [Power quality](https://hupe1980.github.io/metering/docs/power-quality/) |
+| Allocation | `allocation` — UTILTS Berechnungsformel, § 42b community, § 42c sharing, sessions | [Allocation](https://hupe1980.github.io/metering/docs/allocation/) |
+| EEG | `eeg` — MiSpeL (adopted 01.10.2026), EEG § 51/§ 51a, EnFG § 46 | [EEG and EnFG](https://hupe1980.github.io/metering/docs/eeg/) |
 
-```rust
-use metering::{IntervalResolution, calendar};
-use time::macros::{date, datetime};
-
-assert_eq!(calendar::intervals_in_day(date!(2026 - 03 - 29), IntervalResolution::QuarterHour), Some(92));
-assert_eq!(calendar::intervals_in_day(date!(2026 - 10 - 25), IntervalResolution::QuarterHour), Some(100));
-
-// March 2026 holds 2 972 quarter-hours, not 31 × 96 = 2 976.
-assert_eq!(calendar::intervals_in_month(date!(2026 - 03 - 01), IntervalResolution::QuarterHour), Some(2_972));
-
-// A German day starts at 23:00 UTC in winter, 22:00 UTC in summer.
-assert_eq!(calendar::day_start_utc(date!(2026 - 01 - 15)), datetime!(2026-01-14 23:00 UTC));
-assert_eq!(calendar::day_start_utc(date!(2026 - 07 - 15)), datetime!(2026-07-14 22:00 UTC));
-```
-
-A completeness check built on a hard-coded 96 raises a false alarm every spring
-and — worse — **hides a genuine four-interval gap every autumn**, because 96 of
-an expected 100 looks complete.
-
-### ...and gas does not start its day at midnight
-
-Gas balances on the **Gastag**, 06:00 to 06:00 local. That is the same day cut
-six hours later, not a different length — so it is a *boundary*, and
-`DayBoundary` carries it into the places a daily grid is actually built:
-
-```rust
-use metering::{MeterInterval, ResampleConfig, calendar, resample};
-use rust_decimal::dec;
-use time::{Duration, macros::date};
-
-let start = calendar::gas_day_start_utc(date!(2026 - 01 - 15));
-let series: Vec<MeterInterval> = (0..48)
-    .map(|i| MeterInterval::hour(start + Duration::hours(i), dec!(1)))
-    .collect();
-
-// Two whole Gastage...
-let gas_days = resample(&series, &ResampleConfig::to_gas_daily());
-assert_eq!(gas_days.len(), 2);
-assert_eq!(gas_days[0].is_complete(), Some(true));
-
-// ...where the calendar day makes three partial buckets out of the same data.
-let calendar_days = resample(
-    &series,
-    &ResampleConfig::new(metering::IntervalResolution::Hour, metering::IntervalResolution::Day),
-);
-assert_eq!(calendar_days.len(), 3);
-```
-
-→ [Time and the calendar](https://hupe1980.github.io/metering/docs/time-and-calendar/)
-
-### The whole pipeline, end to end
-
-```bash
-cargo run --example pipeline
-```
-
-[`examples/pipeline.rs`](examples/pipeline.rs) walks one Liefertag from the
-Zählerstandsgang the gateway delivered through to the §14a register split —
-differencing, validation, Ersatzwertbildung, aggregation and grading — on the
-25-hour autumn DST day, with a wrapped register and a corrupt reading planted in
-it. It asserts its own invariants, so CI runs it as a test.
-
----
-
-## 🧭 What's in it
-
-| Area | What it does | Guide |
-|---|---|---|
-| **Billing quantities** | Arbeitsmenge, Spitzenleistung with the interval it was reached in, the Benutzungsstundenzahl §17 StromNEV bands the Netzentgelt by, Blindmehrarbeit beyond the Freigrenze, and the import/export/undirected balance | [→](https://hupe1980.github.io/metering/docs/billing-quantities/) |
-| **Calendar** | Berlin days, months, years **and the 06:00 Gastag**; `DayBoundary` carries the choice into resampling and gap filling; DST-correct interval counts; Bundesland holidays | [→](https://hupe1980.github.io/metering/docs/time-and-calendar/) |
-| **Readings** | Zählerstandsgang → Lastgang, register rollover, meter exchange | [→](https://hupe1980.github.io/metering/docs/readings/) |
-| **Identifiers** | `MaloId` and `Eic` with their check characters verified at the parse; `MeloId` (= the Zählpunktbezeichnung); `BdewCode` Marktpartner-ID; the Regelzone read off a Bilanzierungsgebiet's EIC | [→](https://hupe1980.github.io/metering/docs/identifiers/) |
-| **Validation** | Order-independent rules V01–V12 (V10 retired), Hampel outlier test, A/B/C/F grading, and a `RuleSet` saying which rules actually ran; DST- and Gastag-aware daily lengths | [→](https://hupe1980.github.io/metering/docs/validation/) |
-| **Ersatzwerte** | Four methods, calendar-aware grid, the Vergleichstag matched on weekday or SLP day type, and the market's own 28 Ersatzwert reasons with their MSCONS codes | [→](https://hupe1980.github.io/metering/docs/substitute-values/) |
-| **Tariff registers** | HT/NT and §14a Modul 3 in one mechanism, plus a Modul 3 conformance check for curated DSO calendars | [→](https://hupe1980.github.io/metering/docs/tariff-registers/) |
-| **§14a steering** | `P_min,14a` with the published Gleichzeitigkeitsfaktor table, and the netzwirksamer Leistungsbezug | [→](https://hupe1980.github.io/metering/docs/paragraph-14a/) |
-| **Gas & units** | m³→kWh_Hs, the G 685-3 Zustandszahl and G 685 rounding, the SigLinDe gas SLP, exact-rational unit normalisation | [→](https://hupe1980.github.io/metering/docs/gas-and-units/) |
-| **Power quality** | EN 50160 as the statistical test it actually is; VDE-AR-N 4100 Unsymmetrieleistung | [→](https://hupe1980.github.io/metering/docs/power-quality/) |
-| **Virtual meters** | Sum, Residual, GGV allocation (§42b EnWG) — per tenant and per community, with the §42b Abs. 5 pool ceiling | [→](https://hupe1980.github.io/metering/docs/virtual-meters/) |
-| **Sessions & allocation** | A charging session or device log placed on the grid without losing a kWh, and several of them merged onto it; one pool split across many claims with the residual reported; the import/export balance of a bidirectional Zählpunkt | [→](https://hupe1980.github.io/metering/docs/sessions-and-allocation/) |
-| **End to end** | The full MSB pipeline as a runnable example | [→](https://hupe1980.github.io/metering/docs/pipeline/) |
-
----
-
-## 🎯 Scope
-
-This crate computes quantities. Four neighbouring concerns are deliberately
-**out of scope**, each with a better home:
+## Scope
 
 | Not here | Why | Where instead |
 |---|---|---|
-| Money — prices, tariffs, invoices | the output is kWh, m³ and kW | your billing layer |
-| EDIFACT / XML market messages | parsing a MSCONS is not arithmetic | [`mako`](https://github.com/hupe1980/mako) |
-| Fristen — counting Werktage to a deadline | a process-engine concern | your process engine |
+| Money — prices, Netzentgelte, Umlagen, invoices | the output is kWh, m³ and kW | your billing layer |
+| EDIFACT / XML market messages | parsing a MSCONS or UTILTS is not arithmetic | [`mako`](https://github.com/hupe1980/mako) |
+| Fristen — counting Werktage to a deadline | a process-engine concern; the holiday calendar here serves SLP day types and tariff registers | your process engine |
 | SMGW certificates, device inventory | PKI and asset tracking, not quantities | your device management |
-| Levy and subsidy apportionment (MiSpeL, §21 EnFG, §19 EEG) | the quantities exist to size a payment, and the rule is still a bracketed draft | your grid/settlement layer |
 
-Two of those need a word. The crate *does* carry a German statutory holiday
-calendar, because SLP day typing and tariff-register classification cannot be
-done without one — but it counts no business days, so **Fristen** stay out.
+The [regulatory basis](https://hupe1980.github.io/metering/docs/regulatory-basis/)
+lists every source and the version in force. Nothing here is legal advice.
 
-And **MiSpeL** apportions storage and bidirectional-charging flows so that
-Umlageprivilegien and Marktprämien can be computed on them. The arithmetic is
-quantity-shaped, but it is defined *by* the payment rules it feeds, and its
-Bekanntgabe is still written `[01.10.2026]` in square brackets with part of it
-waiting on EU state-aid approval.
-
----
-
-## 🧱 Design constraints
-
-- **Determinism.** No function reads the system clock, the filesystem or the
-  network. Where an instant is needed it is a parameter, so equal inputs give
-  equal outputs. CI enforces this with a grep over non-test code.
-- **Exact decimals for quantities, `f64` only for statistics.** The two meet in
-  one place — the outlier rule converts values to run the Hampel filter — and
-  nothing a float touches is written back into a quantity.
-- **"Exact" means no float, and one rounding at most.** Sums, differences and
-  products do not round, so the conservation laws hold to the digit. Division
-  makes a choice: a quotient a consumer stores is cut to a documented number of
-  places (`ALLOCATION_DP`, `SUBSTITUTE_DP`, `FORECAST_DP`, …), and every share
-  **multiplies before it divides**, because `a ÷ b × c` rounds first and then
-  scales the error up.
-- **The market's vocabulary, not a parallel one.** Where EDI@Energy publishes a
-  code list, the crate *is* that list: `SubstitutionReason` is the 28
-  Statusanlässe of `STS+Z40`, `SubstituteMethod::market_code` the
-  Ersatzwertbildungsverfahren of `STS+Z32` (which differ by commodity), and
-  `QualityFlag::market_code` the `QTY` qualifier. Where the market has no code,
-  the answer is `None` and the docs say why.
-- **One value, one string — and one meaning, one value.** `ObisCode` and
-  `IntervalResolution` each have exactly one canonical spelling, and two
-  distinct values can never mean the same thing: `IntervalResolution::Custom`
-  refuses a length that already has a name. Both held by a proptest suite.
-- **Every coded enum carries the whole contract** — `ALL`, `CODES`, `as_str`,
-  `Display`, `FromStr`, and a `serde` tag that *is* the code. Generate a
-  database `CHECK` constraint from `CODES` and it cannot drift from what the
-  crate writes; one test asserts all six properties for every one of them, and
-  another reads the source so a new enum cannot skip that list.
-- **A clean validation report says which rules ran.** Four of the eleven always
-  run; the other seven hang off six settings, and two of those — a reference
-  instant and a nameplate capacity — have no default, because they are facts
-  about the caller's world rather than about a series. So
-  `ValidationResult::evaluated` and `ValidationConfig::disabled_rules()` make
-  "found nothing" and "never looked" distinguishable.
-- **Order in, order out.** Every entry point that promises it gives the same
-  answer for a shuffled input, held by proptest. Order dependence shows only on
-  a **tie**, so the generator draws half its series from a coarse value grid
-  where ties are the norm.
-- **Nothing created, nothing lost.** A session total placed on the grid sums
-  back to itself; a pool split across claims satisfies
-  `Σ allocated + residual = total`. Both identities are theorems rather than
-  checks — the cut lands on the *cumulative*, so the slot differences telescope
-  — and proptests hold them.
-- **A rule with an end date carries the date.** § 17 StromNEV lapses on
-  31.12.2028 and the Redispatch Pauschal-Abrechnung with it; both are constants
-  the affected functions point at, so a 2029 settlement run can assert rather
-  than remember.
-- **Where a source supplies a default, the crate has it; where it does not, the
-  crate takes an argument.** § 42b Abs. 5 Satz 3 divides *zu gleichen Teilen* in
-  case of doubt, so `AllocationKey::EqualShares` exists. § 42c Abs. 3 Nr. 2 says
-  nothing about a key's shape, so the other keys are offered as arithmetic and
-  say on the type that they cite nothing.
-- **No second copy of a fact.** A register's unit comes from its OBIS code, a
-  meter exchange's date from its instant, an interval's direction from OBIS
-  value group C. Where a fact genuinely *is* stated twice, the disagreement is
-  reportable (`direction_conflict`) rather than resolved in silence.
-- **Serde tags are semver-covered**, pinned literally by a test. Instants are
-  RFC 3339 and dates ISO 8601 in JSON, `time`'s compact tuple in binary formats;
-  quantities are exact decimal strings everywhere, written per field rather than
-  inherited from a `rust_decimal` feature — so enabling `metering/serde` cannot
-  change how a `Decimal` behaves in a crate that never named this one.
-- **Domain enums are exhaustive**; only error enums are `#[non_exhaustive]`.
-- **Unknown is not good.** Where a quantity cannot be determined the API says
-  so — an `Option`, or an error — rather than a benign-looking default: a
-  dynamisation factor for day 400, a peak across mixed resolutions, a market
-  code the market does not have. Constructors are named for what they claim
-  (`MeterInterval::measured`), so nothing acquires a quality by omission.
-
-→ [Design constraints](https://hupe1980.github.io/metering/docs/design/)
-
----
-
-## ⚖️ Regulatory basis
-
-Every provision is quoted from the published text and dated, and the library is
-explicit about the claims it *cannot* verify — the 2025 SLP dynamisation
-function is published as an image, G 685's final rounding diverges between
-Netzbetreiber, VDE-AR-N 4400 is paywalled, and no national rule fixes the
-Blindarbeit Freigrenze. Those are parameters, not constants.
-
-The quotes are checked mechanically, not by recollection: `just quotes` matches
-every German passage in the source, the site and this README against the PDFs
-`just specs` fetches. Sixty-five of sixty-six verify character for character; the
-one that cannot is a label inside a figure.
-
-→ [Regulatory basis](https://hupe1980.github.io/metering/docs/regulatory-basis/)
-
-Nothing here is legal advice.
-
----
-
-## 🧪 Testing
+## Testing
 
 ```bash
-just ci     # everything CI runs, in CI order
-just test   # cargo test --all-features
-just purity # no clock, no I/O, no unsafe outside comments
-just specs  # fetch the primary sources every citation is checked against
-just quotes # check every German quote in src/, site/ and README against the PDFs
-just site   # serve the documentation site locally
+just ci          # the CI gate: fmt, clippy, purity, tests, docs, example, package, deny
+just references  # fetch the primary sources the citations are checked against
+just quotes      # check every quoted German passage against those PDFs
 ```
 
-Beyond the unit tests:
+The Rust blocks in this README and on the guide pages run as doctests.
+`just quotes` needs `pdftotext` and the fetched corpus; it is not a CI job.
 
-- `tests/code_contract.rs` — every coded enum, six properties each: `ALL` vs
-  `CODES`, `as_str` is `Display`, `FromStr` inverts it, codes are distinct, the
-  `serde` tag *is* the code, and an unknown code is an error — plus a scan of
-  the crate source so a new enum cannot quietly skip the list
-- `tests/berlin_calendar.rs` — DST interval counts against the tz database, and
-  proptest over 1996–2065: days tile on both boundaries, a coarse interval count
-  is the sum of the fine ones, stepping back `n` days and counting forward
-  returns `n`
-- `tests/string_canonicalisation.rs` — proptest: stability, totality,
-  idempotence, injectivity of every string form
-- `tests/serde_representation.rs` — every wire tag pinned literally, plus
-  source scans holding that no timestamp or quantity field escapes the wire
-  format and that the manifest enables no `rust_decimal/serde*` feature
-- `tests/proptest_validation.rs` — validation invariants under random input
-- `tests/order_independence.rs` — proptest: a shuffled series gives an
-  identical result from every entry point that promises one
-- `tests/allocation_invariants.rs` — proptest: the §42b/§42c allocation
-  identities, and the §42b Abs. 5 pool ceiling, over generated communities
-- `tests/quantity_invariants.rs` — proptest: the conservation laws and bounds
-  of every arithmetic module — differencing, resampling, gap filling, the
-  register split, the Jahresprognose, unit and gas conversion, the gas SLP,
-  Mehr-/Mindermengen, §14a and EN 50160
-- `tests/regulatory_showcase.rs` — worked examples from the published sources
-- **every code block in this README and on the documentation site**, compiled
-  and run as a doctest — the pages are `include_str!`'d into a `#[cfg(doctest)]`
-  module, so every published block is covered rather than only the ones somebody
-  copied into a mirror
-- `tests/arithmetic_conventions.rs` — source scans: no quotient is used as a
-  factor, and every rounding width is a named constant
-- `tests/doc_conventions.rs` — no item doc over 60 lines, and no changelog
-  prose in a reference doc
-- `tests/scale.rs` — a settlement year and a minute-sampled day through the
-  pipeline: a smoke alarm for accidental quadratic behaviour, not a benchmark
-- `scripts/verify_quotes.py` — every quoted passage against the published PDF
-  (`just quotes`; not a CI lane, because the corpus is not in the repository)
+## Contributing and license
 
----
-
-## 🤝 Contributing
-
-Issues and pull requests welcome. A change that touches a regulated calculation
-should cite the provision it implements — and if a citation here is wrong,
-saying so is the most valuable issue you can file.
-
----
-
-## 📄 License
-
-Licensed under either of [Apache-2.0](LICENSE-APACHE) or [MIT](LICENSE-MIT) at
-your option.
+Issues and pull requests welcome; a change to a regulated calculation cites the
+provision it implements. Licensed under [Apache-2.0](LICENSE-APACHE) or
+[MIT](LICENSE-MIT) at your option.

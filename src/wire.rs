@@ -5,19 +5,13 @@
 //! | JSON, YAML, TOML | `"2026-06-01T12:00:00Z"` — **RFC 3339** | `"2026-06-01"` — **ISO 8601** | `"12.345"` — the exact decimal string |
 //! | bincode, postcard, MessagePack | `time`'s compact tuple | as above | as above |
 //!
-//! Instants and dates split on `is_human_readable`: the readable form is what a
-//! `TIMESTAMPTZ` cast and a JSON Schema `format: date-time` understand, and the
-//! binary one keeps `time`'s nine-integer packing, which matters because
-//! [`MeterInterval`](crate::MeterInterval) carries two instants and is the
-//! hottest type here. `time`'s own `serde-human-readable` feature splits the
-//! same way but writes `2026-06-01 12:00:00.0 +00:00:00`, which is not RFC 3339.
+//! Instants and dates split on `is_human_readable`; `time`'s own
+//! `serde-human-readable` is not RFC 3339. A quantity does not split — see
+//! [`decimal`].
 //!
-//! A quantity does not split — see [`decimal`].
-//!
-//! **Every field states its representation.** Nothing here relies on an
-//! inherited impl for a timestamp or a quantity, which is what makes the format
-//! a property of this crate rather than of whichever features happened to
-//! unify. Two scans in `tests/serde_representation.rs` fail if a field forgets.
+//! Every timestamp and quantity field names one of these modules rather than
+//! inheriting an impl whose format depends on feature unification;
+//! `tests/it/scanners/serde_wire.rs` enforces it.
 
 #![cfg(feature = "serde")]
 
@@ -50,9 +44,6 @@ pub(crate) mod rfc3339 {
 }
 
 /// [`rfc3339`] for an optional instant.
-///
-/// A separate module because `serde(with)` is applied to the field's own type,
-/// and `Option<OffsetDateTime>` is a different type from `OffsetDateTime`.
 pub(crate) mod rfc3339_option {
     use serde::{Deserialize, Deserializer, Serializer};
     use time::OffsetDateTime;
@@ -85,20 +76,13 @@ pub(crate) mod rfc3339_option {
 
 /// Calendar dates as ISO 8601 (`2026-06-01`) in a human-readable format,
 /// compact otherwise.
-///
-/// The German market's validity bounds — a Zählzeitdefinition's year, a
-/// measurement point's `valid_from` — are calendar dates in local time rather
-/// than instants, and travel as dates.
 pub(crate) mod iso_date {
     use serde::{Deserialize, Deserializer, Serialize, Serializer, de, ser};
     use time::Date;
     use time::format_description::BorrowedFormatItem;
 
-    /// `YYYY-MM-DD`, and nothing else.
-    ///
-    /// Spelled out rather than reached for through `Iso8601`, whose default
-    /// configuration formats time components — which a [`Date`] does not have,
-    /// and which fails at compile time if you ask it to.
+    /// `YYYY-MM-DD`; `Iso8601`'s default configuration would format time
+    /// components a [`Date`] does not have.
     const FORMAT: &[BorrowedFormatItem<'_>] =
         time::macros::format_description!("[year]-[month]-[day]");
 
@@ -153,20 +137,14 @@ pub(crate) mod iso_date_option {
 
 /// Quantities as their exact decimal string, in **every** format.
 ///
-/// No `is_human_readable` split: a decimal string is also the compact form
-/// (`"0.25"` is five postcard bytes against sixteen for a packed mantissa).
-///
-/// Reading asks for a **string** — so a JSON number is a type error rather than
-/// a silent trip through `f64`, and `deserialize_any`, the one question
-/// postcard and bincode cannot answer, is never asked — and parses with
+/// Reading asks for a string, so a JSON number is a type error rather than a
+/// trip through `f64`, and parses with
 /// [`from_str_exact`](rust_decimal::Decimal::from_str_exact), so excess digits
-/// are refused rather than rounded away.
+/// are refused rather than rounded.
 ///
-/// **Do not replace this with `rust_decimal`'s own `serde` modules.** Reaching
-/// for them means enabling one of its features, and Cargo features are global
-/// to a build graph: `serde-str` would change how every `Decimal` in the
-/// consumer's workspace deserialises, and `serde-float` set by any crate in
-/// that graph would decide how these quantities serialise.
+/// Not `rust_decimal`'s `serde` features: Cargo features unify across the
+/// build graph, so `serde-str`/`serde-float` set anywhere would change these
+/// quantities' format.
 pub(crate) mod decimal {
     use core::fmt;
     use rust_decimal::Decimal;
@@ -176,11 +154,8 @@ pub(crate) mod decimal {
         value: &Decimal,
         serializer: S,
     ) -> Result<S::Ok, S::Error> {
-        // `collect_str` rather than `serialize_str(&value.to_string())`: it
-        // hands the serialiser the `Display` impl and lets it decide how to
-        // render it. `serde_json` writes the digits straight into its output
-        // buffer; a format that needs the byte length up front finds it its own
-        // way, rather than paying for an allocation this crate imposed.
+        // `collect_str` lets the serialiser render `Display` without an
+        // intermediate `String`.
         serializer.collect_str(value)
     }
 
@@ -205,12 +180,8 @@ pub(crate) mod decimal {
         }
     }
 
-    /// Carries the field-level representation through a container's own impls.
-    ///
-    /// `serde(with)` names functions over the field's exact type, and
-    /// `Vec<Decimal>` is not `Decimal`. A transparent newtype is what the
-    /// sequence, array and map modules below hand to `serde`'s own container
-    /// impls so that the element representation stays this one.
+    /// Carries this representation through `serde`'s container impls (the
+    /// option, sequence, array and map modules below).
     #[derive(serde::Serialize, serde::Deserialize)]
     #[serde(transparent)]
     pub(super) struct Dec(#[serde(with = "self")] pub(super) Decimal);
@@ -243,7 +214,7 @@ pub(crate) mod decimal_option {
     }
 }
 
-/// [`decimal`] for a sequence of quantities — a day's profile values.
+/// [`decimal`] for a sequence of quantities.
 pub(crate) mod decimal_vec {
     use super::decimal::Dec;
     use rust_decimal::Decimal;
@@ -266,8 +237,7 @@ pub(crate) mod decimal_vec {
     }
 }
 
-/// [`decimal`] for a fixed-length array of quantities — the seven weekday
-/// factors of a gas SLP.
+/// [`decimal`] for a fixed-length array of quantities.
 pub(crate) mod decimal_array {
     use super::decimal::Dec;
     use core::fmt;
@@ -275,10 +245,8 @@ pub(crate) mod decimal_array {
     use serde::ser::SerializeTuple;
     use serde::{Deserializer, Serializer, de};
 
-    // A fixed-length array is a **tuple** to `serde`, not a sequence: that is
-    // how `[T; N]`'s own impls spell it, and it is what lets a binary format
-    // leave out the length it already knows. Both halves here must agree, or
-    // postcard writes a count that the reader does not expect.
+    // A tuple, as `[T; N]`'s own impls spell it, so a binary format omits the
+    // length; both halves must agree or postcard misreads the count.
     pub(crate) fn serialize<S: Serializer, const N: usize>(
         values: &[Decimal; N],
         serializer: S,
@@ -318,25 +286,24 @@ pub(crate) mod decimal_array {
     }
 }
 
-/// [`decimal`] for a map of quantities — an allocation key's per-participant
-/// fractions.
+/// [`decimal`] for a map of quantities.
 pub(crate) mod decimal_map {
     use super::decimal::Dec;
     use rust_decimal::Decimal;
-    use serde::{Deserialize, Deserializer, Serializer};
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
     use std::collections::BTreeMap;
 
-    pub(crate) fn serialize<S: Serializer>(
-        values: &BTreeMap<String, Decimal>,
+    pub(crate) fn serialize<K: Serialize, S: Serializer>(
+        values: &BTreeMap<K, Decimal>,
         serializer: S,
     ) -> Result<S::Ok, S::Error> {
         serializer.collect_map(values.iter().map(|(key, &q)| (key, Dec(q))))
     }
 
-    pub(crate) fn deserialize<'de, D: Deserializer<'de>>(
+    pub(crate) fn deserialize<'de, K: Deserialize<'de> + Ord, D: Deserializer<'de>>(
         deserializer: D,
-    ) -> Result<BTreeMap<String, Decimal>, D::Error> {
-        Ok(BTreeMap::<String, Dec>::deserialize(deserializer)?
+    ) -> Result<BTreeMap<K, Decimal>, D::Error> {
+        Ok(BTreeMap::<K, Dec>::deserialize(deserializer)?
             .into_iter()
             .map(|(key, d)| (key, d.0))
             .collect())

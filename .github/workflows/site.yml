@@ -9,8 +9,7 @@ on:
     paths: ["site/**", ".github/workflows/site.yml"]
   workflow_dispatch:
 
-# Allow one concurrent deployment; let an in-flight run finish so a published
-# page is never half-written.
+# One deployment at a time; an in-flight run finishes.
 concurrency:
   group: pages
   cancel-in-progress: false
@@ -26,21 +25,21 @@ jobs:
     name: 🌐 build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: install zola
         run: |
           curl -sSL "https://github.com/getzola/zola/releases/download/v${ZOLA_VERSION}/zola-v${ZOLA_VERSION}-x86_64-unknown-linux-gnu.tar.gz" \
             | tar xz -C /usr/local/bin zola
-      # `check` validates every internal link and anchor; a 404 in the docs is a
-      # build failure, not something a reader discovers.
+      # Every internal link and anchor must resolve.
       - name: check links
         run: zola --root site check
-      # No `--output-dir`: it resolves against the working directory, not
-      # `--root`, so passing one writes to ./public while the upload below looks
-      # in site/public. The default is <root>/public, which is what we want.
+      # No `--output-dir`: it resolves against the cwd, not `--root`; the
+      # default site/public is what the upload reads.
       - name: build
         run: zola --root site build --force
-      - uses: actions/upload-pages-artifact@v3
+      - uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa # v3.0.1
         with:
           path: site/public
 
@@ -57,4 +56,4 @@ jobs:
       url: ${{ steps.deploy.outputs.page_url }}
     steps:
       - id: deploy
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4.0.5

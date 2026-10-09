@@ -1,184 +1,139 @@
 +++
 title = "Billing quantities"
-description = "Arbeitsmenge, Spitzenleistung and the two figures a network invoice is actually built from: the Benutzungsstundenzahl that picks the tariff band, and the Blindmehrarbeit beyond the Freigrenze."
-weight = 4
+description = "Arbeitsmenge, Spitzenleistung and Benutzungsstundenzahl; tariff registers and § 14a Modul 3; Blindmehrarbeit, Mehr-/Mindermengen, network losses and the annual forecast."
+weight = 7
+aliases = ["/docs/tariff-registers/"]
+[extra]
+group = "Tasks"
 +++
 
-A Netznutzungsabrechnung for an RLM Entnahmestelle rests on four numbers, and
-all four are quantities rather than prices. This crate computes them; what they
-cost is the Preisblatt's business.
+Quantities only — kWh, kW, kvarh, hours; prices are the Preisblatt's.
 
-| Quantity | Where it comes from | Basis |
-|---|---|---|
-| **Arbeitsmenge** (kWh) | the sum of the billable intervals | § 17 Abs. 2 StromNEV |
-| **Jahreshöchstleistung** (kW) | the highest average power over any one interval | § 17 Abs. 2 StromNEV |
-| **Benutzungsstundenzahl** (h) | Arbeitsmenge ÷ Jahreshöchstleistung | § 17 Abs. 1 StromNEV |
-| **Blindmehrarbeit** (kvarh) | the reactive energy beyond the Freigrenze | the Netzbetreiber's Preisblatt |
+## Arbeitsmenge and Spitzenleistung
 
-## Arbeit and Leistung
+`aggregate(&series, period)` sums the **billable** intervals in the period and
+takes the Spitzenleistung as the highest average power of one of them,
+`kWh × 3600 ÷ s` — the Jahreshöchstleistung of § 17 Abs. 2 StromNEV. On a grid
+coarser than an hour or a non-energy channel it is `None`.
 
 ```rust
-use metering::{AggregationConfig, MeterInterval, aggregate};
+use metering::prelude::*;
+use time::{Duration, macros::date};
+
+let day = DayBoundary::Strom.day(date!(2026 - 06 - 01)).unwrap();
+// The evening's last six hours never arrived.
+let slots = (0..72)
+    .map(|i| MeterInterval::quarter_hour(day.start() + Duration::minutes(15 * i), dec!(0.5), QualityFlag::Measured))
+    .collect::<Result<Vec<_>, _>>().unwrap();
+let series = Series::new(Resolution::QUARTER_HOUR, DayBoundary::Strom, slots).unwrap();
+
+let period = aggregate(&series, day).unwrap();
+assert_eq!(period.arbeitsmenge, dec!(36));
+assert_eq!(period.spitzenleistung_kw, Some(dec!(2)));
+assert_eq!(period.spitzenleistung_at, Some(day.start()));
+assert_eq!(period.coverage.pct(), Some(dec!(75))); // of the declared day
+```
+
+Coverage is against the **declared** period. Import and export are two
+channels, so two calls; `sum_by_direction` balances intervals by the direction
+their OBIS code names.
+
+**Benutzungsstundenzahl** — `BillingPeriod::benutzungsdauer_h()`, Arbeitsmenge
+÷ Spitzenleistung, cut to `BENUTZUNGSDAUER_DP` (§ 17 Abs. 1 StromNEV, Anlage
+4). StromNEV expires on 31.12.2028 (`STROMNEV_AUSSERKRAFT`); nothing gates on
+the date.
+
+## Tariff registers
+
+A `Zaehlzeitdefinition` is ordered windows over months × day group × **local**
+time band, each naming a register, with a fallback — the Zweitarif, § 14a
+Modul 3, or any definition transmitted over UTILTS. `in_land` books the Land's
+holidays as Sundays.
+
+### § 14a Modul 3 {#modul-3}
+
+HT, NT and ST, mandatory for every Netzbetreiber from 1 April 2025 (BNetzA
+BK8-22/010-A). HT/NT may be restricted to single quarters (BDEW AWH Modul 3
+v1.1, § 2: *"Der Netzbetreiber hat das Wahlrecht, den Gültigkeitszeitraum auf
+einzelne Quartale zu beschränken"*); outside them everything books into ST.
+
+```rust
+use metering::billing::zaehlzeit::{
+    HT, NT, ST, Modul3Conformance, Modul3Context, Quarter, Zaehlzeitdefinition, assess_modul_3,
+};
+use metering::time::holiday::Bundesland;
+use time::macros::{date, datetime};
+
+let zzd = Zaehlzeitdefinition::modul_3(
+    "NB-14A-3",
+    date!(2026 - 01 - 01),
+    (17 * 60, 20 * 60), // HT 17:00–20:00 local
+    (22 * 60, 6 * 60),  // NT 22:00–06:00, across midnight
+    &[Quarter::Q1, Quarter::Q4],
+)
+.unwrap()
+.in_land(Bundesland::Nw)
+.until(date!(2026 - 12 - 31));
+
+assert_eq!(zzd.register_for(datetime!(2026-01-05 17:00 UTC)), Some(HT)); // 18:00 MEZ
+assert_eq!(zzd.register_for(datetime!(2026-01-05 2:00 UTC)), Some(NT));
+assert_eq!(zzd.register_for(datetime!(2026-07-06 16:00 UTC)), Some(ST)); // Q3
+
+let assessment = assess_modul_3(&zzd, &Modul3Context::new().at_a_conforming_delivery_point());
+assert_eq!(assessment.verdict, Modul3Conformance::Conforms);
+```
+
+`assess_modul_3` checks the AWH rules — three reachable registers covering
+every instant, HT ≥ 2 h on every day class, identical windows across whole
+billed quarters, at least two, one calendar year — and the `Modul3Context`
+preconditions (Modul 1, iMSys, no RLM). An unstated precondition is `Unknown`.
+Price corridors and the publication deadline are not checked.
+
+### Splitting energy
+
+`split_energy` books each billable interval into its register;
+`Σ per_register + Σ straddling + Σ unassigned` is the billable energy exactly.
+An interval across a band boundary is `straddling`.
+
+```rust
+use metering::billing::zaehlzeit::{HT, Zaehlzeitdefinition};
+use metering::{MeterInterval, QualityFlag};
 use rust_decimal::dec;
-use time::{Duration, macros::datetime};
+use time::macros::{date, datetime};
 
-// A flat 4 kW draw for one day.
-let day: Vec<MeterInterval> = (0..96)
-    .map(|i| MeterInterval::quarter_hour(
-        datetime!(2026-06-01 0:00 UTC) + Duration::minutes(15 * i),
-        dec!(1),
-    ))
-    .collect();
+let zzd = Zaehlzeitdefinition::ht_nt("NB-1", date!(2026 - 01 - 01), 6 * 60, 22 * 60).unwrap();
+let midday = MeterInterval::quarter_hour(datetime!(2026-01-05 9:00 UTC), dec!(3), QualityFlag::Measured).unwrap();
+// An hour across 06:00 local holds both registers.
+let across = MeterInterval::hour(datetime!(2026-01-05 4:30 UTC), dec!(1), QualityFlag::Measured).unwrap();
 
-let period = aggregate(&day, &AggregationConfig::rlm());
-assert_eq!(period.arbeitsmenge, dec!(96));
-assert_eq!(period.spitzenleistung_kw, Some(dec!(4)));      // 1 kWh per quarter-hour
-assert_eq!(period.spitzenleistung_at, Some(datetime!(2026-06-01 0:00 UTC)));
+let split = zzd.split_energy(&[midday, across]).unwrap();
+assert_eq!(split.per_register[HT], dec!(3));
+assert_eq!(split.straddling.len(), 1);
+assert!(!split.is_complete());
 ```
-
-The peak is reported **with the interval it was first reached in** — the
-Leistungspreis is the most disputed line on an RLM invoice, and "48 kW" does not
-answer *when*.
-
-## One resolution, or none
-
-An average power over an hour is not comparable with one over a quarter-hour:
-the hour has already averaged away the peak the quarter-hour would show. A
-maximum taken across a series that mixes the two is a Spitzenleistung of
-nothing.
-
-```rust
-# use metering::{AggregationConfig, MeterInterval, aggregate};
-# use rust_decimal::dec;
-# use time::macros::datetime;
-let quarter = MeterInterval::quarter_hour(datetime!(2026-06-01 0:00 UTC), dec!(1));
-let hour = MeterInterval::hour(datetime!(2026-06-01 0:15 UTC), dec!(2));
-
-let mixed = aggregate(&[quarter, hour], &AggregationConfig::rlm());
-assert!(!mixed.uniform_resolution);
-assert_eq!(mixed.spitzenleistung_kw, Some(dec!(4)));
-```
-
-The crate does not guess which resolution was meant, and it does not drop the
-answer either. `uniform_resolution` is `false`, which makes the peak an upper
-bound the caller can qualify, refuse, or resample away.
-
-## Coverage reports both of its operands
-
-`coverage_pct` is `covered_secs ÷ period_secs`, clamped to 100 — and the clamp
-is why both operands are on the result. `covered_secs` is a **sum** of billable
-interval lengths, not a merge: `aggregate` makes a single unordered pass and
-merging overlaps would need a sort. A series that overlaps itself therefore
-reaches 100 % with a genuine hole in it, and only the raw seconds show that.
-
-```rust
-# use metering::{AggregationConfig, MeterInterval, aggregate};
-# use rust_decimal::dec;
-# use time::{Duration, macros::datetime};
-let from = datetime!(2026-06-01 0:00 UTC);
-// The same quarter-hour twice, against a declared half-hour.
-let doubled = [
-    MeterInterval::quarter_hour(from, dec!(1)),
-    MeterInterval::quarter_hour(from, dec!(1)),
-];
-let period = aggregate(
-    &doubled,
-    &AggregationConfig::rlm().over_period(from, from + Duration::minutes(30)),
-);
-
-assert_eq!(period.coverage_pct, 100.0);   // the clamp
-assert_eq!(period.covered_secs, 1800);    // ...over 900 real seconds
-assert_eq!(period.period_secs, 1800);
-assert!(!period.coverage_overcounts());   // equal here; V02 names the overlap
-```
-
-`coverage_overcounts()` is `true` once the sum exceeds the period. Either way
-the overlap itself is V02's finding — run `validate_intervals` and look there.
-
-## Benutzungsstundenzahl
-
-§ 17 Abs. 1 StromNEV makes the Netzentgelt depend on *"der jeweiligen
-Benutzungsstundenzahl der Entnahmestelle"*, and Anlage 4 zu § 17 Abs. 2 builds
-the Gleichzeitigkeitsgrad on the Jahresbenutzungsdauer, its two straight lines
-meeting *"durch die Jahresbenutzungsdauer 2 500 Stunden"* and reaching 1 at
-8 760 Stunden. It is the figure a price sheet's two tariff bands are separated
-by — and it is a ratio of two quantities, so it lives here:
-
-```rust
-# use metering::{AggregationConfig, MeterInterval, aggregate};
-# use rust_decimal::dec;
-# use time::{Duration, macros::datetime};
-# let day: Vec<MeterInterval> = (0..96).map(|i| MeterInterval::quarter_hour(
-#     datetime!(2026-06-01 0:00 UTC) + Duration::minutes(15 * i), dec!(1))).collect();
-let period = aggregate(&day, &AggregationConfig::rlm());
-
-// A flat load uses every hour of its own period.
-assert_eq!(period.benutzungsdauer_h(), Some(dec!(24)));
-```
-
-`None` when there is no peak to divide by. The 2 500 h threshold is stated for a
-**year**; over a month the same arithmetic answers a different question.
 
 ## Blindmehrarbeit
 
-A Netznutzer draws real energy (kWh) and reactive energy (kvarh). The reactive
-part performs no work but loads the network, so the Netzbetreiber grants a
-Freigrenze proportional to the Wirkarbeit and charges only the excess:
-
-```text
-Blindmehrarbeit = max(0, Blindarbeit − ratio × Wirkarbeit)
-```
-
-**The ratio is the Netzbetreiber's.** No national rule fixes it, and published
-Preisblätter state it two ways: as *50 % der Wirkarbeit* (a `cos φ` of about
-0,894), or as `cos φ = 0,9`, which is the slightly stricter 0,4843. Both are
-offered, neither is presumed:
+`Blindmehrarbeit = max(0, Blindarbeit − ratio × Wirkarbeit)`. The ratio is the
+Netzbetreiber's (§ 17 Abs. 1 StromNEV); `ReactiveLimit::HALF` and
+`COS_PHI_0_9` are the published practice, neither a default.
 
 ```rust
-use metering::reactive::{ReactiveLimit, blindmehrarbeit};
+use metering::billing::reactive::{ReactiveBalance, ReactiveLimit};
 use rust_decimal::dec;
 
-let balance = blindmehrarbeit(dec!(100000), dec!(62000), ReactiveLimit::half());
-assert_eq!(balance.freigrenze_kvarh, dec!(50000.0));
-assert_eq!(balance.blindmehrarbeit_kvarh, dec!(12000.0));
+let b = ReactiveBalance::new(dec!(100000), dec!(62000), ReactiveLimit::HALF).unwrap();
+assert_eq!(b.blindmehrarbeit_kvarh(), dec!(12000.0));
 
-// The same registers under cos φ = 0,9 admit less, so more is charged.
-let strict = blindmehrarbeit(dec!(100000), dec!(62000), ReactiveLimit::cos_phi_0_9());
-assert_eq!(strict.blindmehrarbeit_kvarh, dec!(13570.0000));
-
-// What is left of the allowance — the figure a compensation is sized against.
-let compensated = blindmehrarbeit(dec!(100000), dec!(20000), ReactiveLimit::half());
-assert_eq!(compensated.headroom_kvarh(), dec!(30000.0));
+let strict = ReactiveBalance::new(dec!(100000), dec!(62000), ReactiveLimit::COS_PHI_0_9).unwrap();
+assert_eq!(strict.blindmehrarbeit_kvarh(), dec!(13570.0000));
 ```
 
-The conversion `ratio = tan(arccos(cos φ)) = √(1 − cos²φ) ÷ cos φ` is *stated*
-rather than computed: a square root has no exact decimal, and no float touches a
-number that multiplies a billed quantity. `RATIO_COS_PHI_0_9` is documented as
-the four-place rounding it is.
+## Mehr-/Mindermengen, losses, forecast
 
-One product and one difference, so the balance reconstructs digit for digit from
-the two register totals it was given.
-
-## Import, export, and what has neither
-
-A bidirectional Zählpunkt delivers a Bezug *and* an Einspeisung series for the
-same quarter-hour. `sum_by_direction` reads the direction off OBIS value group C
-and returns three buckets, not two:
-
-```rust
-use metering::{MeterInterval, aggregation::sum_by_direction};
-use rust_decimal::dec;
-use time::macros::datetime;
-
-let iv = |code: &str, kwh| MeterInterval::quarter_hour(datetime!(2026-06-01 12:00 UTC), kwh)
-    .with_obis(code.parse().unwrap());
-
-let balance = sum_by_direction(&[iv("1-0:1.8.0", dec!(9)), iv("1-0:2.8.0", dec!(4))]);
-assert_eq!(balance.net(), dec!(5));
-assert_eq!(balance.total(), dec!(13));
-```
-
-The third bucket, `undirected`, holds everything whose code has no direction to
-read — a reactive register, a gas volume, an interval with no code at all — so
-`import + export + undirected` is always the plain sum of the input and no
-energy disappears between the call and the result.
+| Item | Computes | Basis |
+|---|---|---|
+| `ImbalanceSaldo` | metered − **bilanzierte** energy, annual; a Mehrmenge is credited, a Mindermenge invoiced (Netzbetreiber's side) | GPKE (BK6-24-174) Kap. 8.4; GaBi Gas 2.1 Tenorziffer 3a |
+| `NetworkLosses` | Σ Einspeisung − Σ Entnahme over a grid area; an indicator, not a settlement quantity | § 22 Abs. 1 EnWG |
+| `project_annual_consumption`, `project_annual_slp` | a year from a partial one, by daily rate (optionally prior-year shaped) or SLP-weighted; a missing slot lowers coverage, not the rate | — |
+| `wape`, `mase`, `annual_energy_error` | forecast accuracy against metered values; no prediction interval | — |

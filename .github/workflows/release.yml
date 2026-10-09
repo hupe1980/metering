@@ -1,9 +1,14 @@
 name: Release
 
 # A tag `vX.Y.Z` matching Cargo.toml publishes to crates.io via trusted
-# publishing (OIDC, no registry secret), attests provenance for the uploaded
-# .crate, and attaches it and a CycloneDX SBOM to the GitHub release.
-# Dispatching on a branch runs `verify` only.
+# publishing (OIDC, no registry secret), attests provenance for the published
+# .crate — downloaded back from crates.io and checked against the registry's
+# SHA-256, so the attestation covers the bytes consumers get — and attaches it
+# and a CycloneDX SBOM to the GitHub release.
+#
+# Manual dispatch with `tag` finishes a release for an existing tag: it builds
+# from that tag and skips the upload when the version is already on crates.io.
+# Dispatch without `tag` runs `verify` only.
 #
 # crates.io setup: Trusted Publishing → hupe1980/metering, workflow
 # `release.yml`, environment `crates-io`.
@@ -13,12 +18,18 @@ on:
       - "v[0-9]+.[0-9]+.[0-9]+"
       - "v[0-9]+.[0-9]+.[0-9]+-*"
   workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to release (e.g. v0.25.0); empty runs verify only"
+        required: false
+        default: ""
 
 permissions: {}
 
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  TAG: ${{ inputs.tag || (github.ref_type == 'tag' && github.ref_name) || '' }}
 
 jobs:
   verify:
@@ -28,9 +39,11 @@ jobs:
       contents: read
     outputs:
       version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ env.TAG || github.ref }}
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
         with:
@@ -43,13 +56,14 @@ jobs:
         run: |
           version="$(sed -n 's/^version *= *"\(.*\)"/\1/p' Cargo.toml | head -1)"
           echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
       - name: Tag must match Cargo.toml version
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: env.TAG != ''
         env:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
-          if [ "${GITHUB_REF_NAME#v}" != "$VERSION" ]; then
-            echo "::error::tag $GITHUB_REF_NAME does not match Cargo.toml version $VERSION"
+          if [ "${TAG#v}" != "$VERSION" ]; then
+            echo "::error::tag $TAG does not match Cargo.toml version $VERSION"
             exit 1
           fi
       # No cache here: a release builds from a clean slate.
@@ -58,16 +72,19 @@ jobs:
   publish:
     name: 🚀 publish to crates.io
     needs: verify
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: needs.verify.outputs.tag != ''
     runs-on: ubuntu-latest
     environment: crates-io
     permissions:
       contents: read
       id-token: write     # OIDC: trusted publishing and the provenance signature
       attestations: write # store the attestation on GitHub
+    env:
+      VERSION: ${{ needs.verify.outputs.version }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ needs.verify.outputs.tag }}
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
         with:
@@ -75,22 +92,41 @@ jobs:
       - uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
         with:
           tool: cargo-cyclonedx
+      - name: Already on crates.io?
+        id: registry
+        run: |
+          code="$(curl -s -o /dev/null -w '%{http_code}' -A 'hupe1980/metering release' \
+            "https://crates.io/api/v1/crates/metering/$VERSION")"
+          if [ "$code" = 200 ]; then echo "published=true" >> "$GITHUB_OUTPUT"; fi
       - uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+        if: steps.registry.outputs.published != 'true'
         id: auth
-      - run: cargo publish --all-features --locked
+      - if: steps.registry.outputs.published != 'true'
+        run: cargo publish --all-features --locked
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
-      # Attest the uploaded .crate; verify with
-      # `gh attestation verify <file> -R hupe1980/metering`.
+      # The published bytes, checked against the registry's checksum.
+      - name: Fetch the published .crate
+        run: |
+          mkdir dist
+          crate="dist/metering-$VERSION.crate"
+          for _ in 1 2 3 4 5 6 7 8 9 10; do
+            curl -fsSL -A 'hupe1980/metering release' -o "$crate" \
+              "https://static.crates.io/crates/metering/metering-$VERSION.crate" && break
+            sleep 15
+          done
+          want="$(curl -fsSL -A 'hupe1980/metering release' \
+            "https://crates.io/api/v1/crates/metering/$VERSION" \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin)["version"]["checksum"])')"
+          echo "$want  $crate" | sha256sum -c -
+      # Verify with `gh attestation verify <file> -R hupe1980/metering`.
       - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
-          subject-path: target/package/metering-${{ needs.verify.outputs.version }}.crate
+          subject-path: dist/metering-${{ needs.verify.outputs.version }}.crate
       - name: SBOM (CycloneDX)
         run: |
           cargo cyclonedx --all-features --format json --spec-version 1.5 --override-filename metering.cdx
-          mkdir dist
-          mv metering.cdx.json dist/metering-${{ needs.verify.outputs.version }}.cdx.json
-          cp target/package/metering-${{ needs.verify.outputs.version }}.crate dist/
+          mv metering.cdx.json "dist/metering-$VERSION.cdx.json"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-assets
@@ -113,8 +149,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           VERSION: ${{ needs.verify.outputs.version }}
+          RELEASE_TAG: ${{ needs.verify.outputs.tag }}
         run: |
-          gh release create "$GITHUB_REF_NAME" assets/* \
+          gh release create "$RELEASE_TAG" assets/* \
             --title "v$VERSION" \
             --generate-notes \
             --verify-tag

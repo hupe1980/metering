@@ -44,8 +44,9 @@ fn internal_references(line: &str) -> Vec<String> {
     }
 
     // Identifiers: a decision number (D or R, an optional hyphen, up to three
-    // digits), a requirement or success criterion (FR or SC, a hyphen,
-    // digits), a user story (US, digits) or a task (T, three digits). The
+    // digits), a requirement, success criterion or security requirement (FR,
+    // SC or SR, a hyphen, digits), a user story (US, digits) or a task (T,
+    // three digits). The
     // planted test below spells out each shape.
     for (at, c) in line.char_indices() {
         if !at_word_start(line, at) {
@@ -53,7 +54,7 @@ fn internal_references(line: &str) -> Vec<String> {
         }
         let rest = &line[at..];
         let (prefix_len, max_digits, min_digits) =
-            if rest.starts_with("FR-") || rest.starts_with("SC-") {
+            if rest.starts_with("FR-") || rest.starts_with("SC-") || rest.starts_with("SR-") {
                 (3, 4, 1)
             } else if rest.starts_with("US") {
                 (2, 3, 1)
@@ -198,6 +199,10 @@ fn the_reference_guard_catches_planted_violations() {
             format!("{}S2", 'U'),
         ),
         (format!("- done in {}012", 'T'), format!("{}012", 'T')),
+        (
+            format!("/// refuses a clock ({}{}-003)", 'S', 'R'),
+            format!("{}{}-003", 'S', 'R'),
+        ),
     ] {
         assert_eq!(internal_references(&line), [hit], "{line}");
     }

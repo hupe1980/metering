@@ -88,7 +88,7 @@ day: `cargo run --example pipeline`.
 | Heat | `heat` — HeizkostenV § 6a, § 9, § 9a | [Heat](https://hupe1980.github.io/metering/docs/heat/) |
 | Grid | `grid` — § 14a EnWG, Redispatch Ausfallarbeit, EN 50160, rollout | [Grid](https://hupe1980.github.io/metering/docs/grid/) · [Power quality](https://hupe1980.github.io/metering/docs/power-quality/) |
 | Allocation | `allocation` — UTILTS Berechnungsformel, § 42b community, § 42c sharing, sessions | [Allocation](https://hupe1980.github.io/metering/docs/allocation/) |
-| EEG | `eeg` — MiSpeL (adopted 01.10.2026), EEG § 51/§ 51a, EnFG § 46 | [EEG and EnFG](https://hupe1980.github.io/metering/docs/eeg/) |
+| EEG | `eeg` — MiSpeL (in effect from 21.10.2026), EEG § 51/§ 51a, EnFG § 46 | [EEG and EnFG](https://hupe1980.github.io/metering/docs/eeg/) |
 
 ## Scope
 

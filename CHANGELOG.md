@@ -4,6 +4,28 @@ All notable changes to `metering` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the crate follows
 semver, with the `serde` representation explicitly in scope (see the crate docs).
 
+## [0.26.0] — 2026-11-20
+
+MiSpeL applicability moves into the crate, and its effect date is corrected.
+
+### Fixed
+
+- **MiSpeL takes effect on 21.10.2026**, not 01.10.2026 (the adoption date): Tenorziffer 8 ties the effect to the Bekanntgabe, which the Amtsblatt notice of 07.10.2026 fixes two weeks later (§ 73 Abs. 1a EnWG).
+
+### Added
+
+- **`eeg::mispel::geltung`** — `geltung(Optionsart, Umstaende)` returns the first day the Festlegung governs a site and the Tenorziffer that set it (8, 9 a or 9 b), with `WIRKSAM_AB` and `EINVERSTAENDNIS_BIS` as constants. You pass the operators' consent and the state-aid approval date; `Umstaende` has no `Default`.
+- **`Zeitraum::ab(jahr, erster_tag)`** — the Kalenderjahr or Rumpfjahr to evaluate, or `None`.
+- **`EegError::NoStateAidApproval`** — the Pauschaloption without an approval date.
+
+### Changed — breaking
+
+- **`Pauschaljahr`**: new fields `p1`, `p3`, `p4` hold the applied limits — the Rumpfjahr's in a Rumpfjahr. `grenzen` is renamed **`kalenderjahr`**. Migrate `y.grenzen.p4` to `y.p4`, or to `y.kalenderjahr.p4` for the whole year's.
+
+### Documentation
+
+- The 0.25.0 migration table gains `local_day`, `local_gas_day` and `to_berlin`.
+
 ## [0.25.0] — 2026-10-09
 
 A hard cut: the crate is rebuilt around a validated `Series`, every rounding
@@ -58,6 +80,8 @@ kept for compatibility.
 | `AggregationConfig` | `aggregate(&Series, Period)` |
 | `IntervalResolution` | `time::resolution::Resolution` |
 | `calendar::day_start_utc` and the `*_start_utc`/`*_end_utc`/`*_range_utc` family | `DayBoundary::{day, month, year}` → `Period` |
+| `calendar::local_day(instant)`, `calendar::local_gas_day(instant)`, the method `DayBoundary::local_day` | `DayBoundary::{Strom, Gas}.day_of(instant)` — returns `Option<Date>` |
+| `calendar::to_berlin` | `time::calendar::to_berlin` (not re-exported at the root) |
 | `AggregationRule`, `compute_virtual_meter` | `allocation::formula::Formula` |
 | `compute_ggv_allocation`, `compute_community_allocation` | `allocation::community::allocate` |
 | `compute_imbalance`, `network_losses`, `blindmehrarbeit` | `ImbalanceSaldo::new`, `NetworkLosses::new`, `ReactiveBalance::new` |

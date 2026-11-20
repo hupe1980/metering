@@ -235,6 +235,30 @@ pub enum Zeitraum {
     },
 }
 
+impl Zeitraum {
+    /// The period of calendar year `jahr` for a site governed from
+    /// `erster_tag` on — for example the day [`geltung`](super::geltung::geltung)
+    /// returns.
+    ///
+    /// The whole year when `erster_tag` is on or before 1 January of `jahr`; a
+    /// Rumpfjahr from `erster_tag` to 31 December when it falls inside the
+    /// year; `None` when it falls after the year.
+    #[must_use]
+    pub fn ab(jahr: i32, erster_tag: Date) -> Option<Self> {
+        let letzter_tag = Date::from_calendar_date(jahr, Month::December, 31).ok()?;
+        if erster_tag > letzter_tag {
+            None
+        } else if erster_tag.year() < jahr || erster_tag.ordinal() == 1 {
+            Some(Self::Kalenderjahr(jahr))
+        } else {
+            Some(Self::Rumpfjahr {
+                erster_tag,
+                letzter_tag,
+            })
+        }
+    }
+}
+
 /// One solar plant: its installed power and its AW¼ > 0 gate.
 #[derive(Debug, Clone, Copy)]
 pub struct SolarAnlage<'a> {
@@ -300,9 +324,16 @@ pub struct SolarAnlageJahr {
 pub struct Pauschaljahr {
     /// The Formelsätze applied: P1/P2/P3, then P4 and P5 when present.
     pub faelle: Vec<Pauschalfall>,
-    /// (P1)–(P4) of the calendar year.
-    pub grenzen: Pauschalgrenzen,
-    /// (P1)R–(P4)R, in a Rumpfjahr — then they replace (P1) and (P4) below.
+    /// (P1) as applied — (P1)R in a Rumpfjahr. The cap of (P15k).
+    pub p1: Decimal,
+    /// (P3) as applied — (P3)R in a Rumpfjahr. The Indifferenzbereich.
+    pub p3: Decimal,
+    /// (P4) as applied — (P4)R in a Rumpfjahr. Subtracted in (P8).
+    pub p4: Decimal,
+    /// (P1)–(P4) of the whole calendar year, Pinst and (P2) among them. In a
+    /// Rumpfjahr these are **not** the applied limits; `p1`, `p3`, `p4` are.
+    pub kalenderjahr: Pauschalgrenzen,
+    /// (P17)–(P22), in a Rumpfjahr.
     pub rumpfjahr: Option<Rumpfjahr>,
     /// (P7) = ∑J (P6)¼ — feed-in in SP≥0 quarter-hours.
     pub p7: Decimal,
@@ -373,7 +404,8 @@ impl Pauschaloption<'_> {
                 (a.start(), b.end(), Some(r))
             }
         };
-        let (p1, p4) = rumpfjahr.map_or((grenzen.p1, grenzen.p4), |r| (r.p1, r.p4));
+        let (p1, p3, p4) =
+            rumpfjahr.map_or((grenzen.p1, grenzen.p3, grenzen.p4), |r| (r.p1, r.p3, r.p4));
 
         let rows = align(&[
             ("Z1NB", self.z1nb),
@@ -427,7 +459,10 @@ impl Pauschaloption<'_> {
         }
         Ok(Pauschaljahr {
             faelle,
-            grenzen,
+            p1,
+            p3,
+            p4,
+            kalenderjahr: grenzen,
             rumpfjahr,
             p7,
             p8,

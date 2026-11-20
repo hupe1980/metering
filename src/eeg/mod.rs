@@ -5,7 +5,7 @@
 //! |---|---|---|
 //! | [`negative_prices`] | EEG § 51, § 51a | zero-value quarter-hours, the extension of the Vergütungszeitraum, the § 51 Abs. 3 energy |
 //! | [`zeitgleichheit`] | EnFG § 46 Abs. 3 and 5 | the per-interval coincident quantity, the worst-case estimate |
-//! | [`mispel`] | MiSpeL Anlage 1 and 2 | the Abgrenzungs- and Pauschaloption quantities, formula by formula |
+//! | [`mispel`] | MiSpeL Tenor, Anlage 1 and 2 | from when the Festlegung governs; the Abgrenzungs- and Pauschaloption quantities, formula by formula |
 //!
 //! Quantities only: where a rule turns on the sign of a price (AW¼ > 0,
 //! SP¼ ≥ 0, a negative spot price), the caller passes which quarter-hours
@@ -113,6 +113,14 @@ pub enum EegError {
     /// A sum or product left the `Decimal` range.
     #[error("arithmetic overflow")]
     Overflow,
+    /// The Pauschaloption was asked for without the date of the EU's
+    /// state-aid approval of § 19 Abs. 3c EEG, which MiSpeL Tenorziffer 9 b
+    /// makes its earliest start.
+    #[error(
+        "the Pauschaloption applies only from the month after the EU state-aid approval \
+         of § 19 Abs. 3c EEG (MiSpeL Tenorziffer 9 b), and no approval date is given"
+    )]
+    NoStateAidApproval,
 }
 
 /// The coincident share of two quantities in one interval: the lesser.

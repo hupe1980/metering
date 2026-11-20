@@ -11,6 +11,7 @@ mod billing;
 mod calendar;
 mod eeg;
 mod order_independence;
+mod parameters;
 mod published_examples;
 mod quantity_invariants;
 mod scale;

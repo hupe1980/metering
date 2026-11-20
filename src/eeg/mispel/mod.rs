@@ -1,5 +1,5 @@
 //! MiSpeL — *Marktintegration von Speichern und Ladepunkten*, the BNetzA
-//! Festlegung of 01.10.2026 (Az. 618-25-02).
+//! Festlegung of 01.10.2026 (Az. 618-25-02), in effect from 21.10.2026.
 //!
 //! A storage system or bidirectional charge point that mixes grid and plant
 //! electricity keeps its Umlageprivilegien (§ 21 EnFG) and Marktprämie
@@ -13,16 +13,14 @@
 //! - [`pauschal`] — **Anlage 2, Pauschaloption.** Flat-rate limits for PV up
 //!   to 30 kWp on one meter, per **calendar year** or Rumpfjahr: formulas
 //!   (P1)–(P22), cases P1–P5.
+//! - [`geltung`] — **Tenorziffern 8 and 9.** From which day the Festlegung
+//!   governs a site: the Bekanntgabe, the operators' consent until
+//!   30.09.2027, and for the Pauschaloption the month after the EU's state-aid
+//!   approval, which is the caller's date.
 //!
 //! The caller names the Formelsatz (an operator decision binding for a
 //! calendar year, Anl. 1 p. 24, Anl. 2 p. 22) and passes AW¼ > 0 ((24)¼,
 //! (P12)¼) and SP¼ ≥ 0 ((P5)¼) as a [`Gate`].
-//!
-//! **Pauschaloption applicability.** Tenorziffer 9 b): Tenorziffern 2
-//! and 4 *"sind frühestens für Netzeinspeisung ab dem ersten Kalendertag des
-//! Kalendermonats anwendbar, der auf die beihilferechtliche Genehmigung der
-//! Europäischen Kommission zu § 19 Abs. 3c EEG"* follows. Whether that
-//! approval exists is the caller's fact; the formulas run regardless.
 //!
 //! **Out of scope:** the money formulas (41)–(44) of A9, the § 22 EnFG
 //! heat-pump quantity of the A7 and P5 footnotes, the unnumbered A10 split.
@@ -39,6 +37,7 @@ use time::OffsetDateTime;
 use crate::series::Series;
 
 pub mod abgrenzung;
+pub mod geltung;
 pub mod pauschal;
 
 /// Which quarter-hours pass a sign test the Festlegung defines on a money

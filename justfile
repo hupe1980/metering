@@ -214,11 +214,14 @@ references:
         'https://www.bdew-mako.de/api/downloadFile/12230'
     fetch edi-energy utilts-mig-1.1e.pdf \
         'https://www.bdew-mako.de/api/downloadFile/10706'
-    # MiSpeL (Az. 618-25-02), adopted 01.10.2026: Tenor and both Anlagen
+    # MiSpeL (Az. 618-25-02), adopted 01.10.2026: Tenor, both Anlagen and the Amtsblatt notice
     mispel='https://www.bundesnetzagentur.de/DE/Fachthemen/ElektrizitaetundGas/ErneuerbareEnergien/EEG_Aufsicht/MiSpeL/DL'
     fetch bnetza mispel-tenor-20261001.pdf "$mispel/MiSpeL_TenorMitBegruendung.html?nn=1067830"
     fetch bnetza mispel-anlage1-abgrenzungsoption-20261001.pdf "$mispel/MiSpeL_Abgrenzungsoptionen.html?nn=1067830"
     fetch bnetza mispel-anlage2-pauschaloption-20261001.pdf "$mispel/MiSpeL_Pauschaloptionen.html?nn=1067830"
+    # Amtsblatt 19/2026 (07.10.2026), Vfg. Nr. 73/2026: the public notice that starts the two weeks of § 73 Abs. 1a EnWG
+    fetch bnetza amtsblatt-2026-19-20261007.pdf \
+        'https://www.bundesnetzagentur.de/DE/Allgemeines/Presse/Amtsblatt/Einzeldownloads/Amtsblatt_26_19.pdf?__blob=publicationFile&v=2'
     # bdew/ — Anwendungshilfen and the gas-SLP Leitfaden
     fetch bdew bdew-slp-strom-2025-profile-h25-g25-l25-p25-s25.xlsx \
         'https://www.bdew.de/media/documents/Kopie_von_Repr%C3%A4sentative_Profile_BDEW_H25_G25_L25_P25_S25_Ver%C3%B6ffentlichung.xlsx'

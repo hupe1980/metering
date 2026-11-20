@@ -1,6 +1,6 @@
 +++
 title = "EEG and EnFG"
-description = "MiSpeL (BNetzA 618-25-02, adopted 01.10.2026) for storage and charge points, the EEG § 51/§ 51a negative-price quarter-hours, and EnFG § 46 Zeitgleichheit."
+description = "MiSpeL (BNetzA 618-25-02, in effect from 21.10.2026) for storage and charge points, the EEG § 51/§ 51a negative-price quarter-hours, and EnFG § 46 Zeitgleichheit."
 weight = 13
 [extra]
 group = "Specialised"
@@ -8,7 +8,7 @@ group = "Specialised"
 
 | Module | Rule | What leaves it |
 |---|---|---|
-| `eeg::mispel` | MiSpeL Anlage 1 and 2 | the Abgrenzungs- and Pauschaloption quantities, formula by formula |
+| `eeg::mispel` | MiSpeL Tenor, Anlage 1 and 2 | from which day the Festlegung governs; the Abgrenzungs- and Pauschaloption quantities, formula by formula |
 | `eeg::negative_prices` | EEG § 51, § 51a | zero-value quarter-hours, the extension of the Vergütungszeitraum, the § 51 Abs. 3 energy |
 | `eeg::zeitgleichheit` | EnFG § 46 Abs. 3 and 5 | the per-interval coincident quantity, the worst-case estimate |
 
@@ -19,10 +19,10 @@ with the first instant where the grids part.
 
 ## MiSpeL
 
-*Marktintegration von Speichern und Ladepunkten* (BNetzA, 01.10.2026, Az.
-618-25-02): a storage system or bidirectional charge point mixing grid and
-plant electricity keeps its Umlageprivilegien (§ 21 EnFG) and Marktprämie
-(§ 19 EEG) for the share these formulas attribute to it.
+*Marktintegration von Speichern und Ladepunkten* (BNetzA, Az. 618-25-02, in
+effect from 21.10.2026): a storage system or bidirectional charge point mixing
+grid and plant electricity keeps its Umlageprivilegien (§ 21 EnFG) and
+Marktprämie (§ 19 EEG) for the share these formulas attribute to it.
 
 | Anlage | Module | Scope | Formulas | Period |
 |---|---|---|---|---|
@@ -41,11 +41,44 @@ let g = Pauschalgrenzen::new(Pauschalbasis::Stromspeicher { kapazitaet_kwh: dec!
 assert_eq!((g.p1, g.p3, g.p4), (dec!(4000), dec!(320), dec!(4320)));
 ```
 
-**Your input:** the Formelsatz (binding for a calendar year) and whether the EU
-state-aid approval of § 19 Abs. 3c EEG, from which the Pauschaloption applies,
-is granted. **Out:** the money formulas (41)–(44) of case A9 and the § 22 EnFG
-heat-pump quantity of the A7 and P5 footnotes. **No rounding** — the Festlegung
-states none; its tables are rounded for display.
+### From which day it governs
+
+`mispel::geltung` applies Tenorziffern 8 and 9 and names the rule that set the
+day:
+
+| Rule | First day | `Grund` |
+|---|---|---|
+| 8 — effect with the Bekanntgabe (Amtsblatt of 07.10.2026 plus two weeks, § 73 Abs. 1a EnWG) | 21.10.2026 | `Bekanntgabe` |
+| 9 a — until 30.09.2027 only with the operators' consent | without consent, 01.10.2027 | `Einverstaendnis` |
+| 9 b — the Pauschaloption from the month after the EU state-aid approval | the first of the next month | `Genehmigung` |
+
+```rust
+use metering::eeg::mispel::geltung::{geltung, Grund, Optionsart, Umstaende};
+use metering::eeg::mispel::pauschal::Zeitraum;
+use time::macros::date;
+
+let g = geltung(
+    Optionsart::Pauschal,
+    Umstaende { einverstaendnis: true, genehmigung: Some(date!(2027 - 01 - 14)) },
+)?;
+assert_eq!((g.ab, g.grund), (date!(2027 - 02 - 01), Grund::Genehmigung));
+
+// The first Pauschaloption year is a Rumpfjahr.
+assert_eq!(
+    Zeitraum::ab(2027, g.ab),
+    Some(Zeitraum::Rumpfjahr { erster_tag: date!(2027 - 02 - 01), letzter_tag: date!(2027 - 12 - 31) }),
+);
+# Ok::<(), metering::eeg::EegError>(())
+```
+
+Without an approval date the Pauschaloption is refused. The Zuordnung date is
+yours; take the later of the two. In a Rumpfjahr, `Pauschaljahr::p1`/`p3`/`p4`
+hold the Rumpfjahr's limits, `kalenderjahr` the whole year's.
+
+**Your input:** the Formelsatz (binding for a calendar year), the operators'
+consent and the state-aid approval date. **Out:** the money formulas (41)–(44)
+of case A9 and the § 22 EnFG heat-pump quantity of the A7 and P5 footnotes.
+**No rounding** — the Festlegung states none; its tables are rounded for display.
 
 ## EEG § 51 and § 51a — negative prices
 

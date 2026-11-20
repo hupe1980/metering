@@ -14,6 +14,9 @@ use metering::eeg::mispel::abgrenzung::{
     Abgrenzungsoption, Anlagen, Basisfall, Einzelzaehler, Einzelzaehlerfall, GewichteteAnlage,
     Monat, VorrangAnlage, jahr, jahr_einzelzaehler,
 };
+use metering::eeg::mispel::geltung::{
+    EINVERSTAENDNIS_BIS, Geltung, Grund, Optionsart, Umstaende, WIRKSAM_AB, geltung,
+};
 use metering::eeg::mispel::pauschal::{
     Pauschalbasis, Pauschalgrenzen, Pauschaloption, SolarAnlage, Zeitraum,
 };
@@ -21,7 +24,7 @@ use metering::eeg::mispel::{Abgrenzungsfall, Einspeisung, Gate, Pauschalfall};
 use metering::prelude::*;
 use rust_decimal::RoundingStrategy;
 use time::macros::{date, datetime};
-use time::{Duration, OffsetDateTime};
+use time::{Date, Duration, OffsetDateTime};
 
 const T0: OffsetDateTime = datetime!(2026-06-01 0:00 UTC);
 
@@ -782,8 +785,13 @@ fn published_anlage2_p13_beispielrechnung_1() {
     .jahr()
     .unwrap();
     assert_eq!(
-        (y.grenzen.p1, y.grenzen.p3, y.grenzen.p4),
+        (y.kalenderjahr.p1, y.kalenderjahr.p3, y.kalenderjahr.p4),
         (dec!(4000), dec!(320), dec!(4320))
+    );
+    // A calendar year applies the calendar-year limits.
+    assert_eq!(
+        (y.p1, y.p3, y.p4),
+        (y.kalenderjahr.p1, y.kalenderjahr.p3, y.kalenderjahr.p4)
     );
     assert_eq!(y.anlagen[0].p15, dec!(3000));
     assert_eq!((y.p8, y.p10), (dec!(0), dec!(0)));
@@ -933,7 +941,10 @@ fn crate_derived_p2_and_p3() {
         vec![(dec!(8), vec![1])],
     );
     assert_eq!(y.faelle, [Pauschalfall::P2]);
-    assert_eq!((y.grenzen.p3, y.grenzen.p4), (dec!(800), dec!(4800)));
+    assert_eq!(
+        (y.kalenderjahr.p3, y.kalenderjahr.p4),
+        (dec!(800), dec!(4800))
+    );
     assert_eq!((y.p8, y.p10, y.p11), (dec!(1200), dec!(1000), dec!(0)));
 
     let p3 = |sk| {
@@ -1125,4 +1136,164 @@ fn a_substituted_input_is_used_and_reported_per_quarter_hour() {
             QualityFlag::Measured
         ]
     );
+}
+
+// ── Applicability: Tenorziffern 8 and 9 ─────────────────────────────────────
+
+fn umstaende(einverstaendnis: bool, genehmigung: Option<Date>) -> Umstaende {
+    Umstaende {
+        einverstaendnis,
+        genehmigung,
+    }
+}
+
+fn g(option: Optionsart, einverstaendnis: bool, genehmigung: Option<Date>) -> Geltung {
+    geltung(option, umstaende(einverstaendnis, genehmigung)).unwrap()
+}
+
+/// The Tenor's dates: the Amtsblatt of 07.10.2026 plus two weeks, and 9 a.
+#[test]
+fn geltung_constants_are_the_tenor_dates() {
+    assert_eq!(WIRKSAM_AB, date!(2026 - 10 - 21));
+    assert_eq!(WIRKSAM_AB - date!(2026 - 10 - 07), Duration::weeks(2));
+    assert_eq!(EINVERSTAENDNIS_BIS, date!(2027 - 09 - 30));
+}
+
+/// Tenorziffer 8: with consent, the Abgrenzungsoption governs from the
+/// Bekanntgabe — never from the adoption date 01.10.2026.
+#[test]
+fn geltung_abgrenzung_from_the_bekanntgabe() {
+    let a = g(Optionsart::Abgrenzung, true, None);
+    assert_eq!((a.ab, a.grund), (date!(2026 - 10 - 21), Grund::Bekanntgabe));
+    // The approval binds only the Pauschaloption.
+    assert_eq!(
+        g(Optionsart::Abgrenzung, true, Some(date!(2027 - 06 - 15))),
+        a
+    );
+}
+
+/// Tenorziffer 9 a: without consent, both options wait for 01.10.2027.
+#[test]
+fn geltung_without_consent_waits_for_the_window_to_close() {
+    let a = g(Optionsart::Abgrenzung, false, None);
+    assert_eq!(
+        (a.ab, a.grund),
+        (date!(2027 - 10 - 01), Grund::Einverstaendnis)
+    );
+    assert_eq!(a.ab, EINVERSTAENDNIS_BIS.next_day().unwrap());
+    let p = g(Optionsart::Pauschal, false, Some(date!(2027 - 01 - 14)));
+    assert_eq!(
+        (p.ab, p.grund),
+        (date!(2027 - 10 - 01), Grund::Einverstaendnis)
+    );
+}
+
+/// Tenorziffer 9 b: the first day of the month *after* the approval, even
+/// when the approval falls on a first; December rolls into January.
+#[test]
+fn geltung_pauschal_from_the_month_after_the_approval() {
+    for (approval, first) in [
+        (date!(2027 - 01 - 14), date!(2027 - 02 - 01)),
+        (date!(2027 - 03 - 01), date!(2027 - 04 - 01)),
+        (date!(2027 - 12 - 31), date!(2028 - 01 - 01)),
+    ] {
+        let p = g(Optionsart::Pauschal, true, Some(approval));
+        assert_eq!((p.ab, p.grund), (first, Grund::Genehmigung), "{approval}");
+    }
+    // An approval before the Bekanntgabe: the Bekanntgabe binds.
+    let early = g(Optionsart::Pauschal, true, Some(date!(2026 - 09 - 05)));
+    assert_eq!((early.ab, early.grund), (WIRKSAM_AB, Grund::Bekanntgabe));
+}
+
+/// On a tie the particular rule is named: an approval in September 2027
+/// without consent gives 01.10.2027 twice over.
+#[test]
+fn geltung_a_tie_names_the_approval() {
+    let p = g(Optionsart::Pauschal, false, Some(date!(2027 - 09 - 10)));
+    assert_eq!((p.ab, p.grund), (date!(2027 - 10 - 01), Grund::Genehmigung));
+}
+
+/// Tenorziffer 9 b: no approval date, no Pauschaloption — refused, not dated.
+#[test]
+fn geltung_refuses_the_pauschaloption_without_approval() {
+    for einverstaendnis in [true, false] {
+        let e = geltung(Optionsart::Pauschal, umstaende(einverstaendnis, None)).unwrap_err();
+        assert_eq!(e, EegError::NoStateAidApproval);
+        assert!(e.to_string().contains("Tenorziffer 9 b"), "{e}");
+    }
+    // An approval with no following month in the supported calendar.
+    assert_eq!(
+        geltung(Optionsart::Pauschal, umstaende(true, Some(Date::MAX))),
+        Err(EegError::Calendar)
+    );
+}
+
+/// Each rule names its Tenorziffer.
+#[test]
+fn geltung_grund_names_the_tenorziffer() {
+    for (grund, ziffer) in [
+        (Grund::Bekanntgabe, "Tenorziffer 8"),
+        (Grund::Einverstaendnis, "Tenorziffer 9 a"),
+        (Grund::Genehmigung, "Tenorziffer 9 b"),
+    ] {
+        assert!(grund.to_string().contains(ziffer), "{grund}");
+    }
+}
+
+/// The period of a year for a site governed from a day.
+#[test]
+fn zeitraum_ab_the_first_governed_day() {
+    let from = date!(2027 - 02 - 01);
+    assert_eq!(Zeitraum::ab(2028, from), Some(Zeitraum::Kalenderjahr(2028)));
+    assert_eq!(
+        Zeitraum::ab(2027, from),
+        Some(Zeitraum::Rumpfjahr {
+            erster_tag: from,
+            letzter_tag: date!(2027 - 12 - 31)
+        })
+    );
+    assert_eq!(
+        Zeitraum::ab(2027, date!(2027 - 01 - 01)),
+        Some(Zeitraum::Kalenderjahr(2027))
+    );
+    assert_eq!(
+        Zeitraum::ab(2027, date!(2027 - 12 - 31)),
+        Some(Zeitraum::Rumpfjahr {
+            erster_tag: date!(2027 - 12 - 31),
+            letzter_tag: date!(2027 - 12 - 31)
+        })
+    );
+    assert_eq!(Zeitraum::ab(2026, from), None);
+}
+
+/// A Rumpfjahr evaluated end to end (crate-derived, Anl. 2 pp. 55–56's
+/// second Rumpfjahr): (P15) and (P8) use (P1)R and (P4)R, which `p1`/`p4`
+/// carry — the calendar-year (P1) of 4 000 would leave (P15) at 3 500.
+#[test]
+fn pauschaljahr_in_a_rumpfjahr_applies_the_rumpfjahr_limits() {
+    let (nb, ne) = year_rows(T0, &[3500], &[0]);
+    let y = Pauschaloption {
+        z1nb: &nb,
+        einspeisung: Einspeisung::Z1(&ne),
+        sp: Gate::Always,
+        basis: Pauschalbasis::Stromspeicher {
+            kapazitaet_kwh: dec!(15),
+        },
+        anlagen: vec![SolarAnlage {
+            kwp: dec!(8),
+            aw: Gate::Always,
+        }],
+        zeitraum: Zeitraum::Rumpfjahr {
+            erster_tag: date!(2026 - 05 - 17),
+            letzter_tag: date!(2026 - 12 - 31),
+        },
+    }
+    .jahr()
+    .unwrap();
+    let r = y.rumpfjahr.unwrap();
+    assert_eq!((y.p1, y.p3, y.p4), (r.p1, r.p3, r.p4));
+    assert_eq!(y.kalenderjahr.p1, dec!(4000));
+    assert_eq!(half_up(y.p1), dec!(2995));
+    assert_eq!(y.anlagen[0].p15, y.p1);
+    assert_eq!(y.p8, dec!(3500) - y.p4);
 }

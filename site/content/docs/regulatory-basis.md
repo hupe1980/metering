@@ -23,7 +23,7 @@ Re-verified October 2026.
 | EDI@Energy *Codeliste der OBIS-Kennzahlen und Medien* | **2.5c** | 01.04.2026 | — |
 | EDI@Energy *Codeliste TUM-/BDEW-SLP Gas* | 1.1 | — | — |
 | SLP-Gas Leitfaden (BDEW/VKU/GEODE) | KoV **XV**, Stand 27.03.2026 | 01.10.2026 | — |
-| BNetzA **MiSpeL** (618-25-02) | adopted 01.10.2026 | Pauschaloption: from the month after the EU state-aid approval of § 19 Abs. 3c EEG | — |
+| BNetzA **MiSpeL** (618-25-02) | adopted 01.10.2026 | 21.10.2026 (`geltung::WIRKSAM_AB`); with the operators' consent until 30.09.2027; Pauschaloption: from the month after the EU state-aid approval of § 19 Abs. 3c EEG | — |
 | BNetzA BK6-23-241, BilAReM | Beschluss 07.05.2026 | Anlage: 01.10.2026 | Pauschal-Abrechnung: 31.12.2028 |
 | StromNEV § 17, Anlage 4 | consolidated | — | **31.12.2028** |
 | StromNZV, GasNZV | — | — | **repealed** with the end of 31.12.2025 |
@@ -113,7 +113,7 @@ under GPKE Kap. 8.4.
 | EN 50160 voltage unbalance | Needs phase angles three RMS magnitudes do not carry | [Power quality](@/docs/power-quality.md) |
 | How the netzwirksamer Leistungsbezug is apportioned | Ziff. 2.3 defines the share, not the split; VDE FNN *Bewertung der Mindestleistung* (V1.0, April 2025) defers to *Netzbetrieb mit Flexibilitäten* Kap. 4.1.2, not freely citable | `Verursachungsregel` |
 | The BDEW-Codenummer check digit as a gate | GS1-issued GLNs are exempt, so a valid ID may fail it | `BdewCode::issuer` |
-| Whether MiSpeL's Pauschaloption applies | Depends on the EU state-aid approval of § 19 Abs. 3c EEG | `eeg::mispel::pauschal` |
+| Whether MiSpeL's Pauschaloption applies | Depends on the EU state-aid approval of § 19 Abs. 3c EEG; its date is passed in | `geltung::Umstaende::genehmigung` |
 
 ## Watch list
 
@@ -125,7 +125,7 @@ Dated regulatory changes and the modules they touch.
 | open | EU state-aid approval of § 19 Abs. 3c EEG | MiSpeL Pauschaloption applicability |
 | 31.12.2026 | HeizkostenV § 5 Abs. 3: every device remotely readable | `heat` (§ 6a monthly information) |
 | spring 2027, binding 01.10.2027 | KoV XVI and its SLP-Gas Leitfaden | `slp::gas` |
-| 30.09.2027 | MiSpeL implementation window ends | `eeg::mispel` |
+| 30.09.2027 | MiSpeL consent window ends: from 01.10.2027 the Festlegung applies without the operators' consent | `eeg::mispel::geltung` |
 | 31.12.2027 | GasNEV expires | not cited — no gas Leistungspreis is modelled |
 | 01.06.2028 | § 42c sharing into adjacent Bilanzierungsgebiete | `allocation::sharing` |
 | 31.12.2028 | StromNEV expires (`STROMNEV_AUSSERKRAFT`); Redispatch Pauschal-Abrechnung ends (`PAUSCHAL_BESTANDSSCHUTZ_ENDE`) | `billing::aggregation`, `billing::reactive`, `grid::ausfallarbeit` |
